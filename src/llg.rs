@@ -3,19 +3,20 @@
 use crate::vector_field::VectorField2D;
 use crate::params::LLGParams;
 use crate::vec3::{cross, normalize};
+use crate::effective_field::zeeman::add_zeeman_field;
 
-/// Advance the magnetisation by one explicit Euler step of the LLG equation,
-/// assuming only a uniform external field H_ext (no exchange/demag yet).
-pub fn step_llg(m: &mut VectorField2D, params: &LLGParams) {
+/// Core integrator: advance m by one step, given a precomputed H_eff field.
+///
+/// H_eff is supplied as a VectorField2D with the same grid as m.
+pub fn step_llg_with_field(m: &mut VectorField2D, h_eff: &VectorField2D, params: &LLGParams) {
     let gamma = params.gamma;
     let alpha = params.alpha;
     let dt = params.dt;
-    let h = params.h_ext;
 
     // loop over all cells
-    for cell in &mut m.data {
-        // current magnetisation at this cell
+    for (cell_idx, cell) in m.data.iter_mut().enumerate() {
         let m_vec = *cell;
+        let h = h_eff.data[cell_idx];
 
         // Landau–Lifshitz–Gilbert (LLG) RHS:
         // dm/dt = -gamma m × H  +  alpha m × (m × H)
@@ -35,12 +36,27 @@ pub fn step_llg(m: &mut VectorField2D, params: &LLGParams) {
             m_vec[2] + dt * dmdt[2],
         ];
 
-        // renormalize to |m| = 1 (simple but good enough for now)
+        // renormalize to |m| = 1
         *cell = normalize(m_new);
     }
 }
 
-// Tests for LLG live at the bottom, see Step 2.
+/// Convenience wrapper for the old API:
+/// builds a uniform H_eff from params.h_ext and calls step_llg_with_field.
+///
+/// This keeps your existing tests and simple use-cases working.
+pub fn step_llg(m: &mut VectorField2D, params: &LLGParams) {
+    // Create a temporary H_eff field on the same grid as m
+    let grid = m.grid;
+    let mut h_eff = VectorField2D::new(grid);
+
+    // Add Zeeman field: uniform H_ext everywhere
+    add_zeeman_field(&mut h_eff, params.h_ext);
+
+    // Call the core integrator
+    step_llg_with_field(m, &h_eff, params);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +78,7 @@ mod tests {
         };
 
         for _ in 0..1000 {
+            // uses the wrapper, which internally builds H_eff and calls step_llg_with_field
             step_llg(&mut m, &params);
         }
 
