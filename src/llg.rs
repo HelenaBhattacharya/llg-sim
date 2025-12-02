@@ -1,40 +1,8 @@
 // src/llg.rs
 
 use crate::vector_field::VectorField2D;
-
-/// Parameters for the LLG equation (very simple version).
-pub struct LLGParams {
-    pub gamma: f64,       // gyromagnetic ratio
-    pub alpha: f64,       // damping
-    pub dt: f64,          // time step
-    pub h_ext: [f64; 3],  // uniform external field (Tesla, in effective units)
-}
-
-// --- small helper functions for vector math ---
-
-#[inline]
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-#[inline]
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let n2 = dot(v, v);
-    if n2 == 0.0 {
-        return [0.0, 0.0, 1.0];
-    }
-    let inv = 1.0 / n2.sqrt();
-    [v[0] * inv, v[1] * inv, v[2] * inv]
-}
+use crate::params::LLGParams;
+use crate::vec3::{cross, normalize};
 
 /// Advance the magnetisation by one explicit Euler step of the LLG equation,
 /// assuming only a uniform external field H_ext (no exchange/demag yet).
@@ -69,5 +37,36 @@ pub fn step_llg(m: &mut VectorField2D, params: &LLGParams) {
 
         // renormalize to |m| = 1 (simple but good enough for now)
         *cell = normalize(m_new);
+    }
+}
+
+// Tests for LLG live at the bottom, see Step 2.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::Grid2D;
+    use crate::vector_field::VectorField2D;
+    use crate::params::LLGParams;
+
+    #[test]
+    fn macrospin_norm_stays_one() {
+        let grid = Grid2D::new(1, 1, 1e-9, 1e-9);
+        let mut m = VectorField2D::new(grid);
+        m.set_uniform(0.1, 0.0, (1.0 - 0.1_f64.powi(2)).sqrt());
+
+        let params = LLGParams {
+            gamma: 1.0,
+            alpha: 0.1,
+            dt: 0.01,
+            h_ext: [1.0, 0.0, 0.0],
+        };
+
+        for _ in 0..1000 {
+            step_llg(&mut m, &params);
+        }
+
+        let m_vec = m.data[0];
+        let norm = (m_vec[0].powi(2) + m_vec[1].powi(2) + m_vec[2].powi(2)).sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
     }
 }

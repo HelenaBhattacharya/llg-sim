@@ -27,3 +27,19 @@ impl Grid2D {
         j * self.nx + i
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_indexing_is_consistent() {
+        let g = Grid2D::new(4, 3, 1.0, 1.0);
+        // Check a few indices by hand
+        assert_eq!(g.idx(0, 0), 0);
+        assert_eq!(g.idx(1, 0), 1);
+        assert_eq!(g.idx(0, 1), 4);
+        assert_eq!(g.idx(3, 2), 11); // (j=2)*4 + i=3 = 11
+        assert_eq!(g.n_cells(), 12);
+    }
+}
