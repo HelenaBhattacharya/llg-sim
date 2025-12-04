@@ -1,7 +1,7 @@
 // src/main.rs
 
 use std::env;
-use std::fs::{File, create_dir_all};
+use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::{BufWriter, Write};
 use std::process::Command;
 
@@ -11,37 +11,47 @@ use llg_sim::llg::step_llg_with_field;
 use llg_sim::params::{LLGParams, Material};
 use llg_sim::effective_field::build_h_eff;
 use llg_sim::visualisation::{save_mz_plot, make_movie_with_ffmpeg};
+use llg_sim::energy::compute_total_energy;
 
 fn main() -> std::io::Result<()> {
+    // ---------- command line options ----------
+    // Usage:
+    //   cargo run -- bloch           -> Bloch wall, frames only
+    //   cargo run -- bloch movie     -> Bloch wall, frames + MP4
+    //   cargo run -- uniform         -> uniform +z, frames only
+    //   cargo run -- uniform movie   -> uniform +z, frames + MP4
+    //
+    let args: Vec<String> = env::args().collect();
+    let init_kind = args.get(1).map(String::as_str).unwrap_or("bloch");
+    let make_movie_flag = args.get(2).map(String::as_str) == Some("movie");
+    // ------------------------------------------
+
     // 1. Set up a 2D grid and magnetisation
     let nx: usize = 128;
     let ny: usize = 128;
     let dx: f64 = 5e-12;
     let dy: f64 = 5e-12;
 
-    let grid: Grid2D = Grid2D::new(nx, ny, dx, dy);  // 64x64 cells, 5 nm spacing
+    let grid: Grid2D = Grid2D::new(nx, ny, dx, dy);
     let mut m: VectorField2D = VectorField2D::new(grid);
     let mut h_eff: VectorField2D = VectorField2D::new(grid);
 
-    // Print physical domain size
+    // let e_init = compute_total_energy(&grid, &m, &material);
+    // println!("Initial E_tot ({} state) = {:.6e}", init_kind, e_init);
+
+    // Print physical domain size (using pm here because dx is 5e-12 m)
     println!(
-        "Domain: {} x {} cells, dx = {:.2} nm, dy = {:.2} nm \
-         (Lx = {:.1} nm, Ly = {:.1} nm)",
+        "Domain: {} x {} cells, dx = {:.3} pm, dy = {:.3} pm \
+         (Lx = {:.1} pm, Ly = {:.1} pm)",
         nx,
         ny,
-        dx * 1e9,
-        dy * 1e9,
-        nx as f64 * dx * 1e9,
-        ny as f64 * dy * 1e9,
+        dx * 1e12,
+        dy * 1e12,
+        nx as f64 * dx * 1e12,
+        ny as f64 * dy * 1e12,
     );
 
-    // -------- choose initial condition from command line --------
-    // cargo run -- bloch    -> Bloch wall
-    // cargo run -- uniform  -> uniform +z
-    // cargo run             -> defaults to Bloch wall
-    let args: Vec<String> = env::args().collect();
-    let init_kind = args.get(1).map(String::as_str).unwrap_or("bloch");
-
+    // -------- choose initial condition --------
     match init_kind {
         "uniform" => {
             println!("Initial condition: uniform +z");
@@ -64,14 +74,14 @@ fn main() -> std::io::Result<()> {
             m.init_bloch_wall(x0, width);
         }
     }
-    // ------------------------------------------------------------
+    // ------------------------------------------
 
     // 2. Define LLG parameters
     let params: LLGParams = LLGParams {
         gamma: 1.0,
         alpha: 0.1,
-        dt: 0.0025,                 // slightly smaller dt for smoother evolution
-        h_ext: [0.0, 0.0, 0.0],    // no external field while looking at the wall
+        dt: 0.0025,              // time step
+        h_ext: [0.0, 0.0, 0.0],  // no external field here
     };
 
     // Material parameters (placeholder values)
@@ -82,18 +92,21 @@ fn main() -> std::io::Result<()> {
         easy_axis: [0.0, 0.0, 1.0],
     };
 
-    // 4. Open CSV file for writing (average magnetisation vs time)
+    // 3. Prepare output: CSV + frames directory
     let file: File = File::create("avg_magnetisation.csv")?;
     let mut writer: BufWriter<File> = BufWriter::new(file);
-
-    // Write header
     writeln!(writer, "t,mx_avg,my_avg,mz_avg")?;
 
-    // Ensure frames directory exists for PNG snapshots
+    // Clear any existing frames so runs don't mix
+    if let Err(e) = remove_dir_all("frames") {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Warning: could not clear frames/: {e}");
+        }
+    }
     create_dir_all("frames")?;
 
-    // 5. Time-stepping loop
-    let n_steps: i32 = 500;       // more steps for a nicer movie
+    // 4. Time-stepping loop
+    let n_steps: i32 = 500;
 
     for step in 0..=n_steps {
         // Build H_eff for this time step (Zeeman + exchange + anisotropy)
@@ -122,7 +135,15 @@ fn main() -> std::io::Result<()> {
             t, mx_avg, my_avg, mz_avg
         )?;
 
-        // Save a plot of m_z every 5 steps for smoother video
+        if step % 10 == 0 {
+        let e_tot = compute_total_energy(&grid, &m, &material);
+        println!(
+            "step {:4}, t = {:.3}, E_tot (toy units) = {:.6e}",
+            step, t, e_tot
+        );
+    }
+
+        // Save a plot of m_z every 2 steps
         if step % 2 == 0 {
             let filename = format!("frames/mz_{:04}.png", step);
             save_mz_plot(&m, &filename).expect("failed to save m_z plot");
@@ -138,17 +159,21 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Build a movie from all frames using ffmpeg (if available)
-    if let Err(e) = make_movie_with_ffmpeg("frames/mz_*.png", "mz_evolution.mp4", 20) {
-        eprintln!("Could not create movie with ffmpeg: {e}");
-    } else {
-        println!("Saved movie to mz_evolution.mp4");
+    // 5. Optionally build a movie from all frames using ffmpeg
+    if make_movie_flag {
+        if let Err(e) = make_movie_with_ffmpeg("frames/mz_*.png", "mz_evolution.mp4", 20) {
+            eprintln!("Could not create movie with ffmpeg: {e}");
+        } else {
+            println!("Saved movie to mz_evolution.mp4");
 
-        // On macOS, open the movie so you can just press “play”
-        #[cfg(target_os = "macos")]
-        {
-            let _ = Command::new("open").arg("mz_evolution.mp4").status();
+            // On macOS, open the movie so you can just press “play”
+            #[cfg(target_os = "macos")]
+            {
+                let _ = Command::new("open").arg("mz_evolution.mp4").status();
+            }
         }
+    } else {
+        println!("Movie generation skipped (no 'movie' flag).");
     }
 
     println!("Saved average magnetisation to avg_magnetisation.csv and PNG frames in frames/");
