@@ -1,37 +1,26 @@
 // src/effective_field/anisotropy.rs
 
-use crate::vector_field::VectorField2D;
 use crate::params::Material;
+use crate::vector_field::VectorField2D;
 
-/// Add a uniaxial anisotropy field H_ani to H_eff.
+/// Add uniaxial anisotropy contribution to B_eff (Tesla).
 ///
-/// Starting from the energy density
-///   E_an = k_u * [1 - (m·u)^2],
-/// the functional derivative gives (up to constants)
-///   H_ani ∝ 2 * k_u * (m·u) * u.
-///
-/// Here we fold all physical prefactors into k_u, so we simply use:
-///   H_ani = 2 * k_u * (m·u) * u.
-pub fn add_uniaxial_anisotropy_field(
-    m: &VectorField2D,
-    h_eff: &mut VectorField2D,
-    mat: &Material,
-) {
+/// For w_ani = K_u [1 - (m·u)^2], we get:
+///   B_ani = (2 K_u / M_s) (m·u) u
+pub fn add_uniaxial_anisotropy_field(m: &VectorField2D, b_eff: &mut VectorField2D, mat: &Material) {
     let k_u = mat.k_u;
-    if k_u == 0.0 {
+    let ms = mat.ms;
+    if k_u == 0.0 || ms == 0.0 {
         return;
     }
 
+    let coeff = 2.0 * k_u / ms;
     let u = mat.easy_axis;
-    let (ux, uy, uz) = (u[0], u[1], u[2]);
 
-    for (m_cell, h_cell) in m.data.iter().zip(h_eff.data.iter_mut()) {
-        let (mx, my, mz) = (m_cell[0], m_cell[1], m_cell[2]);
-        let mdotu = mx * ux + my * uy + mz * uz;
-
-        // H_ani = 2 k_u (m·u) u
-        h_cell[0] += 2.0 * k_u * mdotu * ux;
-        h_cell[1] += 2.0 * k_u * mdotu * uy;
-        h_cell[2] += 2.0 * k_u * mdotu * uz;
+    for (m_cell, b_cell) in m.data.iter().zip(b_eff.data.iter_mut()) {
+        let mdotu = m_cell[0] * u[0] + m_cell[1] * u[1] + m_cell[2] * u[2];
+        b_cell[0] += coeff * mdotu * u[0];
+        b_cell[1] += coeff * mdotu * u[1];
+        b_cell[2] += coeff * mdotu * u[2];
     }
 }

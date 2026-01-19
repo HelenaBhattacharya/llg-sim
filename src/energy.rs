@@ -1,17 +1,9 @@
 // src/energy.rs
 
 use crate::grid::Grid2D;
-use crate::vector_field::VectorField2D;
 use crate::params::Material;
+use crate::vector_field::VectorField2D;
 
-/// Energy contributions in "toy" units, but coming from the same
-/// functional as the effective field:
-///
-///   E_ex  ~ a_ex * ∫ |∇m|^2 dV
-///   E_an  ~ k_u  * ∫ [1 - (m·u)^2] dV
-///   E_zee ~ - M_s ∫ H_ext · m dV
-///
-/// where a_ex, k_u, M_s are the parameters stored in `Material`.
 #[derive(Debug, Copy, Clone)]
 pub struct EnergyBreakdown {
     pub exchange: f64,
@@ -25,29 +17,24 @@ impl EnergyBreakdown {
     }
 }
 
-/// Compute exchange + anisotropy + Zeeman energies on the grid.
-///
-/// This uses simple one–sided finite differences for |∇m|^2 and
-/// includes the cell area dx*dy so the energy scales with the domain size.
-pub fn compute_energy(
-    grid: &Grid2D,
-    m: &VectorField2D,
-    material: &Material,
-    h_ext: [f64; 3],
-) -> EnergyBreakdown {
+/// SI-consistent energy model:
+///   w_ex  = A |∇m|^2
+///   w_ani = K_u [1 - (m·u)^2]
+///   w_zee = - M_s (m · B_ext)
+/// and E = ∫ w dV.
+pub fn compute_energy(grid: &Grid2D, m: &VectorField2D, material: &Material, b_ext: [f64; 3]) -> EnergyBreakdown {
     let nx = grid.nx;
     let ny = grid.ny;
     let dx = grid.dx;
     let dy = grid.dy;
+    let v = grid.cell_volume();
 
-    let cell_area = dx * dy; // 2D film, thickness = 1 in toy units
-
-    let a_ex = material.a_ex;
+    let a = material.a_ex;
     let k_u = material.k_u;
     let u = material.easy_axis;
-    let m_s = material.ms;
+    let ms = material.ms;
 
-    let (hx, hy, hz) = (h_ext[0], h_ext[1], h_ext[2]);
+    let (bx, by, bz) = (b_ext[0], b_ext[1], b_ext[2]);
 
     let mut e_ex = 0.0;
     let mut e_an = 0.0;
@@ -59,59 +46,39 @@ pub fn compute_energy(
             let mij = m.data[idx];
             let (mx, my, mz) = (mij[0], mij[1], mij[2]);
 
-            // ---------- exchange: |∇m|^2 ----------
-            // forward differences in x,y with clamped boundaries
-            let ip = if i + 1 < nx { i + 1 } else { i };
-            let jp = if j + 1 < ny { j + 1 } else { j };
+            // Exchange (forward differences)
+            if a != 0.0 {
+                if i + 1 < nx {
+                    let mip = m.data[grid.idx(i + 1, j)];
+                    let dxm = [mip[0] - mx, mip[1] - my, mip[2] - mz];
+                    let sq = dxm[0] * dxm[0] + dxm[1] * dxm[1] + dxm[2] * dxm[2];
+                    e_ex += a * (sq / (dx * dx)) * v;
+                }
+                if j + 1 < ny {
+                    let mjp = m.data[grid.idx(i, j + 1)];
+                    let dym = [mjp[0] - mx, mjp[1] - my, mjp[2] - mz];
+                    let sq = dym[0] * dym[0] + dym[1] * dym[1] + dym[2] * dym[2];
+                    e_ex += a * (sq / (dy * dy)) * v;
+                }
+            }
 
-            let m_ip = m.data[grid.idx(ip, j)];
-            let m_jp = m.data[grid.idx(i, jp)];
+            // Uniaxial anisotropy
+            if k_u != 0.0 {
+                let mdotu = mx * u[0] + my * u[1] + mz * u[2];
+                e_an += k_u * (1.0 - mdotu * mdotu) * v;
+            }
 
-            let dmdx = [
-                (m_ip[0] - mx) / dx,
-                (m_ip[1] - my) / dx,
-                (m_ip[2] - mz) / dx,
-            ];
-            let dmdy = [
-                (m_jp[0] - mx) / dy,
-                (m_jp[1] - my) / dy,
-                (m_jp[2] - mz) / dy,
-            ];
-
-            let grad_sq = (0..3)
-                .map(|c| dmdx[c] * dmdx[c] + dmdy[c] * dmdy[c])
-                .sum::<f64>();
-
-            e_ex += a_ex * grad_sq * cell_area;
-
-            // ---------- uniaxial anisotropy ----------
-            // E_an = k_u * (1 - (m·u)^2)
-            let mdotu = mx * u[0] + my * u[1] + mz * u[2];
-            e_an += k_u * (1.0 - mdotu * mdotu) * cell_area;
-
-            // ---------- Zeeman ----------
-            // E_zee = - M_s * H_ext · m  (toy units)
-            let mdoth = mx * hx + my * hy + mz * hz;
-            e_zee -= m_s * mdoth * cell_area;
+            // Zeeman
+            if ms != 0.0 {
+                let mdotb = mx * bx + my * by + mz * bz;
+                e_zee -= ms * mdotb * v;
+            }
         }
     }
 
-    EnergyBreakdown {
-        exchange: e_ex,
-        anisotropy: e_an,
-        zeeman: e_zee,
-    }
+    EnergyBreakdown { exchange: e_ex, anisotropy: e_an, zeeman: e_zee }
 }
 
-/// Backwards-compatible helper: just the total energy.
-///
-/// NOTE: signature changed compared to your old version: we now also
-/// need `h_ext` to include Zeeman energy.
-pub fn compute_total_energy(
-    grid: &Grid2D,
-    m: &VectorField2D,
-    material: &Material,
-    h_ext: [f64; 3],
-) -> f64 {
-    compute_energy(grid, m, material, h_ext).total()
+pub fn compute_total_energy(grid: &Grid2D, m: &VectorField2D, material: &Material, b_ext: [f64; 3]) -> f64 {
+    compute_energy(grid, m, material, b_ext).total()
 }
