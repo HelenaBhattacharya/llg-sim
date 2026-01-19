@@ -163,7 +163,7 @@ impl SimConfig {
             easy_axis: normalise3([0.0, 0.0, 1.0]),
         };
 
-        let run = RunSpec { n_steps: 100_000, save_every: 200, fps: 20, zoom_t_max: 2e-9 };
+        let run = RunSpec { n_steps: 10_000, save_every: 200, fps: 20, zoom_t_max: 2e-9 };
 
         Self { preset: Preset::MuMaxLike, init, grid, llg, material, run }
     }

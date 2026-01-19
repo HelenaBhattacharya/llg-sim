@@ -1,0 +1,40 @@
+// mumax/macrospin_anisotropy.mx3
+//
+// Macrospin with uniaxial anisotropy (Ku1 != 0), no exchange, demag disabled.
+// Designed to match src/bin/macrospin_anisotropy.rs.
+//
+// Run on SCARF GPU:
+//   mumax3 -http "" -o runs/macrospin_anisotropy mumax/macrospin_anisotropy.mx3
+
+SetGridSize(1, 1, 1)
+SetCellSize(5e-9, 5e-9, 5e-9)
+
+Msat = 8e5
+Aex  = 0
+Ku1  = 500
+anisU = vector(0, 0, 1)     // uniaxial axis  [oai_citation:0‡indico.linxs.lu.se](https://indico.linxs.lu.se/event/212/attachments/54/101/mumax3.pdf?utm_source=chatgpt.com)
+
+// Disable magnetostatic interaction so physics matches current Rust code.
+NoDemagSpins.Set(1)         // disable demag everywhere  [oai_citation:1‡GitHub](https://github.com/mumax/3/blob/master/engine/demag.go?utm_source=chatgpt.com)
+
+// LLG
+alpha = 0.02
+
+// External field off
+B_ext = vector(0, 0, 0)
+
+// Tilt initial condition to excite motion
+theta := 20 * pi / 180
+m = uniform(sin(theta), 0, cos(theta))
+
+// Table outputs (t,mx,my,mz are included; add extras)
+TableAdd(B_ext)
+TableAdd(B_anis)       // anisotropy field (T)  [oai_citation:2‡mumax.github.io](https://mumax.github.io/api.html?utm_source=chatgpt.com)
+TableAdd(E_total)
+TableAdd(E_Zeeman)
+TableAdd(Edens_anis)   // anisotropy energy density (J/m^3)  [oai_citation:3‡mumax.github.io](https://mumax.github.io/api.html?utm_source=chatgpt.com)
+
+FixDt = 1e-12
+TableAutoSave(1e-12)
+
+Run(100e-9) // 100 ns
