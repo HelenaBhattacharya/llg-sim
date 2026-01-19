@@ -1,5 +1,21 @@
-/target
-/frames
-/out
-/mumax_outputs
+# --- Rust build artifacts ---
+/target/
 
+# --- Generated simulation outputs (local only) ---
+/frames/
+/out/
+/mumax_outputs/
+
+# --- Legacy outputs written to repo root by src/main.rs (ignore these too) ---
+/avg_magnetisation.csv
+/avg_magnetization.csv
+/energy_vs_time.csv
+/energy_vs_time.png
+/energy_residual_vs_time.png
+/m_avg_vs_time.png
+/m_avg_vs_time_zoom.png
+/mz_evolution.mp4
+
+# --- OS / editor noise ---
+.DS_Store
+.vscode/
