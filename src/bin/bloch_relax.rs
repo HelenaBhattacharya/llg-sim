@@ -9,10 +9,10 @@
 // Run:
 //   cargo run --bin bloch_relax
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
@@ -26,17 +26,17 @@ fn main() -> std::io::Result<()> {
     let dy: f64 = 5e-9;
     let dz: f64 = 5e-9;
 
-    let ms: f64 = 8.0e5;        // A/m
-    let a_ex: f64 = 13e-12;     // J/m
-    let k_u: f64 = 500.0;       // J/m^3
+    let ms: f64 = 8.0e5; // A/m
+    let a_ex: f64 = 13e-12; // J/m
+    let k_u: f64 = 500.0; // J/m^3
     let easy_axis = [0.0, 0.0, 1.0];
 
     // External field OFF for relaxation
     let b_ext = [0.0, 0.0, 0.0];
 
     let alpha: f64 = 0.02;
-    let dt: f64 = 2e-13;        // slightly larger than 1e-13 to keep runtime reasonable
-    let t_total: f64 = 20e-9;   // 20 ns relaxation
+    let dt: f64 = 2e-13; // slightly larger than 1e-13 to keep runtime reasonable
+    let t_total: f64 = 20e-9; // 20 ns relaxation
     let out_stride: usize = 50; // write every 50 steps (dt_out = 1e-11 s)
     // -------------------------------------
 
@@ -95,9 +95,16 @@ fn main() -> std::io::Result<()> {
             w,
             "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             t,
-            mx, my, mz,
-            e.total(), e.exchange, e.anisotropy, e.zeeman,
-            params.b_ext[0], params.b_ext[1], params.b_ext[2],
+            mx,
+            my,
+            mz,
+            e.total(),
+            e.exchange,
+            e.anisotropy,
+            e.zeeman,
+            params.b_ext[0],
+            params.b_ext[1],
+            params.b_ext[2],
         )?;
     }
 
@@ -113,14 +120,24 @@ fn main() -> std::io::Result<()> {
                 w,
                 "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
                 t,
-                mx, my, mz,
-                e.total(), e.exchange, e.anisotropy, e.zeeman,
-                params.b_ext[0], params.b_ext[1], params.b_ext[2],
+                mx,
+                my,
+                mz,
+                e.total(),
+                e.exchange,
+                e.anisotropy,
+                e.zeeman,
+                params.b_ext[0],
+                params.b_ext[1],
+                params.b_ext[2],
             )?;
         }
     }
 
     println!("Wrote out/rust_table_bloch_relax.csv");
-    println!("Grid: {}x{}, dt={}, T={}, steps={}", nx, ny, dt, t_total, n_steps);
+    println!(
+        "Grid: {}x{}, dt={}, T={}, steps={}",
+        nx, ny, dt, t_total, n_steps
+    );
     Ok(())
 }

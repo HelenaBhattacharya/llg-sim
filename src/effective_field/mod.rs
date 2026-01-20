@@ -1,8 +1,8 @@
 // src/effective_field/mod.rs
 
-pub mod zeeman;
-pub mod exchange;
 pub mod anisotropy;
+pub mod exchange;
+pub mod zeeman;
 
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};

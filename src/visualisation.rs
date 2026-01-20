@@ -66,16 +66,14 @@ pub fn save_mz_plot(
         .axis_desc_style(("sans-serif", 15))
         .draw()?;
 
-    chart.draw_series(
-        (0..nx).flat_map(|i| {
-            (0..ny).map(move |j| {
-                let idx = field.idx(i as usize, j as usize);
-                let mz = field.data[idx][2];
-                let color = mz_to_color(mz);
-                Rectangle::new([(i, j), (i + 1, j + 1)], color.filled())
-            })
-        }),
-    )?;
+    chart.draw_series((0..nx).flat_map(|i| {
+        (0..ny).map(move |j| {
+            let idx = field.idx(i as usize, j as usize);
+            let mz = field.data[idx][2];
+            let color = mz_to_color(mz);
+            Rectangle::new([(i, j), (i + 1, j + 1)], color.filled())
+        })
+    }))?;
 
     // Annotation with min/max of this frame
     let annot = format!("m_z ∈ [-1, 1] | frame min={:.3}, max={:.3}", min_mz, max_mz);
@@ -88,33 +86,43 @@ pub fn save_mz_plot(
     Ok(())
 }
 
-/// Use `ffmpeg` to stitch all frames/mz_*.png into an MP4 movie.
-pub fn make_movie_with_ffmpeg(pattern: &str, output: &str, fps: u32) -> io::Result<()> {
+/// Use `ffmpeg` to stitch frames into an MP4 movie.
+///
+/// IMPORTANT:
+/// This expects a *numbered sequence* pattern like:
+///   "frames/mz_%05d.png"
+/// and assumes numbering starts at 0 with no gaps.
+/// (main.rs will now generate frames that way.)
+pub fn make_movie_with_ffmpeg(pattern_glob: &str, output: &str, fps: u32) -> io::Result<()> {
     let ffmpeg_path = "/opt/homebrew/bin/ffmpeg"; // update if needed
 
-    let status = Command::new(ffmpeg_path)
-        .args(&[
-            "-y",
-            "-framerate",
-            &fps.to_string(),
-            "-pattern_type",
-            "glob",
-            "-i",
-            pattern,
-            "-pix_fmt",
-            "yuv420p",
-            output,
-        ])
-        .status()?;
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.arg("-y")
+        .arg("-framerate")
+        .arg(fps.to_string())
+        // THIS is the key: must be before -i
+        .arg("-pattern_type")
+        .arg("glob")
+        .arg("-i")
+        .arg(pattern_glob)
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(output);
+
+    let status = cmd.status()?;
 
     if !status.success() {
-        eprintln!("ffmpeg exited with status {:?}", status);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("ffmpeg failed with status {:?}", status),
+        ));
     }
 
     Ok(())
 }
 
-/// Plot exchange, anisotropy, Zeeman and total energy versus time.
+// --- the rest of your plotting helpers unchanged ---
+
 pub fn save_energy_components_plot(
     times: &[f64],
     e_ex: &[f64],
@@ -133,7 +141,6 @@ pub fn save_energy_components_plot(
     let t_min = *times.first().unwrap();
     let t_max = *times.last().unwrap();
 
-    // --- find global y-range over all components (unscaled) ---
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
 
@@ -148,7 +155,11 @@ pub fn save_energy_components_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-30 {
-        let delta = if y_max.abs() < 1e-30 { 1.0 } else { 0.1 * y_max.abs() };
+        let delta = if y_max.abs() < 1e-30 {
+            1.0
+        } else {
+            0.1 * y_max.abs()
+        };
         y_min -= delta;
         y_max += delta;
     } else {
@@ -157,7 +168,6 @@ pub fn save_energy_components_plot(
         y_max += margin;
     }
 
-    // ---------- choose a 10^n scaling for nicer axes ----------
     let magnitude = y_max.abs().max(y_min.abs());
     let (scale, y_label): (f64, String) = if magnitude > 0.0 {
         let exp = magnitude.log10().floor() as i32;
@@ -208,7 +218,10 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times.iter().zip(e_zee.iter()).map(|(&t, &e)| (t, e / scale)),
+            times
+                .iter()
+                .zip(e_zee.iter())
+                .map(|(&t, &e)| (t, e / scale)),
             &GREEN,
         ))?
         .label("Zeeman")
@@ -216,7 +229,10 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times.iter().zip(e_tot.iter()).map(|(&t, &e)| (t, e / scale)),
+            times
+                .iter()
+                .zip(e_tot.iter())
+                .map(|(&t, &e)| (t, e / scale)),
             &BLACK,
         ))?
         .label("Total")
@@ -326,7 +342,11 @@ pub fn save_energy_residual_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-30 {
-        let delta = if y_max.abs() < 1e-30 { 1.0 } else { 0.1 * y_max.abs() };
+        let delta = if y_max.abs() < 1e-30 {
+            1.0
+        } else {
+            0.1 * y_max.abs()
+        };
         y_min -= delta;
         y_max += delta;
     } else {
@@ -401,7 +421,11 @@ pub fn save_m_avg_zoom_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-9 {
-        let delta = if y_max.abs() < 1e-9 { 1.0 } else { 0.1 * y_max.abs() };
+        let delta = if y_max.abs() < 1e-9 {
+            1.0
+        } else {
+            0.1 * y_max.abs()
+        };
         y_min -= delta;
         y_max += delta;
     } else {

@@ -9,10 +9,10 @@
 // Output:
 //   out/rust_table.csv
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::step_llg_with_field_rk4;
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
@@ -24,15 +24,15 @@ fn main() -> std::io::Result<()> {
     let dy = 5e-9;
     let dz = 5e-9;
 
-    let b0 = 1.0_f64;           // Tesla
+    let b0 = 1.0_f64; // Tesla
     let alpha = 0.01_f64;
-    let dt = 5e-14_f64;         // seconds
-    let t_total = 5e-9_f64;     // 5 ns
-    let theta_deg = 5.0_f64;    // initial tilt angle
+    let dt = 5e-14_f64; // seconds
+    let t_total = 5e-9_f64; // 5 ns
+    let theta_deg = 5.0_f64; // initial tilt angle
 
-    let ms = 8.0e5_f64;         // A/m
-    let a_ex = 0.0_f64;         // J/m (OFF for macrospin)
-    let k_u = 0.0_f64;          // J/m^3 (OFF for macrospin)
+    let ms = 8.0e5_f64; // A/m
+    let a_ex = 0.0_f64; // J/m (OFF for macrospin)
+    let k_u = 0.0_f64; // J/m^3 (OFF for macrospin)
     // ------------------------------------------------------------
 
     let n_steps: usize = (t_total / dt).round() as usize;
@@ -69,10 +69,7 @@ fn main() -> std::io::Result<()> {
     let mut w = BufWriter::new(file);
 
     // MuMax-like table columns
-    writeln!(
-        w,
-        "t,mx,my,mz,E_total,E_ex,E_an,E_zee,Bx,By,Bz"
-    )?;
+    writeln!(w, "t,mx,my,mz,E_total,E_ex,E_an,E_zee,Bx,By,Bz")?;
 
     // Write t=0 row
     {
@@ -82,9 +79,16 @@ fn main() -> std::io::Result<()> {
             w,
             "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             0.0,
-            v[0], v[1], v[2],
-            e.total(), e.exchange, e.anisotropy, e.zeeman,
-            params.b_ext[0], params.b_ext[1], params.b_ext[2],
+            v[0],
+            v[1],
+            v[2],
+            e.total(),
+            e.exchange,
+            e.anisotropy,
+            e.zeeman,
+            params.b_ext[0],
+            params.b_ext[1],
+            params.b_ext[2],
         )?;
     }
 
@@ -99,15 +103,27 @@ fn main() -> std::io::Result<()> {
             w,
             "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             t,
-            v[0], v[1], v[2],
-            e.total(), e.exchange, e.anisotropy, e.zeeman,
-            params.b_ext[0], params.b_ext[1], params.b_ext[2],
+            v[0],
+            v[1],
+            v[2],
+            e.total(),
+            e.exchange,
+            e.anisotropy,
+            e.zeeman,
+            params.b_ext[0],
+            params.b_ext[1],
+            params.b_ext[2],
         )?;
     }
 
     // Helpful printout
     let f_expected = (params.gamma * b0) / (2.0 * std::f64::consts::PI);
-    println!("Wrote out/rust_table.csv (N={}, dt={} s, T={} s)", n_steps + 1, dt, t_total);
+    println!(
+        "Wrote out/rust_table.csv (N={}, dt={} s, T={} s)",
+        n_steps + 1,
+        dt,
+        t_total
+    );
     println!("Expected precession frequency ~ {:.3e} Hz", f_expected);
 
     Ok(())

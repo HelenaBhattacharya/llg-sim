@@ -22,7 +22,12 @@ impl EnergyBreakdown {
 ///   w_ani = K_u [1 - (m·u)^2]
 ///   w_zee = - M_s (m · B_ext)
 /// and E = ∫ w dV.
-pub fn compute_energy(grid: &Grid2D, m: &VectorField2D, material: &Material, b_ext: [f64; 3]) -> EnergyBreakdown {
+pub fn compute_energy(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    material: &Material,
+    b_ext: [f64; 3],
+) -> EnergyBreakdown {
     let nx = grid.nx;
     let ny = grid.ny;
     let dx = grid.dx;
@@ -76,9 +81,18 @@ pub fn compute_energy(grid: &Grid2D, m: &VectorField2D, material: &Material, b_e
         }
     }
 
-    EnergyBreakdown { exchange: e_ex, anisotropy: e_an, zeeman: e_zee }
+    EnergyBreakdown {
+        exchange: e_ex,
+        anisotropy: e_an,
+        zeeman: e_zee,
+    }
 }
 
-pub fn compute_total_energy(grid: &Grid2D, m: &VectorField2D, material: &Material, b_ext: [f64; 3]) -> f64 {
+pub fn compute_total_energy(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    material: &Material,
+    b_ext: [f64; 3],
+) -> f64 {
     compute_energy(grid, m, material, b_ext).total()
 }

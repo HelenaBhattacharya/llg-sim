@@ -75,9 +75,9 @@ pub struct LLGParams {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Material {
-    pub ms: f64,       // A/m
-    pub a_ex: f64,     // J/m
-    pub k_u: f64,      // J/m^3
+    pub ms: f64,   // A/m
+    pub a_ex: f64, // J/m
+    pub k_u: f64,  // J/m^3
     pub easy_axis: Vec3,
 }
 
@@ -91,8 +91,12 @@ pub struct GridSpec {
 }
 
 impl GridSpec {
-    pub fn lx(&self) -> f64 { self.nx as f64 * self.dx }
-    pub fn ly(&self) -> f64 { self.ny as f64 * self.dy }
+    pub fn lx(&self) -> f64 {
+        self.nx as f64 * self.dx
+    }
+    pub fn ly(&self) -> f64 {
+        self.ny as f64 * self.dy
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,14 +128,25 @@ impl SimConfig {
     /// Non-physical numbers, but consistent *meanings*.
     /// External field is only applied for Tilt by default.
     pub fn toy(init: InitKind) -> Self {
-        let grid = GridSpec { nx: 128, ny: 128, dx: 5e-12, dy: 5e-12, dz: 5e-12 };
+        let grid = GridSpec {
+            nx: 128,
+            ny: 128,
+            dx: 5e-12,
+            dy: 5e-12,
+            dz: 5e-12,
+        };
 
         let b_ext = match init {
             InitKind::Tilt => [1.0, 0.0, 0.0],
             _ => [0.0, 0.0, 0.0],
         };
 
-        let llg = LLGParams { gamma: 1.0, alpha: 0.1, dt: 0.0025, b_ext };
+        let llg = LLGParams {
+            gamma: 1.0,
+            alpha: 0.1,
+            dt: 0.0025,
+            b_ext,
+        };
 
         let material = Material {
             ms: 8.0e5,
@@ -140,21 +155,44 @@ impl SimConfig {
             easy_axis: normalise3([0.0, 0.0, 1.0]),
         };
 
-        let run = RunSpec { n_steps: 500, save_every: 2, fps: 20, zoom_t_max: 0.1 };
+        let run = RunSpec {
+            n_steps: 500,
+            save_every: 2,
+            fps: 20,
+            zoom_t_max: 0.1,
+        };
 
-        Self { preset: Preset::Toy, init, grid, llg, material, run }
+        Self {
+            preset: Preset::Toy,
+            init,
+            grid,
+            llg,
+            material,
+            run,
+        }
     }
 
     /// SI-ish starting point for MuMax comparisons (after validation).
     pub fn mumax_like(init: InitKind) -> Self {
-        let grid = GridSpec { nx: 128, ny: 128, dx: 5e-9, dy: 5e-9, dz: 5e-9 };
+        let grid = GridSpec {
+            nx: 128,
+            ny: 128,
+            dx: 5e-9,
+            dy: 5e-9,
+            dz: 5e-9,
+        };
 
         let b_ext = match init {
             InitKind::Tilt => [0.01, 0.0, 0.0], // 10 mT
             _ => [0.0, 0.0, 0.0],
         };
 
-        let llg = LLGParams { gamma: GAMMA_E_RAD_PER_S_T, alpha: 0.02, dt: 1e-13, b_ext };
+        let llg = LLGParams {
+            gamma: GAMMA_E_RAD_PER_S_T,
+            alpha: 0.02,
+            dt: 1e-13,
+            b_ext,
+        };
 
         let material = Material {
             ms: 8.0e5,
@@ -163,15 +201,29 @@ impl SimConfig {
             easy_axis: normalise3([0.0, 0.0, 1.0]),
         };
 
-        let run = RunSpec { n_steps: 10_000, save_every: 200, fps: 20, zoom_t_max: 2e-9 };
+        let run = RunSpec {
+            n_steps: 10_000,
+            save_every: 200,
+            fps: 20,
+            zoom_t_max: 2e-9,
+        };
 
-        Self { preset: Preset::MuMaxLike, init, grid, llg, material, run }
+        Self {
+            preset: Preset::MuMaxLike,
+            init,
+            grid,
+            llg,
+            material,
+            run,
+        }
     }
 }
 
 fn normalise3(v: Vec3) -> Vec3 {
     let n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-    if n2 == 0.0 { return [0.0, 0.0, 1.0]; }
+    if n2 == 0.0 {
+        return [0.0, 0.0, 1.0];
+    }
     let inv = 1.0 / n2.sqrt();
     [v[0] * inv, v[1] * inv, v[2] * inv]
 }

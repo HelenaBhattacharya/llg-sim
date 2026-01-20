@@ -118,23 +118,20 @@ pub fn step_llg_with_field_rk4(m: &mut VectorField2D, b_eff: &VectorField2D, par
         let b = b_eff.data[cell_idx];
 
         let k1 = llg_rhs(m0, b, gamma, alpha);
-        let m1 = add_scaled(m0, 0.5 * dt, k1);
+        let m1 = normalize(add_scaled(m0, 0.5 * dt, k1));
 
         let k2 = llg_rhs(m1, b, gamma, alpha);
-        let m2 = add_scaled(m0, 0.5 * dt, k2);
+        let m2 = normalize(add_scaled(m0, 0.5 * dt, k2));
 
         let k3 = llg_rhs(m2, b, gamma, alpha);
-        let m3 = add_scaled(m0, dt, k3);
+        let m3 = normalize(add_scaled(m0, dt, k3));
 
         let k4 = llg_rhs(m3, b, gamma, alpha);
 
-        let m_new = [
-            m0[0] + (dt / 6.0) * (k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0]),
-            m0[1] + (dt / 6.0) * (k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1]),
-            m0[2] + (dt / 6.0) * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2]),
-        ];
+        let incr = combo_rk4(k1, k2, k3, k4);
+        let m_new = normalize(add_scaled(m0, dt, incr));
 
-        *cell = normalize(m_new);
+        *cell = m_new;
     }
 }
 

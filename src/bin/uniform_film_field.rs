@@ -11,10 +11,10 @@
 // Output:
 //   out/rust_table_uniform_film.csv
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
@@ -28,17 +28,17 @@ fn main() -> std::io::Result<()> {
     let dy: f64 = 5e-9;
     let dz: f64 = 5e-9;
 
-    let ms: f64 = 8.0e5;        // A/m
-    let a_ex: f64 = 13e-12;     // J/m
-    let k_u: f64 = 500.0;       // J/m^3
+    let ms: f64 = 8.0e5; // A/m
+    let a_ex: f64 = 13e-12; // J/m
+    let k_u: f64 = 500.0; // J/m^3
     let easy_axis = [0.0, 0.0, 1.0];
 
     // External field along +x to drive dynamics from an initial +z state
     let b_ext = [0.01, 0.0, 0.0]; // 10 mT
 
     let alpha: f64 = 0.02;
-    let dt: f64 = 1e-13;        // integration dt
-    let t_total: f64 = 5e-9;    // 5 ns
+    let dt: f64 = 1e-13; // integration dt
+    let t_total: f64 = 5e-9; // 5 ns
     let out_stride: usize = 10; // write every N steps -> dt_out = out_stride*dt
     // -------------------------------------
 
@@ -95,9 +95,16 @@ fn main() -> std::io::Result<()> {
             w,
             "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             t,
-            mx, my, mz,
-            e.total(), e.exchange, e.anisotropy, e.zeeman,
-            params.b_ext[0], params.b_ext[1], params.b_ext[2],
+            mx,
+            my,
+            mz,
+            e.total(),
+            e.exchange,
+            e.anisotropy,
+            e.zeeman,
+            params.b_ext[0],
+            params.b_ext[1],
+            params.b_ext[2],
         )?;
     }
 
@@ -113,9 +120,16 @@ fn main() -> std::io::Result<()> {
                 w,
                 "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
                 t,
-                mx, my, mz,
-                e.total(), e.exchange, e.anisotropy, e.zeeman,
-                params.b_ext[0], params.b_ext[1], params.b_ext[2],
+                mx,
+                my,
+                mz,
+                e.total(),
+                e.exchange,
+                e.anisotropy,
+                e.zeeman,
+                params.b_ext[0],
+                params.b_ext[1],
+                params.b_ext[2],
             )?;
         }
     }

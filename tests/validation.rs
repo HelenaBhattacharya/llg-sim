@@ -10,6 +10,7 @@ use llg_sim::grid::Grid2D;
 use llg_sim::llg::step_llg_with_field;
 use llg_sim::params::{LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
+use llg_sim::energy::compute_total_energy;
 
 fn unit(v: [f64; 3]) -> [f64; 3] {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -210,6 +211,84 @@ fn bloch_wall_init_matches_tanh_sech_profile() {
             rel_err
         );
     }
+}
+
+#[test]
+fn energy_gradient_consistency_exchange_anisotropy() {
+    // Checks the discrete consistency:
+    //   ΔE ≈ -Ms * V * B_eff(cell) · Δm
+    //
+    // This is *exactly* the Priority B "energy-gradient consistency" idea.
+
+    let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 5e-9);
+    let mut m = VectorField2D::new(grid);
+
+    // A non-uniform configuration (so exchange is active)
+    let x0 = 0.5 * grid.nx as f64 * grid.dx;
+    let width = 5.0 * grid.dx;
+    m.init_bloch_wall(x0, width);
+
+    let params = LLGParams {
+        gamma: 1.760_859_630_23e11,
+        alpha: 0.02,
+        dt: 1e-13,
+        b_ext: [0.0, 0.0, 0.0],
+    };
+
+    let material = Material {
+        ms: 8.0e5,
+        a_ex: 13e-12,
+        k_u: 500.0,
+        easy_axis: unit([0.0, 0.0, 1.0]),
+    };
+
+    // Build B_eff for the current state
+    let mut b_eff = VectorField2D::new(grid);
+    build_h_eff(&grid, &m, &mut b_eff, &params, &material);
+
+    let e0 = compute_total_energy(&grid, &m, &material, params.b_ext);
+
+    // Pick an interior cell
+    let i = grid.nx / 2;
+    let j = grid.ny / 2;
+    let idx = grid.idx(i, j);
+    let m0 = m.data[idx];
+
+    // Choose a perturbation direction perpendicular to m0
+    let a = [0.37, -0.24, 0.91];
+    let mdota = m0[0] * a[0] + m0[1] * a[1] + m0[2] * a[2];
+    let mut dir = [a[0] - mdota * m0[0], a[1] - mdota * m0[1], a[2] - mdota * m0[2]];
+    let n = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    assert!(n > 1e-12, "failed to construct a perpendicular perturbation");
+    dir = [dir[0] / n, dir[1] / n, dir[2] / n];
+
+    // Small perturbation + renormalise
+    let eps = 1e-6;
+    let m1 = unit([m0[0] + eps * dir[0], m0[1] + eps * dir[1], m0[2] + eps * dir[2]]);
+    let dm = [m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2]];
+
+    // Copy field and perturb one cell
+    let mut m_pert = VectorField2D { grid, data: m.data.clone() };
+    m_pert.data[idx] = m1;
+
+    let e1 = compute_total_energy(&grid, &m_pert, &material, params.b_ext);
+
+    let de_num = e1 - e0;
+
+    let b = b_eff.data[idx];
+    let de_pred = -material.ms * grid.cell_volume() * (b[0] * dm[0] + b[1] * dm[1] + b[2] * dm[2]);
+
+    // Compare with a loose tolerance (we only need “same order and sign” right now)
+    let b_norm = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
+    let scale = (material.ms * grid.cell_volume() * b_norm * eps).max(1e-30);
+
+    let err = (de_num - de_pred).abs();
+
+    assert!(
+        err < 5e-2 * scale,
+        "ΔE mismatch: num={:.6e}, pred={:.6e}, err={:.6e}, scale={:.6e}",
+        de_num, de_pred, err, scale
+    );
 }
 
 #[test]
