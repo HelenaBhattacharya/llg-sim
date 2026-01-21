@@ -1,10 +1,15 @@
 // src/bin/bloch_relax.rs
 //
-// Bloch wall relaxation benchmark (exchange + uniaxial anisotropy + optional B_ext).
+// Bloch wall relaxation benchmark (exchange + uniaxial anisotropy).
 // Demag is absent in Rust; MuMax demag will be disabled for fair comparison.
 //
 // Outputs:
 //   out/rust_table_bloch_relax.csv
+//   out/bloch_slices/
+//     rust_slice_t0.csv
+//     rust_slice_t5ns.csv
+//     rust_slice_t10ns.csv
+//     rust_slice_final.csv
 //
 // Run:
 //   cargo run --bin bloch_relax
@@ -18,6 +23,23 @@ use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
+fn write_midrow_slice(
+    m: &VectorField2D,
+    grid: &Grid2D,
+    filename: &str,
+) -> std::io::Result<()> {
+    let j = grid.ny / 2;
+    let mut f = BufWriter::new(File::create(filename)?);
+    writeln!(f, "x,mx,mz")?;
+    for i in 0..grid.nx {
+        let idx = j * grid.nx + i;
+        let x = (i as f64 + 0.5) * grid.dx;
+        let v = m.data[idx];
+        writeln!(f, "{:.6e},{:.6e},{:.6e}", x, v[0], v[2])?;
+    }
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     // --- keep in sync with MuMax script ---
     let nx: usize = 256;
@@ -26,18 +48,17 @@ fn main() -> std::io::Result<()> {
     let dy: f64 = 5e-9;
     let dz: f64 = 5e-9;
 
-    let ms: f64 = 8.0e5; // A/m
-    let a_ex: f64 = 13e-12; // J/m
-    let k_u: f64 = 500.0; // J/m^3
+    let ms: f64 = 8.0e5;      // A/m
+    let a_ex: f64 = 13e-12;   // J/m
+    let k_u: f64 = 500.0;     // J/m^3
     let easy_axis = [0.0, 0.0, 1.0];
 
-    // External field OFF for relaxation
     let b_ext = [0.0, 0.0, 0.0];
 
     let alpha: f64 = 0.02;
-    let dt: f64 = 2e-13; // slightly larger than 1e-13 to keep runtime reasonable
-    let t_total: f64 = 20e-9; // 20 ns relaxation
-    let out_stride: usize = 50; // write every 50 steps (dt_out = 1e-11 s)
+    let dt: f64 = 2e-13;
+    let t_total: f64 = 20e-9;
+    let out_stride: usize = 50;
     // -------------------------------------
 
     let n_steps: usize = (t_total / dt).round() as usize;
@@ -45,9 +66,9 @@ fn main() -> std::io::Result<()> {
     let grid = Grid2D::new(nx, ny, dx, dy, dz);
     let mut m = VectorField2D::new(grid);
 
-    // Bloch wall initial condition: centred in x, uniform in y
+    // Bloch wall initial condition
     let x0 = 0.5 * nx as f64 * dx;
-    let width = 5.0 * dx; // intentionally sharp vs equilibrium, so it relaxes
+    let width = 5.0 * dx;
     m.init_bloch_wall(x0, width);
 
     let params = LLGParams {
@@ -67,12 +88,13 @@ fn main() -> std::io::Result<()> {
     let mut scratch = RK4Scratch::new(grid);
 
     create_dir_all("out")?;
+    create_dir_all("out/bloch_slices")?;
+
     let file = File::create("out/rust_table_bloch_relax.csv")?;
     let mut w = BufWriter::new(file);
 
     writeln!(w, "t,mx,my,mz,E_total,E_ex,E_an,E_zee,Bx,By,Bz")?;
 
-    // helper avg
     let avg_m = |field: &VectorField2D| -> [f64; 3] {
         let mut sx = 0.0;
         let mut sy = 0.0;
@@ -86,7 +108,7 @@ fn main() -> std::io::Result<()> {
         [sx / n, sy / n, sz / n]
     };
 
-    // step 0
+    // t = 0
     {
         let t = 0.0;
         let [mx, my, mz] = avg_m(&m);
@@ -108,14 +130,23 @@ fn main() -> std::io::Result<()> {
         )?;
     }
 
+    write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_t0.csv")?;
+
     for step in 1..=n_steps {
         step_llg_rk4_recompute_field(&mut m, &params, &material, &mut scratch);
 
+        let t = (step as f64) * dt;
+
+        if (t - 5.0e-9).abs() < 0.5 * dt {
+            write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_t5ns.csv")?;
+        }
+        if (t - 1.0e-8).abs() < 0.5 * dt {
+            write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_t10ns.csv")?;
+        }
+
         if step % out_stride == 0 || step == n_steps {
-            let t = (step as f64) * dt;
             let [mx, my, mz] = avg_m(&m);
             let e: EnergyBreakdown = compute_energy(&grid, &m, &material, params.b_ext);
-
             writeln!(
                 w,
                 "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
@@ -134,10 +165,8 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    println!("Wrote out/rust_table_bloch_relax.csv");
-    println!(
-        "Grid: {}x{}, dt={}, T={}, steps={}",
-        nx, ny, dt, t_total, n_steps
-    );
+    write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_final.csv")?;
+
+    println!("Wrote out/rust_table_bloch_relax.csv and out/bloch_slices/");
     Ok(())
 }

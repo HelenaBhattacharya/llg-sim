@@ -1,10 +1,14 @@
 // mumax/bloch_relax.mx3
-// Domain-wall relaxation with exchange + uniaxial anisotropy, demag disabled.
-// Matches Rust parameters.
+//
+// Minimal Bloch wall relaxation (exchange + uniaxial anisotropy only).
+// Demagnetising field disabled to match Rust benchmark.
 
 SetGridSize(256, 64, 1)
 SetCellSize(5e-9, 5e-9, 5e-9)
 
+// ----------------------
+// Material parameters
+// ----------------------
 Msat = 8e5
 Aex  = 13e-12
 Ku1  = 500
@@ -13,21 +17,28 @@ anisU = vector(0, 0, 1)
 alpha = 0.02
 B_ext = vector(0, 0, 0)
 
-// Disable demag for fair comparison
+// Disable demag explicitly
 NoDemagSpins.Set(1)
 
-// Two domains: left = -z, right = +z, wall magnetisation along +x (mx bump like your Rust init)
-m = twodomain(0,0,-1,  1,0,0,  0,0,1)
+// ----------------------
+// Initial state: Bloch wall
+// ----------------------
+m = twodomain(0, 0, -1,   1, 0, 0,   0, 0, 1)
 
-// Table outputs
-TableAdd(B_ext)
-TableAdd(E_total)
-TableAdd(E_Zeeman)
-TableAdd(Edens_exch)
-TableAdd(Edens_anis)
+// Explicit scalar components (REQUIRED)
+mx := m.Comp(0)
+mz := m.Comp(2)
 
-// Integrate at dt=2e-13, output every 1e-11 (matches the Rust stride we picked)
+// ----------------------
+// Time stepping
+// ----------------------
 FixDt = 2e-13
-TableAutoSave(1e-11)
 
+// Relax to equilibrium
 Run(20e-9)
+
+// ----------------------
+// Save final state
+// ----------------------
+SaveAs(mx, "mx_final")
+SaveAs(mz, "mz_final")
