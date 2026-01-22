@@ -4,18 +4,21 @@
 // Demag is absent in Rust; MuMax demag will be disabled for fair comparison.
 //
 // Outputs:
-//   out/rust_table_bloch_relax.csv
-//   out/bloch_slices/
-//     rust_slice_t0.csv
-//     rust_slice_t5ns.csv
-//     rust_slice_t10ns.csv
-//     rust_slice_final.csv
+//   out/bloch_relax/
+//     ├── config.json
+//     ├── rust_table_bloch_relax.csv
+//     └── bloch_slices/
+//         ├── rust_slice_t0.csv
+//         ├── rust_slice_t5ns.csv
+//         ├── rust_slice_t10ns.csv
+//         └── rust_slice_final.csv
 //
 // Run:
 //   cargo run --bin bloch_relax
 
 use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
@@ -23,10 +26,19 @@ use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
+use llg_sim::config::{
+    RunConfig,
+    GeometryConfig,
+    MaterialConfig,
+    FieldConfig,
+    NumericsConfig,
+    RunInfo,
+};
+
 fn write_midrow_slice(
     m: &VectorField2D,
     grid: &Grid2D,
-    filename: &str,
+    filename: &Path,
 ) -> std::io::Result<()> {
     let j = grid.ny / 2;
     let mut f = BufWriter::new(File::create(filename)?);
@@ -87,10 +99,57 @@ fn main() -> std::io::Result<()> {
 
     let mut scratch = RK4Scratch::new(grid);
 
-    create_dir_all("out")?;
-    create_dir_all("out/bloch_slices")?;
+    // -------------------------------------------------
+    // Output directories
+    // -------------------------------------------------
+    let out_dir = Path::new("out").join("bloch_relax");
+    let slices_dir = out_dir.join("bloch_slices");
 
-    let file = File::create("out/rust_table_bloch_relax.csv")?;
+    create_dir_all(&slices_dir)?;
+
+    // -------------------------------------------------
+    // Write config.json
+    // -------------------------------------------------
+    let run_config = RunConfig {
+        geometry: GeometryConfig {
+            nx,
+            ny,
+            nz: 1,
+            dx,
+            dy,
+            dz,
+        },
+        material: MaterialConfig {
+            ms,
+            aex: a_ex,
+            ku1: k_u,
+            easy_axis,
+        },
+        fields: FieldConfig {
+            b_ext,
+            demag: false,
+            dmi: None,
+        },
+        numerics: NumericsConfig {
+            integrator: "rk4_recompute".to_string(),
+            dt,
+            steps: n_steps,
+            output_stride: out_stride,
+        },
+        run: RunInfo {
+            binary: "bloch_relax".to_string(),
+            run_id: "bloch_relax".to_string(),
+            git_commit: None,
+            timestamp_utc: None,
+        },
+    };
+
+    run_config.write_to_dir(&out_dir)?;
+
+    // -------------------------------------------------
+    // Open output table
+    // -------------------------------------------------
+    let file = File::create(out_dir.join("rust_table_bloch_relax.csv"))?;
     let mut w = BufWriter::new(file);
 
     writeln!(w, "t,mx,my,mz,E_total,E_ex,E_an,E_zee,Bx,By,Bz")?;
@@ -130,7 +189,7 @@ fn main() -> std::io::Result<()> {
         )?;
     }
 
-    write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_t0.csv")?;
+    write_midrow_slice(&m, &grid, &slices_dir.join("rust_slice_t0.csv"))?;
 
     for step in 1..=n_steps {
         step_llg_rk4_recompute_field(&mut m, &params, &material, &mut scratch);
@@ -138,10 +197,10 @@ fn main() -> std::io::Result<()> {
         let t = (step as f64) * dt;
 
         if (t - 5.0e-9).abs() < 0.5 * dt {
-            write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_t5ns.csv")?;
+            write_midrow_slice(&m, &grid, &slices_dir.join("rust_slice_t5ns.csv"))?;
         }
         if (t - 1.0e-8).abs() < 0.5 * dt {
-            write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_t10ns.csv")?;
+            write_midrow_slice(&m, &grid, &slices_dir.join("rust_slice_t10ns.csv"))?;
         }
 
         if step % out_stride == 0 || step == n_steps {
@@ -165,8 +224,8 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    write_midrow_slice(&m, &grid, "out/bloch_slices/rust_slice_final.csv")?;
+    write_midrow_slice(&m, &grid, &slices_dir.join("rust_slice_final.csv"))?;
 
-    println!("Wrote out/rust_table_bloch_relax.csv and out/bloch_slices/");
+    println!("Wrote outputs to {:?}", out_dir);
     Ok(())
 }

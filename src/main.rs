@@ -19,6 +19,14 @@ use llg_sim::visualisation::{
     make_movie_with_ffmpeg, save_energy_components_plot, save_energy_residual_plot, save_m_avg_plot,
     save_m_avg_zoom_plot, save_mz_plot,
 };
+use llg_sim::config::{
+    RunConfig,
+    GeometryConfig,
+    MaterialConfig,
+    FieldConfig,
+    NumericsConfig,
+    RunInfo,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Integrator {
@@ -252,6 +260,46 @@ fn main() -> std::io::Result<()> {
     let frames_dir = run_dir.join("frames");
     create_dir_all(&frames_dir)?;
 
+    // -------------------------------------------------
+    // Write config.json for this run
+    // -------------------------------------------------
+    let run_config = RunConfig {
+        geometry: GeometryConfig {
+            nx: grid_spec.nx,
+            ny: grid_spec.ny,
+            nz: 1,
+            dx: grid_spec.dx,
+            dy: grid_spec.dy,
+            dz: grid_spec.dz,
+        },
+        material: MaterialConfig {
+            ms: material.ms,
+            aex: material.a_ex,
+            ku1: material.k_u,
+            easy_axis: material.easy_axis,
+        },
+        fields: FieldConfig {
+            b_ext: params.b_ext,
+            demag: false,   // demag not implemented yet
+            dmi: None,      // DMI not implemented yet
+        },
+        numerics: NumericsConfig {
+            integrator: integrator.as_str().to_string(),
+            dt: params.dt,
+            steps: run.n_steps,
+            output_stride: run.save_every,
+        },
+        run: RunInfo {
+            binary: "llg-sim".to_string(),
+            run_id: run_id.clone(),
+            git_commit: None,
+            timestamp_utc: None,
+        },
+    };
+
+    run_config.write_to_dir(&run_dir)?;
+
+
     // ffmpeg expects a glob here because visualisation.rs uses "-pattern_type glob"
     let ffmpeg_pattern = frames_dir.join("mz_*.png").to_string_lossy().to_string();
     // ----------------------------------------
@@ -263,38 +311,38 @@ fn main() -> std::io::Result<()> {
     }
     let frame_pad = n_frames_est.saturating_sub(1).to_string().len().max(4);
 
-    // Write a small run_config.txt for traceability
-    {
-        let mut f = BufWriter::new(File::create(run_dir.join("run_config.txt"))?);
-        writeln!(f, "cmd: {}", argv.join(" "))?;
-        writeln!(f, "run_dir: {}", run_dir.to_string_lossy())?;
-        writeln!(f, "preset: {}", cfg.preset.as_str())?;
-        writeln!(f, "init: {}", cfg.init.as_str())?;
-        writeln!(f, "integrator: {}", integrator.as_str())?;
-        writeln!(f, "steps: {}", run.n_steps)?;
-        writeln!(f, "save_every: {}", run.save_every)?;
-        writeln!(f, "fps: {}", run.fps)?;
-        writeln!(f, "zoom_t_max: {:.6e}", run.zoom_t_max)?;
-        writeln!(f, "dt: {:.16e}", params.dt)?;
-        writeln!(
-            f,
-            "B_ext: [{:.6e},{:.6e},{:.6e}]",
-            params.b_ext[0], params.b_ext[1], params.b_ext[2]
-        )?;
-        writeln!(f, "Ms: {:.6e}", material.ms)?;
-        writeln!(f, "A_ex: {:.6e}", material.a_ex)?;
-        writeln!(f, "Ku: {:.6e}", material.k_u)?;
-        writeln!(
-            f,
-            "easy_axis: [{:.6e},{:.6e},{:.6e}]",
-            material.easy_axis[0], material.easy_axis[1], material.easy_axis[2]
-        )?;
-        writeln!(
-            f,
-            "grid: nx={} ny={} dx={:.6e} dy={:.6e} dz={:.6e}",
-            grid_spec.nx, grid_spec.ny, grid_spec.dx, grid_spec.dy, grid_spec.dz
-        )?;
-    }
+    // // Write a small run_config.txt for traceability
+    // {
+    //     let mut f = BufWriter::new(File::create(run_dir.join("run_config.txt"))?);
+    //     writeln!(f, "cmd: {}", argv.join(" "))?;
+    //     writeln!(f, "run_dir: {}", run_dir.to_string_lossy())?;
+    //     writeln!(f, "preset: {}", cfg.preset.as_str())?;
+    //     writeln!(f, "init: {}", cfg.init.as_str())?;
+    //     writeln!(f, "integrator: {}", integrator.as_str())?;
+    //     writeln!(f, "steps: {}", run.n_steps)?;
+    //     writeln!(f, "save_every: {}", run.save_every)?;
+    //     writeln!(f, "fps: {}", run.fps)?;
+    //     writeln!(f, "zoom_t_max: {:.6e}", run.zoom_t_max)?;
+    //     writeln!(f, "dt: {:.16e}", params.dt)?;
+    //     writeln!(
+    //         f,
+    //         "B_ext: [{:.6e},{:.6e},{:.6e}]",
+    //         params.b_ext[0], params.b_ext[1], params.b_ext[2]
+    //     )?;
+    //     writeln!(f, "Ms: {:.6e}", material.ms)?;
+    //     writeln!(f, "A_ex: {:.6e}", material.a_ex)?;
+    //     writeln!(f, "Ku: {:.6e}", material.k_u)?;
+    //     writeln!(
+    //         f,
+    //         "easy_axis: [{:.6e},{:.6e},{:.6e}]",
+    //         material.easy_axis[0], material.easy_axis[1], material.easy_axis[2]
+    //     )?;
+    //     writeln!(
+    //         f,
+    //         "grid: nx={} ny={} dx={:.6e} dy={:.6e} dz={:.6e}",
+    //         grid_spec.nx, grid_spec.ny, grid_spec.dx, grid_spec.dy, grid_spec.dz
+    //     )?;
+    // }
 
     let grid: Grid2D = Grid2D::new(
         grid_spec.nx,
