@@ -67,7 +67,7 @@ fn main() -> std::io::Result<()> {
 
     let b_ext = [0.0, 0.0, 0.0];
 
-    let alpha: f64 = 0.02;
+    let alpha: f64 = 0.5;
     let dt: f64 = 2e-13;
     let t_total: f64 = 20e-9;
     let out_stride: usize = 50;
@@ -80,7 +80,7 @@ fn main() -> std::io::Result<()> {
 
     // Bloch wall initial condition
     let x0 = 0.5 * nx as f64 * dx;
-    let width = 5.0 * dx;
+    let width = 60.0 * dx;
     m.init_bloch_wall(x0, width);
 
     let params = LLGParams {
@@ -95,6 +95,7 @@ fn main() -> std::io::Result<()> {
         a_ex,
         k_u,
         easy_axis,
+        dmi: Some(5e-4),
     };
 
     let mut scratch = RK4Scratch::new(grid);
@@ -128,7 +129,7 @@ fn main() -> std::io::Result<()> {
         fields: FieldConfig {
             b_ext,
             demag: false,
-            dmi: None,
+            dmi: material.dmi,
         },
         numerics: NumericsConfig {
             integrator: "rk4_recompute".to_string(),

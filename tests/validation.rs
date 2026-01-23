@@ -51,6 +51,7 @@ fn macrospin_precession_quarter_turn_about_bz() {
         a_ex: 0.0,
         k_u: 0.0,
         easy_axis: [0.0, 0.0, 1.0],
+        dmi: None,
     };
 
     // Target time: quarter period, t = (pi/2)/(gamma B)
@@ -104,6 +105,7 @@ fn macrospin_anisotropy_relaxes_toward_easy_axis() {
         a_ex: 0.0,
         k_u: 500.0, // J/m^3
         easy_axis: unit([0.0, 0.0, 1.0]),
+        dmi: None,
     };
 
     let mz0 = m.data[0][2];
@@ -240,6 +242,7 @@ fn energy_gradient_consistency_exchange_anisotropy() {
         a_ex: 13e-12,
         k_u: 500.0,
         easy_axis: unit([0.0, 0.0, 1.0]),
+        dmi: None,
     };
 
     // Build B_eff for the current state

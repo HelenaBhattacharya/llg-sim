@@ -3,9 +3,31 @@
 # Overlay Rust vs MuMax outputs and (optionally) compute FFT peak frequency.
 #
 # Examples:
-#   python3 scripts/overlay_macrospin.py out/rust_table.csv mumax_outputs/macrospin_fmr/table.txt --col my --do_fft
-#   python3 scripts/overlay_macrospin.py out/rust_table_bloch_relax.csv mumax_outputs/bloch_relax/table.txt --col mx --out out/overlay_bloch_mx.png
-#
+# python3 scripts/overlay_macrospin.py \
+#   out/macrospin_fmr/rust_table_macrospin_fmr.csv \
+#   mumax_outputs/macrospin_fmr/table.txt \
+#   --col my \
+#   --do_fft \
+#   --out out/macrospin_fmr/overlay_my_vs_time.png
+
+# python3 scripts/overlay_macrospin.py \
+#   out/macrospin_anisotropy/rust_table_macrospin_anisotropy.csv \
+#   mumax_outputs/macrospin_anisotropy/table.txt \
+#   --col mz \
+#   --out out/macrospin_anisotropy/overlay_mz_vs_time.png
+
+# python3 scripts/overlay_macrospin.py \
+#   out/macrospin_anisotropy/rust_table_macrospin_anisotropy.csv \
+#   mumax_outputs/macrospin_anisotropy/table.txt \
+#   --col my \
+#   --out out/macrospin_anisotropy/overlay_my_vs_time.png
+
+# python3 scripts/overlay_macrospin.py \
+#   out/uniform_film/rust_table_uniform_film.csv \
+#   mumax_outputs/uniform_film_field/table.txt \
+#   --col my \
+#   --out out/uniform_film/overlay_my_vs_time.png
+
 # Output:
 #   out/<something>.png
 

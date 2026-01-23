@@ -75,10 +75,11 @@ pub struct LLGParams {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Material {
-    pub ms: f64,   // A/m
-    pub a_ex: f64, // J/m
-    pub k_u: f64,  // J/m^3
+    pub ms: f64,           // A/m
+    pub a_ex: f64,         // J/m
+    pub k_u: f64,          // J/m^3
     pub easy_axis: Vec3,
+    pub dmi: Option<f64>,  // J/m^2 (interfacial DMI), None = OFF
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +154,7 @@ impl SimConfig {
             a_ex: 1.0,
             k_u: 0.1,
             easy_axis: normalise3([0.0, 0.0, 1.0]),
+            dmi: None,
         };
 
         let run = RunSpec {
@@ -199,6 +201,7 @@ impl SimConfig {
             a_ex: 13e-12,
             k_u: 500.0,
             easy_axis: normalise3([0.0, 0.0, 1.0]),
+            dmi: None,
         };
 
         let run = RunSpec {

@@ -311,39 +311,6 @@ fn main() -> std::io::Result<()> {
     }
     let frame_pad = n_frames_est.saturating_sub(1).to_string().len().max(4);
 
-    // // Write a small run_config.txt for traceability
-    // {
-    //     let mut f = BufWriter::new(File::create(run_dir.join("run_config.txt"))?);
-    //     writeln!(f, "cmd: {}", argv.join(" "))?;
-    //     writeln!(f, "run_dir: {}", run_dir.to_string_lossy())?;
-    //     writeln!(f, "preset: {}", cfg.preset.as_str())?;
-    //     writeln!(f, "init: {}", cfg.init.as_str())?;
-    //     writeln!(f, "integrator: {}", integrator.as_str())?;
-    //     writeln!(f, "steps: {}", run.n_steps)?;
-    //     writeln!(f, "save_every: {}", run.save_every)?;
-    //     writeln!(f, "fps: {}", run.fps)?;
-    //     writeln!(f, "zoom_t_max: {:.6e}", run.zoom_t_max)?;
-    //     writeln!(f, "dt: {:.16e}", params.dt)?;
-    //     writeln!(
-    //         f,
-    //         "B_ext: [{:.6e},{:.6e},{:.6e}]",
-    //         params.b_ext[0], params.b_ext[1], params.b_ext[2]
-    //     )?;
-    //     writeln!(f, "Ms: {:.6e}", material.ms)?;
-    //     writeln!(f, "A_ex: {:.6e}", material.a_ex)?;
-    //     writeln!(f, "Ku: {:.6e}", material.k_u)?;
-    //     writeln!(
-    //         f,
-    //         "easy_axis: [{:.6e},{:.6e},{:.6e}]",
-    //         material.easy_axis[0], material.easy_axis[1], material.easy_axis[2]
-    //     )?;
-    //     writeln!(
-    //         f,
-    //         "grid: nx={} ny={} dx={:.6e} dy={:.6e} dz={:.6e}",
-    //         grid_spec.nx, grid_spec.ny, grid_spec.dx, grid_spec.dy, grid_spec.dz
-    //     )?;
-    // }
-
     let grid: Grid2D = Grid2D::new(
         grid_spec.nx,
         grid_spec.ny,
@@ -582,3 +549,39 @@ fn main() -> std::io::Result<()> {
     println!("Done. Outputs in {}", run_dir.to_string_lossy());
     Ok(())
 }
+
+
+
+
+    // // Write a small run_config.txt for traceability
+    // {
+    //     let mut f = BufWriter::new(File::create(run_dir.join("run_config.txt"))?);
+    //     writeln!(f, "cmd: {}", argv.join(" "))?;
+    //     writeln!(f, "run_dir: {}", run_dir.to_string_lossy())?;
+    //     writeln!(f, "preset: {}", cfg.preset.as_str())?;
+    //     writeln!(f, "init: {}", cfg.init.as_str())?;
+    //     writeln!(f, "integrator: {}", integrator.as_str())?;
+    //     writeln!(f, "steps: {}", run.n_steps)?;
+    //     writeln!(f, "save_every: {}", run.save_every)?;
+    //     writeln!(f, "fps: {}", run.fps)?;
+    //     writeln!(f, "zoom_t_max: {:.6e}", run.zoom_t_max)?;
+    //     writeln!(f, "dt: {:.16e}", params.dt)?;
+    //     writeln!(
+    //         f,
+    //         "B_ext: [{:.6e},{:.6e},{:.6e}]",
+    //         params.b_ext[0], params.b_ext[1], params.b_ext[2]
+    //     )?;
+    //     writeln!(f, "Ms: {:.6e}", material.ms)?;
+    //     writeln!(f, "A_ex: {:.6e}", material.a_ex)?;
+    //     writeln!(f, "Ku: {:.6e}", material.k_u)?;
+    //     writeln!(
+    //         f,
+    //         "easy_axis: [{:.6e},{:.6e},{:.6e}]",
+    //         material.easy_axis[0], material.easy_axis[1], material.easy_axis[2]
+    //     )?;
+    //     writeln!(
+    //         f,
+    //         "grid: nx={} ny={} dx={:.6e} dy={:.6e} dz={:.6e}",
+    //         grid_spec.nx, grid_spec.ny, grid_spec.dx, grid_spec.dy, grid_spec.dz
+    //     )?;
+    // }
