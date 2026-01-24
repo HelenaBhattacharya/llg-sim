@@ -1,6 +1,6 @@
 // src/llg.rs
 
-use crate::effective_field::{build_h_eff, zeeman::add_zeeman_field};
+use crate::effective_field::{build_h_eff_masked, FieldMask, zeeman::add_zeeman_field};
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
 use crate::vec3::{cross, normalize};
@@ -26,6 +26,26 @@ fn llg_rhs(m: [f64; 3], b: [f64; 3], gamma: f64, alpha: f64) -> [f64; 3] {
         pref * (m_cross_b[0] + alpha * m_cross_m_cross_b[0]),
         pref * (m_cross_b[1] + alpha * m_cross_m_cross_b[1]),
         pref * (m_cross_b[2] + alpha * m_cross_m_cross_b[2]),
+    ]
+}
+
+/// Damping-only (precession-suppressed) RHS used for energy relaxation.
+///
+///   dm/dt = -(gamma*alpha/(1+alpha^2)) [ m × (m × B) ]
+///
+/// This is commonly used in micromagnetics as a “relax” mode to find equilibrium states.
+#[inline]
+fn llg_rhs_relax(m: [f64; 3], b: [f64; 3], gamma: f64, alpha: f64) -> [f64; 3] {
+    let denom = 1.0 + alpha * alpha;
+    let pref = -gamma * alpha / denom;
+
+    let m_cross_b = cross(m, b);
+    let m_cross_m_cross_b = cross(m, m_cross_b);
+
+    [
+        pref * m_cross_m_cross_b[0],
+        pref * m_cross_m_cross_b[1],
+        pref * m_cross_m_cross_b[2],
     ]
 }
 
@@ -107,7 +127,7 @@ pub fn step_llg_with_field(m: &mut VectorField2D, b_eff: &VectorField2D, params:
 ///
 /// Notes:
 /// - This is exact for Zeeman-only macrospin where B_eff is constant in time and independent of m.
-/// - For field terms that depend on m (exchange/anisotropy), use `step_llg_rk4_recompute_field`.
+/// - For field terms that depend on m (exchange/anisotropy/DMI), use `step_llg_rk4_recompute_field`.
 pub fn step_llg_with_field_rk4(m: &mut VectorField2D, b_eff: &VectorField2D, params: &LLGParams) {
     let gamma = params.gamma;
     let alpha = params.alpha;
@@ -135,18 +155,16 @@ pub fn step_llg_with_field_rk4(m: &mut VectorField2D, b_eff: &VectorField2D, par
     }
 }
 
-/// Fixed-step RK4 where the effective field B_eff(m) is recomputed at each RK substage.
+/// Fixed-step RK4 where the effective field B_eff(m) is recomputed at each RK substage,
+/// with an explicit field mask controlling which physics terms are included.
 ///
-/// This is the appropriate integrator when B_eff depends on m (exchange, anisotropy, etc.).
-///
-/// Usage pattern:
-/// - Create one `RK4Scratch` once (e.g. in `main.rs`) and reuse it every step.
-/// - Call this function instead of Euler.
-pub fn step_llg_rk4_recompute_field(
+/// This is the appropriate integrator when B_eff depends on m (exchange, anisotropy, DMI, etc.).
+pub fn step_llg_rk4_recompute_field_masked(
     m: &mut VectorField2D,
     params: &LLGParams,
     material: &Material,
     scratch: &mut RK4Scratch,
+    mask: FieldMask,
 ) {
     let grid = &m.grid;
     let gamma = params.gamma;
@@ -155,7 +173,7 @@ pub fn step_llg_rk4_recompute_field(
     let n = m.data.len();
 
     // Stage 1: k1 from m
-    build_h_eff(grid, m, &mut scratch.b1, params, material);
+    build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
     for i in 0..n {
         scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
@@ -165,7 +183,7 @@ pub fn step_llg_rk4_recompute_field(
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
     }
-    build_h_eff(grid, &scratch.m1, &mut scratch.b2, params, material);
+    build_h_eff_masked(grid, &scratch.m1, &mut scratch.b2, params, material, mask);
     for i in 0..n {
         scratch.k2[i] = llg_rhs(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
@@ -175,7 +193,7 @@ pub fn step_llg_rk4_recompute_field(
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
     }
-    build_h_eff(grid, &scratch.m2, &mut scratch.b3, params, material);
+    build_h_eff_masked(grid, &scratch.m2, &mut scratch.b3, params, material, mask);
     for i in 0..n {
         scratch.k3[i] = llg_rhs(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
@@ -185,7 +203,7 @@ pub fn step_llg_rk4_recompute_field(
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
     }
-    build_h_eff(grid, &scratch.m3, &mut scratch.b4, params, material);
+    build_h_eff_masked(grid, &scratch.m3, &mut scratch.b4, params, material, mask);
     for i in 0..n {
         scratch.k4[i] = llg_rhs(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
@@ -196,6 +214,145 @@ pub fn step_llg_rk4_recompute_field(
         let m_new = add_scaled(m.data[i], dt, incr);
         m.data[i] = normalize(m_new);
     }
+}
+
+/// Fixed-step RK4 recompute-field, but using damping-only (precession suppressed) dynamics.
+/// This is intended for energy relaxation, matching the spirit of MuMax3's relax mode.
+pub fn step_llg_rk4_recompute_field_masked_relax(
+    m: &mut VectorField2D,
+    params: &LLGParams,
+    material: &Material,
+    scratch: &mut RK4Scratch,
+    mask: FieldMask,
+) {
+    let grid = &m.grid;
+    let gamma = params.gamma;
+    let alpha = params.alpha;
+    let dt = params.dt;
+    let n = m.data.len();
+
+    // Stage 1
+    build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
+    for i in 0..n {
+        scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
+    }
+
+    // Stage 2
+    for i in 0..n {
+        let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
+        scratch.m1.data[i] = normalize(m1);
+    }
+    build_h_eff_masked(grid, &scratch.m1, &mut scratch.b2, params, material, mask);
+    for i in 0..n {
+        scratch.k2[i] = llg_rhs_relax(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
+    }
+
+    // Stage 3
+    for i in 0..n {
+        let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
+        scratch.m2.data[i] = normalize(m2);
+    }
+    build_h_eff_masked(grid, &scratch.m2, &mut scratch.b3, params, material, mask);
+    for i in 0..n {
+        scratch.k3[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
+    }
+
+    // Stage 4
+    for i in 0..n {
+        let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
+        scratch.m3.data[i] = normalize(m3);
+    }
+    build_h_eff_masked(grid, &scratch.m3, &mut scratch.b4, params, material, mask);
+    for i in 0..n {
+        scratch.k4[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
+    }
+
+    // Combine
+    for i in 0..n {
+        let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
+        let m_new = add_scaled(m.data[i], dt, incr);
+        m.data[i] = normalize(m_new);
+    }
+}
+
+/// Adaptive timestep wrapper for the relax-mode masked RK4 stepper.
+///
+/// Uses step-doubling error estimate:
+/// - one step of dt
+/// - two steps of dt/2
+/// Error ~ ||m_small - m_big||_inf over all cells/components.
+///
+/// On accept: writes m <- m_small (more accurate).
+pub fn step_llg_rk4_recompute_field_masked_relax_adaptive(
+    m: &mut VectorField2D,
+    params: &mut LLGParams,
+    material: &Material,
+    scratch: &mut RK4Scratch,
+    mask: FieldMask,
+    tol: f64,
+    dt_min: f64,
+    dt_max: f64,
+) -> (f64, bool) {
+    // Save original dt
+    let dt0 = params.dt;
+
+    // Make copies of the state for trial steps
+    let mut m_big = VectorField2D::new(m.grid);
+    let mut m_small = VectorField2D::new(m.grid);
+    m_big.data.clone_from(&m.data);
+    m_small.data.clone_from(&m.data);
+
+    // --- big step: dt ---
+    params.dt = dt0;
+    step_llg_rk4_recompute_field_masked_relax(&mut m_big, params, material, scratch, mask);
+
+    // --- two half steps: dt/2 ---
+    params.dt = 0.5 * dt0;
+    step_llg_rk4_recompute_field_masked_relax(&mut m_small, params, material, scratch, mask);
+    step_llg_rk4_recompute_field_masked_relax(&mut m_small, params, material, scratch, mask);
+
+    // Restore dt for controller logic
+    params.dt = dt0;
+
+    // Compute infinity-norm error estimate over all cells/components
+    let mut err: f64 = 0.0;
+    for (vb, vs) in m_big.data.iter().zip(m_small.data.iter()) {
+        err = err.max((vs[0] - vb[0]).abs());
+        err = err.max((vs[1] - vb[1]).abs());
+        err = err.max((vs[2] - vb[2]).abs());
+    }
+
+    // Accept/reject
+    if err <= tol {
+        // Accept: use the more accurate two-half-step solution
+        m.data.clone_from(&m_small.data);
+
+        // Increase dt slightly if well below tol
+        let safety = 0.9;
+        let grow = if err == 0.0 { 2.0 } else { (tol / err).powf(0.2) }; // 1/5 power for RK4-ish
+        let dt_new = (dt0 * safety * grow).min(dt_max);
+        params.dt = dt_new.max(dt_min);
+
+        return (err, true);
+    } else {
+        // Reject: reduce dt and signal caller to retry
+        let safety = 0.9;
+        let shrink = (tol / err).powf(0.2); // 1/5 power
+        let dt_new = (dt0 * safety * shrink).max(dt_min);
+        params.dt = dt_new;
+
+        return (err, false);
+    }
+}
+
+/// Backwards-compatible: recompute-field RK4 using the full field builder (includes DMI if enabled).
+pub fn step_llg_rk4_recompute_field(
+    m: &mut VectorField2D,
+    params: &LLGParams,
+    material: &Material,
+    scratch: &mut RK4Scratch,
+) {
+    step_llg_rk4_recompute_field_masked(m, params, material, scratch, FieldMask::Full);
 }
 
 /// Uniform-field wrapper (Euler).
