@@ -70,7 +70,7 @@ fn main() -> std::io::Result<()> {
     // Smoothed wall IC
     let x0 = 0.5 * nx as f64 * dx;
     let width_cells: f64 = 40.0;
-    m.init_bloch_wall(x0, width_cells * dx);
+    m.init_bloch_wall_y(x0, width_cells * dx, 1.0);
 
     let mut params = LLGParams {
         gamma: GAMMA_E_RAD_PER_S_T,
@@ -79,7 +79,7 @@ fn main() -> std::io::Result<()> {
         b_ext,
     };
 
-    let dmi_strength: f64 = 2e-4;
+    let dmi_strength: f64 = -1e-4;
     let material = Material {
         ms,
         a_ex,

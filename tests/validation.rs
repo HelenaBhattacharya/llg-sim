@@ -368,3 +368,78 @@ fn macrospin_fmr_fft_peak_matches_gamma_b() {
         n
     );
 }
+
+
+#[test]
+fn dmi_field_flips_sign_with_d() {
+    use llg_sim::effective_field::build_h_eff;
+    use llg_sim::grid::Grid2D;
+    use llg_sim::params::{LLGParams, Material};
+    use llg_sim::vector_field::VectorField2D;
+
+    // 1D line: ny=1 so only x-derivatives matter.
+    let nx: usize = 9;
+    let ny: usize = 1;
+    let dx: f64 = 1.0;
+    let dy: f64 = 1.0;
+    let dz: f64 = 1.0;
+    let grid = Grid2D::new(nx, ny, dx, dy, dz);
+
+    // Gentle mz gradient so dmz/dx != 0
+    let mut m = VectorField2D::new(grid);
+    for i in 0..nx {
+        let mz = (i as f64 - (nx as f64 - 1.0) / 2.0) * 0.01;
+        let mz = mz.max(-0.2).min(0.2);
+        let mx = (1.0 - mz * mz).sqrt();
+
+        let idx = m.idx(i, 0);
+        m.data[idx] = [mx, 0.0, mz];
+    }
+
+    let params = LLGParams {
+        gamma: 1.760_859_630_23e11,
+        alpha: 0.0,
+        dt: 1e-13,
+        b_ext: [0.0, 0.0, 0.0],
+    };
+
+    let ms: f64 = 8.0e5;
+    let a_ex: f64 = 13e-12;
+
+    // +D
+    let mat_plus = Material {
+        ms,
+        a_ex,
+        k_u: 0.0,
+        easy_axis: unit([0.0, 0.0, 1.0]),
+        dmi: Some(1e-4),
+    };
+    let mut b_plus = VectorField2D::new(grid);
+    build_h_eff(&grid, &m, &mut b_plus, &params, &mat_plus);
+
+    // -D
+    let mat_minus = Material {
+        ms,
+        a_ex,
+        k_u: 0.0,
+        easy_axis: unit([0.0, 0.0, 1.0]),
+        dmi: Some(-1e-4),
+    };
+    let mut b_minus = VectorField2D::new(grid);
+    build_h_eff(&grid, &m, &mut b_minus, &params, &mat_minus);
+
+    // Interior cell (avoid boundary complications)
+    let i0 = 4usize;
+    let idx0 = m.idx(i0, 0);
+
+    let bx_plus = b_plus.data[idx0][0];
+    let bx_minus = b_minus.data[idx0][0];
+
+    // Should be opposite sign: bx(+D) + bx(-D) ≈ 0
+    assert!(bx_plus.abs() > 0.0, "expected nonzero DMI field component");
+    assert!(
+        (bx_plus + bx_minus).abs() < 1e-10 * bx_plus.abs().max(1.0),
+        "DMI field should flip sign with D: bx+= {}, bx-= {}",
+        bx_plus, bx_minus
+    );
+}

@@ -142,6 +142,7 @@ fn main() -> std::io::Result<()> {
     let mut steps_override: Option<usize> = None;
     let mut save_override: Option<usize> = None;
     let mut fps_override: Option<u32> = None;
+    let mut dmi_override: Option<f64> = None;
     let mut dt_override: Option<f64> = None;
     let mut frames_target: Option<usize> = None;
     let mut zoom_override: Option<f64> = None;
@@ -174,6 +175,20 @@ fn main() -> std::io::Result<()> {
                 eprintln!("Warning: unknown integrator '{v}', using rk4recompute");
                 Integrator::Rk4Recompute
             });
+            continue;
+        }
+
+        if let Some(v) = arg.strip_prefix("dmi=") {
+
+            // Accept "none" / "off" / "0" to disable
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+                dmi_override = Some(0.0);
+            } else if let Ok(val) = v.parse::<f64>() {
+                dmi_override = Some(val);
+            } else {
+                eprintln!("Warning: could not parse dmi value '{v}', ignoring");
+            }
             continue;
         }
 
@@ -216,7 +231,7 @@ fn main() -> std::io::Result<()> {
 
     let cfg: SimConfig = SimConfig::new(preset, init);
     let grid_spec = cfg.grid;
-    let material = cfg.material;
+    let mut material = cfg.material;
 
     // Make mutable local copies so we can override without mutating SimConfig.
     let mut params = cfg.llg;
@@ -234,6 +249,9 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(z) = zoom_override {
         run.zoom_t_max = z;
+    }
+    if let Some(d) = dmi_override {
+        material.dmi = if d == 0.0 { None } else { Some(d) };
     }
 
     // Output cadence:
@@ -281,7 +299,7 @@ fn main() -> std::io::Result<()> {
         fields: FieldConfig {
             b_ext: params.b_ext,
             demag: false,   // demag not implemented yet
-            dmi: None,      // DMI not implemented yet
+            dmi: material.dmi,
         },
         numerics: NumericsConfig {
             integrator: integrator.as_str().to_string(),
@@ -392,10 +410,10 @@ fn main() -> std::io::Result<()> {
             m.set_uniform(theta.sin(), 0.0, theta.cos());
         }
         InitKind::Bloch => {
-            println!("Initial condition: Bloch wall");
+            println!("Initial condition: Bloch wall (m_y bump)");
             let x0 = 0.5 * grid_spec.nx as f64 * grid_spec.dx;
             let width = 5.0 * grid_spec.dx;
-            m.init_bloch_wall(x0, width);
+            m.init_bloch_wall_y(x0, width, 1.0);
         }
     }
     // ------------------------------------------
@@ -407,7 +425,7 @@ fn main() -> std::io::Result<()> {
 
     let file_energy: File = File::create(run_dir.join("energy_vs_time.csv"))?;
     let mut writer_energy: BufWriter<File> = BufWriter::new(file_energy);
-    writeln!(writer_energy, "t,E_ex,E_an,E_zee,E_tot")?;
+    writeln!(writer_energy, "t,E_ex,E_an,E_zee,E_dmi,E_tot")?;
 
     // Allocate vectors for plots
     let n_pts = run.n_steps + 1;
@@ -450,7 +468,12 @@ fn main() -> std::io::Result<()> {
         mx_avg_vec.push(mx_avg);
         my_avg_vec.push(my_avg);
         mz_avg_vec.push(mz_avg);
-        writeln!(writer_mag, "{:.8},{:.8},{:.8},{:.8}", t, mx_avg, my_avg, mz_avg)?;
+
+        writeln!(
+            writer_mag,
+            "{:.16e},{:.16e},{:.16e},{:.16e}",
+            t, mx_avg, my_avg, mz_avg
+        )?;
 
         // Energy diagnostics
         let e: EnergyBreakdown = compute_energy(&grid, &m, &material, params.b_ext);
@@ -458,8 +481,8 @@ fn main() -> std::io::Result<()> {
 
         writeln!(
             writer_energy,
-            "{:.8},{:.16e},{:.16e},{:.16e},{:.16e}",
-            t, e.exchange, e.anisotropy, e.zeeman, e_tot
+            "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
+            t, e.exchange, e.anisotropy, e.zeeman, e.dmi, e_tot
         )?;
 
         times.push(t);
@@ -470,8 +493,8 @@ fn main() -> std::io::Result<()> {
 
         if step % print_every == 0 {
             println!(
-                "step {:6}, t = {:.3e}, E_ex = {:.3e}, E_an = {:.3e}, E_zee = {:.3e}, E_tot = {:.3e}",
-                step, t, e.exchange, e.anisotropy, e.zeeman, e_tot
+                "step {:6}, t = {:.3e}, E_ex = {:.3e}, E_an = {:.3e}, E_zee = {:.3e}, E_dmi = {:.3e}, E_tot = {:.3e}",
+                step, t, e.exchange, e.anisotropy, e.zeeman, e.dmi, e_tot
             );
         }
 
@@ -549,39 +572,3 @@ fn main() -> std::io::Result<()> {
     println!("Done. Outputs in {}", run_dir.to_string_lossy());
     Ok(())
 }
-
-
-
-
-    // // Write a small run_config.txt for traceability
-    // {
-    //     let mut f = BufWriter::new(File::create(run_dir.join("run_config.txt"))?);
-    //     writeln!(f, "cmd: {}", argv.join(" "))?;
-    //     writeln!(f, "run_dir: {}", run_dir.to_string_lossy())?;
-    //     writeln!(f, "preset: {}", cfg.preset.as_str())?;
-    //     writeln!(f, "init: {}", cfg.init.as_str())?;
-    //     writeln!(f, "integrator: {}", integrator.as_str())?;
-    //     writeln!(f, "steps: {}", run.n_steps)?;
-    //     writeln!(f, "save_every: {}", run.save_every)?;
-    //     writeln!(f, "fps: {}", run.fps)?;
-    //     writeln!(f, "zoom_t_max: {:.6e}", run.zoom_t_max)?;
-    //     writeln!(f, "dt: {:.16e}", params.dt)?;
-    //     writeln!(
-    //         f,
-    //         "B_ext: [{:.6e},{:.6e},{:.6e}]",
-    //         params.b_ext[0], params.b_ext[1], params.b_ext[2]
-    //     )?;
-    //     writeln!(f, "Ms: {:.6e}", material.ms)?;
-    //     writeln!(f, "A_ex: {:.6e}", material.a_ex)?;
-    //     writeln!(f, "Ku: {:.6e}", material.k_u)?;
-    //     writeln!(
-    //         f,
-    //         "easy_axis: [{:.6e},{:.6e},{:.6e}]",
-    //         material.easy_axis[0], material.easy_axis[1], material.easy_axis[2]
-    //     )?;
-    //     writeln!(
-    //         f,
-    //         "grid: nx={} ny={} dx={:.6e} dy={:.6e} dz={:.6e}",
-    //         grid_spec.nx, grid_spec.ny, grid_spec.dx, grid_spec.dy, grid_spec.dz
-    //     )?;
-    // }

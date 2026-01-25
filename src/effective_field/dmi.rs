@@ -1,92 +1,107 @@
 // src/effective_field/dmi.rs
 //
-// Interfacial (Néel-type) Dzyaloshinskii–Moriya interaction (DMI)
-// for thin films.
+// Interfacial (Néel-type) DMI for thin films (MuMax3).
 //
-// Energy density:
-//   E_DMI = D [ m_z (∇·m) - (m · ∇) m_z ]
+// MuMax3 Eq. (10):
+//   B_DM = (2D/Msat) * ( ∂x m_z, ∂y m_z, -(∂x m_x + ∂y m_y) )
 //
-// Effective field:
-//   B_DMI = (2D / (μ0 M_s)) * ( ∂x m_z, ∂y m_z, -(∂x m_x + ∂y m_y) )
+// Boundary conditions (Eq. 11–15) are imposed using ghost neighbours so derivatives remain central.
+// In case of nonzero D, these BCs must also be applied to exchange.
 //
-// Notes:
-// - D is in J/m^2 (interfacial DMI).
-// - Uses central differences in the interior and one-sided differences at boundaries.
-// - Safe for nx==1 or ny==1 (derivatives become 0 in that direction).
+// IMPORTANT: NO μ0 in prefactor.  [oai_citation:5‡The design and verification of MuMax3 [1].pdf](sediment://file_000000002ef871f48e98082b4fbf5137)
 
 use crate::grid::Grid2D;
-use crate::params::MU0;
+use crate::params::Material;
 use crate::vector_field::VectorField2D;
 
-pub fn add_dmi_field(
-    grid: &Grid2D,
-    m: &VectorField2D,
-    b_eff: &mut VectorField2D,
-    dmi: f64, // J/m^2
-    ms: f64,  // A/m
-) {
+#[inline]
+fn ghost_x(m: [f64; 3], n_x: f64, eta: f64, dx: f64) -> [f64; 3] {
+    let mx = m[0];
+    let my = m[1];
+    let mz = m[2];
+
+    // Eq. 11, 13, 14 (x-normal boundary)
+    let dmx_dx = -eta * mz;
+    let dmy_dx = 0.0;
+    let dmz_dx = eta * mx;
+
+    [mx + n_x * dx * dmx_dx, my + n_x * dx * dmy_dx, mz + n_x * dx * dmz_dx]
+}
+
+#[inline]
+fn ghost_y(m: [f64; 3], n_y: f64, eta: f64, dy: f64) -> [f64; 3] {
+    let mx = m[0];
+    let my = m[1];
+    let mz = m[2];
+
+    // Eq. 12, 13, 14 (y-normal boundary)
+    let dmx_dy = 0.0;
+    let dmy_dy = -eta * mz;
+    let dmz_dy = eta * my;
+
+    [mx + n_y * dy * dmx_dy, my + n_y * dy * dmy_dy, mz + n_y * dy * dmz_dy]
+}
+
+pub fn add_dmi_field(grid: &Grid2D, m: &VectorField2D, b_eff: &mut VectorField2D, mat: &Material) {
+    let d = match mat.dmi {
+        Some(v) if v != 0.0 => v,
+        _ => return,
+    };
+    let ms = mat.ms;
+    let a = mat.a_ex;
+
+    if ms == 0.0 || a == 0.0 {
+        return;
+    }
+
     let nx = grid.nx;
     let ny = grid.ny;
+    if nx == 0 || ny == 0 {
+        return;
+    }
+
     let dx = grid.dx;
     let dy = grid.dy;
 
-    // Prefactor to convert DMI into an effective induction B (Tesla)
-    let prefactor = 2.0 * dmi / (MU0 * ms);
+    // MuMax3 prefactor: 2D/Msat (NO μ0)
+    let pref = 2.0 * d / ms;
+
+    // Boundary coupling eta = D/(2A)
+    let eta = d / (2.0 * a);
 
     for j in 0..ny {
         for i in 0..nx {
-            let idx = j * nx + i;
+            let idx = m.idx(i, j);
+            let m_ij = m.data[idx];
 
-            // --- derivatives (robust for nx==1 or ny==1) ---
-
-            // ∂x m_z
-            let dmz_dx = if nx == 1 {
-                0.0
+            let (m_im, m_ip) = if nx == 1 {
+                (m_ij, m_ij)
             } else if i == 0 {
-                (m.data[idx + 1][2] - m.data[idx][2]) / dx
+                (ghost_x(m_ij, -1.0, eta, dx), m.data[m.idx(i + 1, j)])
             } else if i == nx - 1 {
-                (m.data[idx][2] - m.data[idx - 1][2]) / dx
+                (m.data[m.idx(i - 1, j)], ghost_x(m_ij, 1.0, eta, dx))
             } else {
-                (m.data[idx + 1][2] - m.data[idx - 1][2]) / (2.0 * dx)
+                (m.data[m.idx(i - 1, j)], m.data[m.idx(i + 1, j)])
             };
 
-            // ∂y m_z
-            let dmz_dy = if ny == 1 {
-                0.0
+            let (m_jm, m_jp) = if ny == 1 {
+                (m_ij, m_ij)
             } else if j == 0 {
-                (m.data[idx + nx][2] - m.data[idx][2]) / dy
+                (ghost_y(m_ij, -1.0, eta, dy), m.data[m.idx(i, j + 1)])
             } else if j == ny - 1 {
-                (m.data[idx][2] - m.data[idx - nx][2]) / dy
+                (m.data[m.idx(i, j - 1)], ghost_y(m_ij, 1.0, eta, dy))
             } else {
-                (m.data[idx + nx][2] - m.data[idx - nx][2]) / (2.0 * dy)
+                (m.data[m.idx(i, j - 1)], m.data[m.idx(i, j + 1)])
             };
 
-            // ∂x m_x
-            let dmx_dx = if nx == 1 {
-                0.0
-            } else if i == 0 {
-                (m.data[idx + 1][0] - m.data[idx][0]) / dx
-            } else if i == nx - 1 {
-                (m.data[idx][0] - m.data[idx - 1][0]) / dx
-            } else {
-                (m.data[idx + 1][0] - m.data[idx - 1][0]) / (2.0 * dx)
-            };
+            let dmz_dx = if nx > 1 { (m_ip[2] - m_im[2]) / (2.0 * dx) } else { 0.0 };
+            let dmz_dy = if ny > 1 { (m_jp[2] - m_jm[2]) / (2.0 * dy) } else { 0.0 };
+            let dmx_dx = if nx > 1 { (m_ip[0] - m_im[0]) / (2.0 * dx) } else { 0.0 };
+            let dmy_dy = if ny > 1 { (m_jp[1] - m_jm[1]) / (2.0 * dy) } else { 0.0 };
 
-            // ∂y m_y
-            let dmy_dy = if ny == 1 {
-                0.0
-            } else if j == 0 {
-                (m.data[idx + nx][1] - m.data[idx][1]) / dy
-            } else if j == ny - 1 {
-                (m.data[idx][1] - m.data[idx - nx][1]) / dy
-            } else {
-                (m.data[idx + nx][1] - m.data[idx - nx][1]) / (2.0 * dy)
-            };
-
-            // --- DMI field contribution ---
-            b_eff.data[idx][0] += prefactor * dmz_dx;
-            b_eff.data[idx][1] += prefactor * dmz_dy;
-            b_eff.data[idx][2] += -prefactor * (dmx_dx + dmy_dy);
+            b_eff.data[idx][0] += pref * dmz_dx;
+            b_eff.data[idx][1] += pref * dmz_dy;
+            b_eff.data[idx][2] += -pref * (dmx_dx + dmy_dy);
         }
     }
 }

@@ -39,10 +39,8 @@ pub fn build_h_eff_masked(
 
     // DMI only if mask allows it and material has DMI enabled
     let include_dmi = matches!(mask, FieldMask::ExchAnisDmi | FieldMask::Full);
-    if include_dmi {
-        if let Some(d) = mat.dmi {
-            dmi::add_dmi_field(grid, m, b_eff, d, mat.ms);
-        }
+    if include_dmi && mat.dmi.is_some() {
+        dmi::add_dmi_field(grid, m, b_eff, mat);
     }
 
     // (Demag will be added later under FieldMask::Full.)
