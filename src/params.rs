@@ -80,6 +80,10 @@ pub struct Material {
     pub k_u: f64,          // J/m^3
     pub easy_axis: Vec3,
     pub dmi: Option<f64>,  // J/m^2 (interfacial DMI), None = OFF
+
+    /// Include magnetostatic (demag) field via FFT convolution.
+    /// Default: false to preserve previous benchmarks.
+    pub demag: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +159,7 @@ impl SimConfig {
             k_u: 0.1,
             easy_axis: normalise3([0.0, 0.0, 1.0]),
             dmi: None,
+            demag: false,
         };
 
         let run = RunSpec {
@@ -202,6 +207,7 @@ impl SimConfig {
             k_u: 500.0,
             easy_axis: normalise3([0.0, 0.0, 1.0]),
             dmi: None,
+            demag: false,
         };
 
         let run = RunSpec {

@@ -4,6 +4,7 @@ pub mod anisotropy;
 pub mod exchange;
 pub mod zeeman;
 pub mod dmi;
+pub mod demag;
 
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
@@ -15,7 +16,7 @@ pub enum FieldMask {
     ExchAnis,
     /// Zeeman + Exchange + Anisotropy + DMI (no Demag)
     ExchAnisDmi,
-    /// All currently implemented terms (includes DMI if mat.dmi is Some)
+    /// All currently implemented terms (includes DMI if mat.dmi is Some, Demag if mat.demag = true)
     Full,
 }
 
@@ -43,10 +44,13 @@ pub fn build_h_eff_masked(
         dmi::add_dmi_field(grid, m, b_eff, mat);
     }
 
-    // (Demag will be added later under FieldMask::Full.)
+    // Demag only if mask is Full and demag is enabled.
+    if matches!(mask, FieldMask::Full) && mat.demag {
+        demag::add_demag_field(grid, m, b_eff, mat);
+    }
 }
 
-/// Backwards-compatible: build full B_eff (includes DMI if mat.dmi is Some).
+/// Backwards-compatible: build full B_eff (includes DMI if mat.dmi is Some, Demag if mat.demag=true).
 pub fn build_h_eff(
     grid: &Grid2D,
     m: &VectorField2D,

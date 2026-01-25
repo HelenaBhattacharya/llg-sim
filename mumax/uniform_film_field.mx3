@@ -1,7 +1,7 @@
 // mumax/uniform_film_field.mx3
 //
 // Uniform film benchmark with exchange + anisotropy + uniform external field.
-// Demag disabled to match Rust.
+// Demag ENABLED to match Rust (demag: true).
 // Designed to match src/bin/uniform_film_field.rs.
 
 SetGridSize(128, 128, 1)
@@ -12,22 +12,30 @@ Aex  = 13e-12
 Ku1  = 500
 anisU = vector(0, 0, 1)
 
-// Disable demag for fair comparison
-NoDemagSpins.Set(1)
+// Demag ON (default). If you previously disabled it, explicitly re-enable:
+NoDemagSpins.Set(0)
 
 alpha = 0.02
-
-B_ext = vector(0.01, 0, 0) // 10 mT along +x
+B_ext = vector(0.01, 1e-4, 0)
 
 // Initial condition: uniform +z
 m = uniform(0, 0, 1)
 
+// ----------------------
 // Table outputs
+// ----------------------
+// Magnetisation components
+TableAdd(m)
+
+// External field
 TableAdd(B_ext)
+
+// Total energies (J)
 TableAdd(E_total)
-TableAdd(E_Zeeman)
-TableAdd(Edens_exch)
-TableAdd(Edens_anis)
+TableAdd(E_exch)
+TableAdd(E_anis)
+TableAdd(E_zeeman)
+TableAdd(E_demag)
 
 // Match Rust sampling cadence:
 // Rust integrates at dt=1e-13 but outputs every 10 steps -> dt_out = 1e-12

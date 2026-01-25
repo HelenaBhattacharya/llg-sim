@@ -1,7 +1,7 @@
 // src/bin/uniform_film_field.rs
 //
-// Uniform 2D film benchmark (exchange + anisotropy + uniform external field),
-// with demag intentionally absent (to match current Rust physics + MuMax demag-off).
+// Uniform 2D film benchmark (exchange + anisotropy + uniform external field).
+// This version ENABLES demag so it can be compared against a MuMax3 run with demag on.
 //
 // Run:
 //   cargo run --bin uniform_film_field
@@ -44,12 +44,15 @@ fn main() -> std::io::Result<()> {
     let easy_axis = [0.0, 0.0, 1.0];
 
     // External field along +x to drive dynamics from an initial +z state
-    let b_ext = [0.01, 0.0, 0.0]; // 10 mT
+    let b_ext = [0.01, 1e-4, 0.0]; // +By phase-lock (0.1 mT)
 
     let alpha: f64 = 0.02;
-    let dt: f64 = 1e-13;        // integration dt
-    let t_total: f64 = 5e-9;    // 5 ns
-    let out_stride: usize = 10; // write every N steps
+    let dt: f64 = 1e-13;           // integration dt
+    let t_total: f64 = 5e-9;      // 5 ns total time
+    let out_stride: usize = 10;   // write every N steps -> dt_out = 1e-12 (match MuMax)
+
+    // Enable demag for this benchmark (match MuMax3 demag on).
+    let enable_demag: bool = true;
     // -------------------------------------
 
     let n_steps: usize = (t_total / dt).round() as usize;
@@ -73,6 +76,7 @@ fn main() -> std::io::Result<()> {
         k_u,
         easy_axis,
         dmi: None,
+        demag: enable_demag,
     };
 
     let mut scratch = RK4Scratch::new(grid);
@@ -103,7 +107,7 @@ fn main() -> std::io::Result<()> {
         },
         fields: FieldConfig {
             b_ext,
-            demag: false,
+            demag: enable_demag,
             dmi: None,
         },
         numerics: NumericsConfig {
@@ -128,7 +132,8 @@ fn main() -> std::io::Result<()> {
     let file = File::create(out_dir.join("rust_table_uniform_film.csv"))?;
     let mut w = BufWriter::new(file);
 
-    writeln!(w, "t,mx,my,mz,E_total,E_ex,E_an,E_zee,Bx,By,Bz")?;
+    // Add E_demag to the output table (and keep the rest unchanged).
+    writeln!(w, "t,mx,my,mz,E_total,E_ex,E_an,E_zee,E_demag,Bx,By,Bz")?;
 
     // Helper: compute averages
     let avg_m = |field: &VectorField2D| -> [f64; 3] {
@@ -151,7 +156,7 @@ fn main() -> std::io::Result<()> {
         let e: EnergyBreakdown = compute_energy(&grid, &m, &material, params.b_ext);
         writeln!(
             w,
-            "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
+            "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             t,
             mx,
             my,
@@ -160,6 +165,7 @@ fn main() -> std::io::Result<()> {
             e.exchange,
             e.anisotropy,
             e.zeeman,
+            e.demag,
             params.b_ext[0],
             params.b_ext[1],
             params.b_ext[2],
@@ -176,7 +182,7 @@ fn main() -> std::io::Result<()> {
 
             writeln!(
                 w,
-                "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
+                "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
                 t,
                 mx,
                 my,
@@ -185,6 +191,7 @@ fn main() -> std::io::Result<()> {
                 e.exchange,
                 e.anisotropy,
                 e.zeeman,
+                e.demag,
                 params.b_ext[0],
                 params.b_ext[1],
                 params.b_ext[2],
@@ -194,6 +201,7 @@ fn main() -> std::io::Result<()> {
 
     let dt_out = (out_stride as f64) * dt;
     println!("Wrote outputs to {:?}", out_dir);
+    println!("Demag enabled: {}", enable_demag);
     println!("Steps: {}, dt={}, T={}", n_steps, dt, t_total);
     println!("Output stride: {} -> dt_out={}", out_stride, dt_out);
 

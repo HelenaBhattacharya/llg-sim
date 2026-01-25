@@ -52,6 +52,7 @@ fn macrospin_precession_quarter_turn_about_bz() {
         k_u: 0.0,
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
+        demag: false,
     };
 
     // Target time: quarter period, t = (pi/2)/(gamma B)
@@ -106,6 +107,7 @@ fn macrospin_anisotropy_relaxes_toward_easy_axis() {
         k_u: 500.0, // J/m^3
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: None,
+        demag: false,
     };
 
     let mz0 = m.data[0][2];
@@ -243,6 +245,7 @@ fn energy_gradient_consistency_exchange_anisotropy() {
         k_u: 500.0,
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: None,
+        demag: false,
     };
 
     // Build B_eff for the current state
@@ -413,6 +416,7 @@ fn dmi_field_flips_sign_with_d() {
         k_u: 0.0,
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: Some(1e-4),
+        demag: false,
     };
     let mut b_plus = VectorField2D::new(grid);
     build_h_eff(&grid, &m, &mut b_plus, &params, &mat_plus);
@@ -424,6 +428,7 @@ fn dmi_field_flips_sign_with_d() {
         k_u: 0.0,
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: Some(-1e-4),
+        demag: false,
     };
     let mut b_minus = VectorField2D::new(grid);
     build_h_eff(&grid, &m, &mut b_minus, &params, &mat_minus);
@@ -442,4 +447,164 @@ fn dmi_field_flips_sign_with_d() {
         "DMI field should flip sign with D: bx+= {}, bx-= {}",
         bx_plus, bx_minus
     );
+}
+
+
+// ------------------------------------------------------------
+// Demag: small-grid sanity checks (FFT convolution + symmetry)
+// ------------------------------------------------------------
+
+#[test]
+fn demag_uniform_2x2_cube_cells_has_symmetry_and_reasonable_factor() {
+    use llg_sim::effective_field::demag::add_demag_field;
+    use llg_sim::grid::Grid2D;
+    use llg_sim::params::{Material, MU0};
+    use llg_sim::vector_field::VectorField2D;
+
+    // 2×2 in-plane grid with cubic cells (dx=dy=dz=1).
+    let grid = Grid2D::new(2, 2, 1.0, 1.0, 1.0);
+
+    // Uniform magnetisation along +z.
+    let mut m = VectorField2D::new(grid);
+    m.set_uniform(0.0, 0.0, 1.0);
+
+    // Accumulate demag field into b_eff.
+    let mut b_eff = VectorField2D::new(grid);
+    b_eff.set_uniform(0.0, 0.0, 0.0);
+
+    // Turn demag ON for this test only.
+    let ms = 1.0;
+    let mat = Material {
+        ms,
+        a_ex: 0.0,
+        k_u: 0.0,
+        easy_axis: [0.0, 0.0, 1.0],
+        dmi: None,
+        demag: true,
+    };
+
+    add_demag_field(&grid, &m, &mut b_eff, &mat);
+
+    // For uniform M along z on this symmetric 2×2 grid:
+    // - Bx and By should be ~0 by symmetry.
+    // - All four cells should have identical Bz (all are symmetry-equivalent corners).
+    // - Bz should oppose Mz (negative).
+    let tol_xy = 1e-10;
+    let tol_equal = 1e-10;
+
+    let b0 = b_eff.data[0];
+    let mut bz_min = b0[2];
+    let mut bz_max = b0[2];
+
+    for (idx, b) in b_eff.data.iter().enumerate() {
+        assert!(b[0].abs() < tol_xy, "cell {idx}: expected Bx~0, got {}", b[0]);
+        assert!(b[1].abs() < tol_xy, "cell {idx}: expected By~0, got {}", b[1]);
+
+        bz_min = bz_min.min(b[2]);
+        bz_max = bz_max.max(b[2]);
+    }
+
+    assert!(
+        (bz_max - bz_min).abs() < tol_equal,
+        "expected identical Bz in all cells by symmetry, got range [{}, {}]",
+        bz_min,
+        bz_max
+    );
+
+    assert!(b0[2] < 0.0, "expected Bz < 0 for Mz>0, got {}", b0[2]);
+
+    // Implied Nzz = -Bz / (mu0 * Ms * mz). Here Ms=1, mz=1.
+    let nzz = -b0[2] / (MU0 * ms);
+    println!("demag 2x2x1 (cubic cell) implied Nzz ~ {:.6}", nzz);
+
+    // Very loose bounds: this is a first-pass demag kernel (dipole + cube self-term).
+    assert!(nzz > 0.05 && nzz < 1.05, "unexpected Nzz={}", nzz);
+}
+
+
+// ------------------------------------------------------------
+// Demag: print Nxx, Nyy, Nzz for a small 2×2×1 sample
+// ------------------------------------------------------------
+
+#[test]
+fn demag_uniform_2x2_prints_nxx_nyy_nzz() {
+    use llg_sim::effective_field::demag::add_demag_field;
+    use llg_sim::grid::Grid2D;
+    use llg_sim::params::{Material, MU0};
+    use llg_sim::vector_field::VectorField2D;
+
+    let grid = Grid2D::new(2, 2, 1.0, 1.0, 1.0);
+
+    let ms = 1.0;
+    let mat = Material {
+        ms,
+        a_ex: 0.0,
+        k_u: 0.0,
+        easy_axis: [0.0, 0.0, 1.0],
+        dmi: None,
+        demag: true,
+    };
+
+    fn infer_nii(component: usize, grid: Grid2D, ms: f64, mat: &Material) -> f64 {
+        let mut m = VectorField2D::new(grid);
+        let mut b_eff = VectorField2D::new(grid);
+        b_eff.set_uniform(0.0, 0.0, 0.0);
+
+        // Set uniform magnetisation along the chosen axis.
+        let (mx, my, mz) = match component {
+            0 => (1.0, 0.0, 0.0),
+            1 => (0.0, 1.0, 0.0),
+            2 => (0.0, 0.0, 1.0),
+            _ => unreachable!(),
+        };
+        m.set_uniform(mx, my, mz);
+
+        add_demag_field(&grid, &m, &mut b_eff, mat);
+
+        // Use cell 0 (all cells are symmetry-equivalent in 2×2).
+        let b = b_eff.data[0][component];
+
+        // Nii = -B_i / (mu0 * Ms * m_i). Here Ms=1 and m_i=1.
+        -b / (MU0 * ms)
+    }
+
+    let nxx = infer_nii(0, grid, ms, &mat);
+    let nyy = infer_nii(1, grid, ms, &mat);
+    let nzz = infer_nii(2, grid, ms, &mat);
+
+    println!("2x2x1 implied demag factors: Nxx={:.6}, Nyy={:.6}, Nzz={:.6}", nxx, nyy, nzz);
+
+    // Loose physical sanity: factors should be positive-ish and sum should be O(1).
+    assert!(nxx > 0.0 && nxx < 1.2);
+    assert!(nyy > 0.0 && nyy < 1.2);
+    assert!(nzz > 0.0 && nzz < 1.2);
+    assert!((nxx + nyy + nzz) > 0.5 && (nxx + nyy + nzz) < 2.5);
+}
+
+#[test]
+fn demag_energy_is_nonnegative_for_uniform_state() {
+    use llg_sim::energy::compute_energy;
+    use llg_sim::grid::Grid2D;
+    use llg_sim::params::Material;
+    use llg_sim::vector_field::VectorField2D;
+
+    let grid = Grid2D::new(32, 32, 5e-9, 5e-9, 1e-9);
+
+    let ms = 1.0;
+    let mat = Material {
+        ms,
+        a_ex: 0.0,
+        k_u: 0.0,
+        easy_axis: [0.0, 0.0, 1.0],
+        dmi: None,
+        demag: true,
+    };
+
+    let mut m = VectorField2D::new(grid);
+    m.set_uniform(0.0, 0.0, 1.0);
+
+    let e = compute_energy(&grid, &m, &mat, [0.0, 0.0, 0.0]);
+
+    // Demag energy should be >= 0 for a physical demag field.
+    assert!(e.demag >= 0.0, "demag energy was negative: {}", e.demag);
 }

@@ -73,6 +73,7 @@ fn main() -> std::io::Result<()> {
         k_u,
         easy_axis,
         dmi: None,
+        demag: false,
     };
 
     let mut scratch = RK4Scratch::new(grid);
