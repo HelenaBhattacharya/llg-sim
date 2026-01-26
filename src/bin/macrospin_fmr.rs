@@ -104,14 +104,19 @@ fn main() -> std::io::Result<()> {
         },
         fields: FieldConfig {
             b_ext: [0.0, 0.0, b0],
-            demag: false,
-            dmi: None,
+            demag: material.demag,
+            dmi: material.dmi,
         },
         numerics: NumericsConfig {
             integrator: "rk4".to_string(),
             dt,
             steps: n_steps,
             output_stride: 1,
+            // Not used for this fixed-step RK4 macrospin script
+            max_err: None,
+            headroom: None,
+            dt_min: None,
+            dt_max: None,
         },
         run: RunInfo {
             binary: "macrospin_fmr".to_string(),

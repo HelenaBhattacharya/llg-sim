@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json;
-use std::path::Path;
 use std::fs::File;
+use std::path::Path;
 
 #[derive(Serialize)]
 pub struct RunConfig {
@@ -40,9 +40,16 @@ pub struct FieldConfig {
 #[derive(Serialize)]
 pub struct NumericsConfig {
     pub integrator: String,
+    /// Initial timestep (s). For adaptive integrators, dt will vary during the run; see dt_history.csv.
     pub dt: f64,
     pub steps: usize,
     pub output_stride: usize,
+
+    // Optional adaptive-step settings (MuMax-like)
+    pub max_err: Option<f64>,
+    pub headroom: Option<f64>,
+    pub dt_min: Option<f64>,
+    pub dt_max: Option<f64>,
 }
 
 #[derive(Serialize)]

@@ -652,13 +652,14 @@ fn mumax_like_h_from_unit_m(
     let max_size = d / accuracy;
 
     // Integration counts for destination volume
-    let nx = ((cell[0] / max_size).max(1.0) + 0.5) as usize;
-    let ny = ((cell[1] / max_size).max(1.0) + 0.5) as usize;
-    let nz = ((cell[2] / max_size).max(1.0) + 0.5) as usize;
+    let nx = ((cell[0] / max_size).ceil().max(1.0)) as usize;
+    let ny = ((cell[1] / max_size).ceil().max(1.0)) as usize;
+    let nz = ((cell[2] / max_size).ceil().max(1.0)) as usize;
 
-    // Integration counts for source face (staggered, MuMax multiplies these by 2)
-    let mut nv = ((cell[v] / max_size).max(1.0) + 0.5) as usize;
-    let mut nw = ((cell[w] / max_size).max(1.0) + 0.5) as usize;
+    let mut nv = ((cell[v] / max_size).ceil().max(1.0)) as usize;
+    let mut nw = ((cell[w] / max_size).ceil().max(1.0)) as usize;
+
+    // MuMax-style staggering
     nv *= 2;
     nw *= 2;
 

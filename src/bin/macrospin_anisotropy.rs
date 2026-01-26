@@ -51,6 +51,7 @@ fn main() -> std::io::Result<()> {
     // ------------------------------------------------------------
 
     let n_steps: usize = (t_total / dt).round() as usize;
+    let out_stride: usize = 1; // write every step (macrospin is cheap)
 
     let grid = Grid2D::new(1, 1, dx, dy, dz);
 
@@ -104,14 +105,20 @@ fn main() -> std::io::Result<()> {
         },
         fields: FieldConfig {
             b_ext,
-            demag: false,
-            dmi: None,
+            demag: material.demag,
+            dmi: material.dmi,
         },
+
         numerics: NumericsConfig {
-            integrator: "rk4_recompute".to_string(),
-            dt,
+            integrator: "rk4recompute".to_string(),
+            dt: dt,
             steps: n_steps,
-            output_stride: 1,
+            output_stride: out_stride,
+            // Not used for this fixed-step RK4 macrospin script
+            max_err: None,
+            headroom: None,
+            dt_min: None,
+            dt_max: None,
         },
         run: RunInfo {
             binary: "macrospin_anisotropy".to_string(),

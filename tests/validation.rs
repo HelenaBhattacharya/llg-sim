@@ -608,3 +608,100 @@ fn demag_energy_is_nonnegative_for_uniform_state() {
     // Demag energy should be >= 0 for a physical demag field.
     assert!(e.demag >= 0.0, "demag energy was negative: {}", e.demag);
 }
+
+#[test]
+fn macrospin_precession_quarter_turn_rk45_adaptive() {
+    use llg_sim::grid::Grid2D;
+    use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
+    use llg_sim::params::{LLGParams, Material, GAMMA_E_RAD_PER_S_T};
+    use llg_sim::vector_field::VectorField2D;
+
+    // 1-cell macrospin
+    let grid = Grid2D::new(1, 1, 1.0, 1.0, 1.0);
+    let mut m = VectorField2D::new(grid);
+
+    // Start along +x
+    m.set_uniform(1.0, 0.0, 0.0);
+
+    // Constant B along +z, no damping => pure precession
+    let b0 = 0.1_f64; // Tesla
+
+    let mut params = LLGParams {
+        gamma: GAMMA_E_RAD_PER_S_T,
+        alpha: 0.0,
+        dt: 1e-14, // initial dt (adaptive will change it)
+        b_ext: [0.0, 0.0, b0],
+    };
+
+    let material = Material {
+        ms: 8.0e5,
+        a_ex: 0.0,
+        k_u: 0.0,
+        easy_axis: [0.0, 0.0, 1.0],
+        dmi: None,
+        demag: false,
+    };
+
+    // RK45 adaptive controls (MuMax-like)
+    let max_err = 1e-5;
+    let headroom = 0.8;
+
+    // Clamp dt so we don't do silly jumps; keep generous.
+    let dt_min = 1e-18;
+    let dt_max = 1e-11;
+
+    let mut scratch = RK45Scratch::new(grid);
+
+    // Target: quarter period: t = (pi/2)/(gamma*B)
+    let t_target = std::f64::consts::FRAC_PI_2 / (params.gamma * b0);
+
+    // Integrate until we hit t_target (within float tolerance)
+    let mut t = 0.0_f64;
+    let mut attempts = 0usize;
+
+    while t < t_target {
+        attempts += 1;
+        assert!(attempts < 200_000, "RK45 took too many attempts; dt may be stuck");
+
+        // Clamp dt so we land exactly on t_target
+        let remaining = t_target - t;
+        if params.dt > remaining {
+            params.dt = remaining;
+        }
+
+        let (_eps, accepted, dt_used) = step_llg_rk45_recompute_field_adaptive(
+            &mut m,
+            &mut params,
+            &material,
+            &mut scratch,
+            max_err,
+            headroom,
+            dt_min,
+            dt_max,
+        );
+
+        if accepted {
+            t += dt_used;
+        }
+        // if rejected, params.dt has been reduced inside the stepper; retry
+    }
+
+    // Expected: after ~quarter turn about +z, m should be mostly in ±y and near equator.
+    let v = m.data[0];
+
+    assert!(
+        v[2].abs() < 0.1,
+        "m_z should stay ~0 for pure precession, got {}",
+        v[2]
+    );
+    assert!(
+        v[1].abs() > 0.9,
+        "after ~quarter turn, |m_y| should be large, got {}",
+        v[1]
+    );
+    assert!(
+        v[0].abs() < 0.3,
+        "after ~quarter turn, |m_x| should be small, got {}",
+        v[0]
+    );
+}

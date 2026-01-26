@@ -101,13 +101,18 @@ fn main() -> std::io::Result<()> {
     let run_config = RunConfig {
         geometry: GeometryConfig { nx, ny, nz: 1, dx, dy, dz },
         material: MaterialConfig { ms, aex: a_ex, ku1: k_u, easy_axis },
-        fields: FieldConfig { b_ext, demag: false, dmi: material.dmi },
+        fields: FieldConfig { b_ext, demag: material.demag, dmi: material.dmi },
         numerics: NumericsConfig {
-            integrator: "rk4relax_masked_staged_energy_backtracking".to_string(),
+            integrator: "...".to_string(),
             dt: dt0,
             steps: n_steps,
             output_stride: out_stride,
+            max_err: None,
+            headroom: None,
+            dt_min: None,
+            dt_max: None,
         },
+
         run: RunInfo {
             binary: "bloch_relax".to_string(),
             run_id: "bloch_relax".to_string(),

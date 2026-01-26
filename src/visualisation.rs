@@ -128,6 +128,8 @@ pub fn save_energy_components_plot(
     e_ex: &[f64],
     e_an: &[f64],
     e_zee: &[f64],
+    e_dmi: &[f64],
+    e_demag: &[f64],
     e_tot: &[f64],
     filename: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -144,7 +146,14 @@ pub fn save_energy_components_plot(
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
 
-    for &e in e_ex.iter().chain(e_an).chain(e_zee).chain(e_tot) {
+    for &e in e_ex
+        .iter()
+        .chain(e_an)
+        .chain(e_zee)
+        .chain(e_dmi)
+        .chain(e_demag)
+        .chain(e_tot)
+    {
         if e.is_finite() {
             y_min = y_min.min(e);
             y_max = y_max.max(e);
@@ -155,11 +164,7 @@ pub fn save_energy_components_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-30 {
-        let delta = if y_max.abs() < 1e-30 {
-            1.0
-        } else {
-            0.1 * y_max.abs()
-        };
+        let delta = if y_max.abs() < 1e-30 { 1.0 } else { 0.1 * y_max.abs() };
         y_min -= delta;
         y_max += delta;
     } else {
@@ -168,6 +173,7 @@ pub fn save_energy_components_plot(
         y_max += margin;
     }
 
+    // Scale label like before
     let magnitude = y_max.abs().max(y_min.abs());
     let (scale, y_label): (f64, String) = if magnitude > 0.0 {
         let exp = magnitude.log10().floor() as i32;
@@ -196,6 +202,7 @@ pub fn save_energy_components_plot(
         .y_desc(y_label)
         .x_labels(10)
         .y_labels(10)
+        .x_label_formatter(&|x| format!("{:.2e}", x))
         .label_style(("sans-serif", 16))
         .axis_desc_style(("sans-serif", 18))
         .draw()?;
@@ -218,10 +225,7 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times
-                .iter()
-                .zip(e_zee.iter())
-                .map(|(&t, &e)| (t, e / scale)),
+            times.iter().zip(e_zee.iter()).map(|(&t, &e)| (t, e / scale)),
             &GREEN,
         ))?
         .label("Zeeman")
@@ -229,80 +233,27 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times
-                .iter()
-                .zip(e_tot.iter())
-                .map(|(&t, &e)| (t, e / scale)),
+            times.iter().zip(e_dmi.iter()).map(|(&t, &e)| (t, e / scale)),
+            &MAGENTA,
+        ))?
+        .label("DMI")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
+
+    chart
+        .draw_series(LineSeries::new(
+            times.iter().zip(e_demag.iter()).map(|(&t, &e)| (t, e / scale)),
+            &CYAN,
+        ))?
+        .label("Demag")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &CYAN));
+
+    chart
+        .draw_series(LineSeries::new(
+            times.iter().zip(e_tot.iter()).map(|(&t, &e)| (t, e / scale)),
             &BLACK,
         ))?
         .label("Total")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
-
-    chart
-        .configure_series_labels()
-        .border_style(&BLACK)
-        .background_style(&WHITE.mix(0.8))
-        .draw()?;
-
-    root.present()?;
-    Ok(())
-}
-
-pub fn save_m_avg_plot(
-    times: &[f64],
-    mx: &[f64],
-    my: &[f64],
-    mz: &[f64],
-    filename: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if times.is_empty() {
-        return Ok(());
-    }
-
-    let y_min = -1.1;
-    let y_max = 1.1;
-
-    let t_min = *times.first().unwrap();
-    let t_max = *times.last().unwrap();
-
-    let root = BitMapBackend::new(filename, (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
-
-    let mut chart = ChartBuilder::on(&root)
-        .margin(20)
-        .caption("Average magnetisation vs time", ("sans-serif", 30))
-        .set_left_and_bottom_label_area_size(60)
-        .build_cartesian_2d(t_min..t_max, y_min..y_max)?;
-
-    chart
-        .configure_mesh()
-        .x_desc("time (s)")
-        .y_desc("average magnetisation component")
-        .draw()?;
-
-    chart
-        .draw_series(LineSeries::new(
-            times.iter().zip(mx.iter()).map(|(&t, &v)| (t, v)),
-            &RED,
-        ))?
-        .label("m_x")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
-
-    chart
-        .draw_series(LineSeries::new(
-            times.iter().zip(my.iter()).map(|(&t, &v)| (t, v)),
-            &GREEN,
-        ))?
-        .label("m_y")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
-
-    chart
-        .draw_series(LineSeries::new(
-            times.iter().zip(mz.iter()).map(|(&t, &v)| (t, v)),
-            &BLUE,
-        ))?
-        .label("m_z")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
 
     chart
         .configure_series_labels()
@@ -342,11 +293,7 @@ pub fn save_energy_residual_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-30 {
-        let delta = if y_max.abs() < 1e-30 {
-            1.0
-        } else {
-            0.1 * y_max.abs()
-        };
+        let delta = if y_max.abs() < 1e-30 { 1.0 } else { 0.1 * y_max.abs() };
         y_min -= delta;
         y_max += delta;
     } else {
@@ -368,12 +315,80 @@ pub fn save_energy_residual_plot(
         .configure_mesh()
         .x_desc("time (s)")
         .y_desc("ΔE(t) = E(t) − E(0) (J)")
+        .x_label_formatter(&|x| format!("{:.2e}", x))
         .draw()?;
 
     chart.draw_series(LineSeries::new(
         times.iter().zip(residuals.iter()).map(|(&t, &de)| (t, de)),
         &BLACK,
     ))?;
+
+    root.present()?;
+    Ok(())
+}
+
+pub fn save_m_avg_plot(
+    times: &[f64],
+    mx: &[f64],
+    my: &[f64],
+    mz: &[f64],
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if times.is_empty() {
+        return Ok(());
+    }
+
+    let y_min = -1.1;
+    let y_max = 1.1;
+
+    let t_min = *times.first().unwrap();
+    let t_max = *times.last().unwrap();
+
+    let root = BitMapBackend::new(filename, (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .margin(20)
+        .caption("Average magnetisation vs time", ("sans-serif", 30))
+        .set_left_and_bottom_label_area_size(60)
+        .build_cartesian_2d(t_min..t_max, y_min..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("time (s)")
+        .y_desc("average magnetisation component")
+        .x_label_formatter(&|x| format!("{:.2e}", x))
+        .draw()?;
+
+    chart
+        .draw_series(LineSeries::new(
+            times.iter().zip(mx.iter()).map(|(&t, &v)| (t, v)),
+            &RED,
+        ))?
+        .label("m_x")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+    chart
+        .draw_series(LineSeries::new(
+            times.iter().zip(my.iter()).map(|(&t, &v)| (t, v)),
+            &GREEN,
+        ))?
+        .label("m_y")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
+
+    chart
+        .draw_series(LineSeries::new(
+            times.iter().zip(mz.iter()).map(|(&t, &v)| (t, v)),
+            &BLUE,
+        ))?
+        .label("m_z")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+
+    chart
+        .configure_series_labels()
+        .border_style(&BLACK)
+        .background_style(&WHITE.mix(0.8))
+        .draw()?;
 
     root.present()?;
     Ok(())
@@ -447,6 +462,7 @@ pub fn save_m_avg_zoom_plot(
         .configure_mesh()
         .x_desc("time (s)")
         .y_desc("average magnetisation component")
+        .x_label_formatter(&|x| format!("{:.2e}", x))
         .draw()?;
 
     chart
@@ -472,6 +488,135 @@ pub fn save_m_avg_zoom_plot(
         ))?
         .label("m_z")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+
+    chart
+        .configure_series_labels()
+        .border_style(&BLACK)
+        .background_style(&WHITE.mix(0.8))
+        .draw()?;
+
+    root.present()?;
+    Ok(())
+}
+
+pub fn save_dt_vs_time_plot(
+    times: &[f64],
+    dts: &[f64],
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if times.len() < 2 || times.len() != dts.len() {
+        return Ok(());
+    }
+
+    let t_min = *times.first().unwrap();
+    let t_max = *times.last().unwrap();
+
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for &v in dts {
+        if v.is_finite() {
+            y_min = y_min.min(v);
+            y_max = y_max.max(v);
+        }
+    }
+    if !y_min.is_finite() || !y_max.is_finite() {
+        y_min = 0.0;
+        y_max = 1.0;
+    } else {
+        let margin = 0.1 * (y_max - y_min).abs().max(1e-30);
+        y_min -= margin;
+        y_max += margin;
+        if y_min < 0.0 {
+            y_min = 0.0;
+        }
+    }
+
+    let root = BitMapBackend::new(filename, (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .margin(20)
+        .caption("Adaptive timestep dt vs time", ("sans-serif", 30))
+        .set_left_and_bottom_label_area_size(60)
+        .build_cartesian_2d(t_min..t_max, y_min..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("time (s)")
+        .y_desc("dt (s)")
+        .x_label_formatter(&|x| format!("{:.2e}", x))
+        .draw()?;
+
+    chart.draw_series(LineSeries::new(
+        times.iter().zip(dts.iter()).map(|(&t, &dt)| (t, dt)),
+        &BLACK,
+    ))?;
+
+    root.present()?;
+    Ok(())
+}
+
+pub fn save_eps_vs_time_plot(
+    times: &[f64],
+    eps: &[f64],
+    max_err: f64,
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if times.len() < 2 || times.len() != eps.len() {
+        return Ok(());
+    }
+
+    let t_min = *times.first().unwrap();
+    let t_max = *times.last().unwrap();
+
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for &v in eps {
+        if v.is_finite() {
+            y_min = y_min.min(v);
+            y_max = y_max.max(v);
+        }
+    }
+    if !y_min.is_finite() || !y_max.is_finite() {
+        y_min = 0.0;
+        y_max = 1.0;
+    } else {
+        let margin = 0.1 * (y_max - y_min).abs().max(1e-30);
+        y_min = (y_min - margin).max(0.0);
+        y_max += margin;
+    }
+    // ensure max_err visible
+    y_max = y_max.max(1.2 * max_err);
+
+    let root = BitMapBackend::new(filename, (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .margin(20)
+        .caption("RK45 error estimate eps vs time", ("sans-serif", 30))
+        .set_left_and_bottom_label_area_size(60)
+        .build_cartesian_2d(t_min..t_max, y_min..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("time (s)")
+        .y_desc("eps")
+        .x_label_formatter(&|x| format!("{:.2e}", x))
+        .draw()?;
+
+    chart
+        .draw_series(LineSeries::new(
+            times.iter().zip(eps.iter()).map(|(&t, &e)| (t, e)),
+            &RED,
+        ))?
+        .label("eps")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+    // Horizontal line: max_err
+    chart
+        .draw_series(LineSeries::new(vec![(t_min, max_err), (t_max, max_err)], &BLACK))?
+        .label("max_err")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
 
     chart
         .configure_series_labels()
