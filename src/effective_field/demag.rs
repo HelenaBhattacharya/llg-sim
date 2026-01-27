@@ -82,6 +82,14 @@ fn same_grid(a: &Grid2D, b: &Grid2D) -> bool {
     a.nx == b.nx && a.ny == b.ny && a.dx == b.dx && a.dy == b.dy && a.dz == b.dz
 }
 
+#[inline]
+fn wrap_index(d: isize, n: usize) -> usize {
+    let n = n as isize;
+    let mut v = d % n;
+    if v < 0 { v += n; }
+    v as usize
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KernelCacheHeader {
     magic: [u8; 8], // b"LLGDMAG\0"
@@ -287,8 +295,10 @@ struct Demag2D {
     // Kernel in Fourier domain (Tesla per (A/m))
     kxx: Vec<Complex<f64>>,
     kxy: Vec<Complex<f64>>,
+    #[allow(dead_code)]
     kxz: Vec<Complex<f64>>,
     kyy: Vec<Complex<f64>>,
+    #[allow(dead_code)]
     kyz: Vec<Complex<f64>>,
     kzz: Vec<Complex<f64>>,
 
@@ -355,22 +365,26 @@ impl Demag2D {
 
         if !loaded {
             println!("[demag] cache miss -> building kernel (this may take a while)...");
-            // Build real-space kernel first
-            for iy in 0..py {
-                let sy: isize = if iy <= py / 2 { iy as isize } else { iy as isize - py as isize };
-                for ix in 0..px {
-                    let sx: isize = if ix <= px / 2 { ix as isize } else { ix as isize - px as isize };
+            // Fill only the physically meaningful linear-convolution range.// MuMax fills displacements in [-(N-1), +(N-1)] and leaves the ±N Nyquist plane as 0.
+            // MuMax fills displacements in [-(N-1), +(N-1)] and leaves the ±N Nyquist plane as 0.
+            let rx_max = nx as isize - 1;
+            let ry_max = ny as isize - 1;
 
-                    let (k_xx, k_xy, k_xz, k_yy, k_yz, k_zz) =
-                        prism_kernel_tensor_numeric(grid.dx, grid.dy, grid.dz, sx, sy);
-
+            // arrays are already zero-initialised, so any entries we do not fill remain 0
+            for sy in -ry_max..=ry_max {
+                let iy = wrap_index(sy, py);
+                for sx in -rx_max..=rx_max {
+                    let ix = wrap_index(sx, px);
+                    let (k_xx, k_xy, _k_xz, k_yy, _k_yz, k_zz) =
+                    prism_kernel_tensor_numeric(grid.dx, grid.dy, grid.dz, sx, sy);
                     let idx = iy * px + ix;
                     kxx[idx].re = k_xx;
                     kxy[idx].re = k_xy;
-                    kxz[idx].re = k_xz;
                     kyy[idx].re = k_yy;
-                    kyz[idx].re = k_yz;
                     kzz[idx].re = k_zz;
+                    // MuMax 2D convention: XZ/YZ not used
+                    kxz[idx].re = 0.0;
+                    kyz[idx].re = 0.0;
                 }
             }
 
@@ -456,12 +470,11 @@ impl Demag2D {
             let mx = self.mx[idx];
             let my = self.my[idx];
             let mz = self.mz[idx];
-
-            self.bx[idx] = self.kxx[idx] * mx + self.kxy[idx] * my + self.kxz[idx] * mz;
-            self.by[idx] = self.kxy[idx] * mx + self.kyy[idx] * my + self.kyz[idx] * mz;
-            self.bz[idx] = self.kxz[idx] * mx + self.kyz[idx] * my + self.kzz[idx] * mz;
+            // Match MuMax 2D demag path: no XZ/YZ coupling
+            self.bx[idx] = self.kxx[idx] * mx + self.kxy[idx] * my;
+            self.by[idx] = self.kxy[idx] * mx + self.kyy[idx] * my;
+            self.bz[idx] = self.kzz[idx] * mz;
         }
-
         // iFFT back to real space
         fft2_inverse_in_place(&mut self.bx, self.px, self.py, &self.fft_x_inv, &self.fft_y_inv, &mut self.col_buf);
         fft2_inverse_in_place(&mut self.by, self.px, self.py, &self.fft_x_inv, &self.fft_y_inv, &mut self.col_buf);

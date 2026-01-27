@@ -13,6 +13,17 @@
 #     --col phi         => atan2(my, mx)  (optionally unwrap)
 #
 # Examples:
+# python3 scripts/overlay_macrospin.py \
+#   out/macrospin_fmr/rust_table_macrospin_fmr.csv \
+#   mumax_outputs/macrospin_fmr/table.txt \
+#   --col my \
+#   --clip_overlap \
+#   --metrics \
+#   --do_fft \
+#   --fft_tmin 5e-10 --fft_tmax 5e-9 \
+#   --fmin 1e9 \
+#   --out out/macrospin_fmr/overlay_my_vs_time.png 
+# 
 #   python3 scripts/overlay_macrospin.py \
 #     out/uniform_film/rust_table_uniform_film.csv \
 #     mumax_outputs/uniform_film_field/table.txt \
