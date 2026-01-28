@@ -1,0 +1,19 @@
+Nx := 200
+Ny := 50
+SetGridSize(Nx, Ny, 1)
+SetCellSize(500e-9/Nx, 125e-9/Ny, 3e-9)
+
+Msat  = 800e3
+Aex   = 13e-12
+alpha = 0.02
+
+m = Uniform(1, .1, 0)
+Relax()
+
+TableAdd(m)
+TableAutoSave(10e-12)
+
+AutoSave(m, 100e-12)
+
+B_ext = Vector(-35.5e-3, -6.3e-3, 0)
+Run(1e-9)
