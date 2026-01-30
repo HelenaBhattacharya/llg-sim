@@ -6,6 +6,42 @@
 // Run:
 //   cargo run --release --bin uniform_film_field
 //
+// Post-process (MuMax overlays: uniform film, RK4 recompute-field, demag ON):
+//
+//   # Overlay m_y(t):
+//   python3 scripts/overlay_macrospin.py \
+//     out/uniform_film/rust_table_uniform_film.csv \
+//     mumax_outputs/uniform_film_field_demag_on/table.txt \
+//     --col my --clip_overlap --metrics \
+//     --out out/uniform_film/overlay_my_vs_time.png
+//
+//   # Overlay m_z(t):
+//   python3 scripts/overlay_macrospin.py \
+//     out/uniform_film/rust_table_uniform_film.csv \
+//     mumax_outputs/uniform_film_field_demag_on/table.txt \
+//     --col mz --clip_overlap --metrics \
+//     --out out/uniform_film/overlay_mz_vs_time.png
+//
+// All plots are written to:
+//   out/uniform_film/
+//
+// Magnetisation components:
+//   - mx(t), my(t), mz(t)
+//   - m_parallel(t)
+//
+// Field diagnostics (spatial averages):
+//   - B_demagx/y/z(t)
+//   - B_effx/y/z(t)
+//
+// Energy terms:
+//   - E_demag(t)
+//   - E_total(t)
+//
+// All plots are written into:
+//   out/uniform_film/
+//
+// (e.g. overlay_my_rk4.png, overlay_B_demagz_rk4.png, overlay_E_demag_rk4.png)
+//
 // Output:
 //   out/uniform_film/
 //     ├── config.json

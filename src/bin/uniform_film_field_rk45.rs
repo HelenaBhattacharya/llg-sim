@@ -7,6 +7,59 @@
 //   cargo run --release --bin uniform_film_field_rk45 -- demag=off
 //   cargo run --release --bin uniform_film_field_rk45 -- demag=on
 //
+// Post-process (MuMax overlay: uniform film, adaptive RK45):
+//
+// Demag OFF:
+//   MuMax reference:
+//     mumax_outputs/uniform_film_field_demag_off/table.txt
+//
+//   Example overlays:
+//   python3 scripts/overlay_macrospin.py \
+//     out/uniform_film_rk45_demag_off/rust_table_uniform_film.csv \
+//     mumax_outputs/uniform_film_field_demag_off/table.txt \
+//     --col my --clip_overlap --metrics \
+//     --out out/uniform_film_rk45_demag_off/overlay_my_vs_time.png
+//
+//   python3 scripts/overlay_macrospin.py \
+//     out/uniform_film_rk45_demag_off/rust_table_uniform_film.csv \
+//     mumax_outputs/uniform_film_field_demag_off/table.txt \
+//     --col mz --clip_overlap --metrics \
+//     --out out/uniform_film_rk45_demag_off/overlay_mz_vs_time.png
+//
+// Demag ON:
+//   MuMax reference:
+//     mumax_outputs/uniform_film_field_demag_on/table.txt
+//
+//   Example overlays:
+//   python3 scripts/overlay_macrospin.py \
+//     out/uniform_film_rk45_demag_on/rust_table_uniform_film.csv \
+//     mumax_outputs/uniform_film_field_demag_on/table.txt \
+//     --col my --clip_overlap --metrics \
+//     --out out/uniform_film_rk45_demag_on/overlay_my_vs_time.png
+//
+//   python3 scripts/overlay_macrospin.py \
+//     out/uniform_film_rk45_demag_on/rust_table_uniform_film.csv \
+//     mumax_outputs/uniform_film_field_demag_on/table.txt \
+//     --col mz --clip_overlap --metrics \
+//     --out out/uniform_film_rk45_demag_on/overlay_mz_vs_time.png
+//
+// Depending on the `demag=` flag, outputs are written to:
+//
+//   - demag=off -> out/uniform_film_rk45_demag_off/
+//   - demag=on  -> out/uniform_film_rk45_demag_on/
+//
+// Magnetisation components:
+//   - mx(t), my(t), mz(t)
+//   - m_parallel(t)
+//
+// Field diagnostics (spatial averages):
+//   - B_demagx/y/z(t)
+//   - B_effx/y/z(t)
+//
+// Energy terms:
+//   - E_demag(t)
+//   - E_total(t)
+//
 // Output:
 //   out/uniform_film_rk45_{demag_on|demag_off}/
 //     ├── config.json

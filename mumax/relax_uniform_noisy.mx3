@@ -1,0 +1,45 @@
+// -----------------------------------------------------------------------------
+// Relaxation benchmark: near-uniform state -> MuMax Relax()
+//
+// Purpose:
+//   Validate relaxation consistency between MuMax and Rust using MuMax Relax().
+//   Uses a near-ground-state initial condition so Relax finishes quickly.
+//
+// Physics:
+//   Exchange + uniaxial anisotropy
+//   No demag, no DMI
+//   Small Bz bias to remove ±z degeneracy
+// -----------------------------------------------------------------------------
+
+SetGridSize(64, 64, 1)
+SetCellSize(5e-9, 5e-9, 5e-9)
+
+// ---------------- Material ----------------
+Msat = 8e5
+Aex  = 13e-12
+Ku1  = 500
+anisU = vector(0, 0, 1)
+
+// ---------------- Settings ----------------
+alpha = 0.5
+B_ext = vector(0, 0, 1e-6)   // symmetry-breaking bias
+
+// Disable demag
+NoDemagSpins.Set(1)
+
+// ---------------- Initial condition ----------------
+// Near the +z ground state (matches Rust spirit)
+eps := 0.05
+m = uniform(eps, 0, sqrt(1 - eps*eps))
+
+// ---------------- Relaxation ----------------
+// Stage 1: fast convergence
+RelaxTorqueThreshold = 1e-4
+Relax()
+
+// Stage 2: tighten (optional)
+RelaxTorqueThreshold = 1e-6
+Relax()
+
+// ---------------- Output ----------------
+SaveAs(m, "m_final")

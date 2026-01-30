@@ -155,6 +155,193 @@ impl RK45Scratch {
     }
 }
 
+/// Reusable scratch buffers for Bogacki–Shampine RK23 (3(2)) in relax-mode,
+/// with B_eff recomputed at each substage.
+///
+/// This is the MuMax-style choice for Relax(): adaptive 3rd-order with an
+/// embedded 2nd-order estimate for error control.
+pub struct RK23Scratch {
+    // Stage magnetisations
+    m2: VectorField2D,
+    m3: VectorField2D,
+    m4: VectorField2D, // 3rd-order solution (accepted state)
+
+    // Stage fields
+    b1: VectorField2D,
+    b2: VectorField2D,
+    b3: VectorField2D,
+    b4: VectorField2D,
+
+    // Stage torques
+    k1: Vec<[f64; 3]>,
+    k2: Vec<[f64; 3]>,
+    k3: Vec<[f64; 3]>,
+    k4: Vec<[f64; 3]>,
+}
+
+impl RK23Scratch {
+    pub fn new(grid: Grid2D) -> Self {
+        let n = grid.n_cells();
+        Self {
+            m2: VectorField2D::new(grid),
+            m3: VectorField2D::new(grid),
+            m4: VectorField2D::new(grid),
+
+            b1: VectorField2D::new(grid),
+            b2: VectorField2D::new(grid),
+            b3: VectorField2D::new(grid),
+            b4: VectorField2D::new(grid),
+
+            k1: vec![[0.0; 3]; n],
+            k2: vec![[0.0; 3]; n],
+            k3: vec![[0.0; 3]; n],
+            k4: vec![[0.0; 3]; n],
+        }
+    }
+}
+
+/// Adaptive Bogacki–Shampine RK23 (3(2)) step in relax mode (precession suppressed),
+/// with recompute-field at each substage and a FieldMask.
+///
+/// Error estimate is based on the difference between 3rd- and 2nd-order states.
+/// Controller: dt_next = dt * headroom * (max_err/eps)^(1/3), clamped.
+///
+/// Returns: (eps, accepted, dt_used).
+pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
+    m: &mut VectorField2D,
+    params: &mut LLGParams,
+    material: &Material,
+    scratch: &mut RK23Scratch,
+    mask: FieldMask,
+    max_err: f64,
+    headroom: f64,
+    dt_min: f64,
+    dt_max: f64,
+) -> (f64, bool, f64) {
+    let grid = &m.grid;
+    let gamma = params.gamma;
+    let alpha = params.alpha;
+    let dt0 = params.dt;
+    let n = m.data.len();
+
+    // Bogacki–Shampine coefficients
+    const A21: f64 = 1.0 / 2.0;
+
+    const A32: f64 = 3.0 / 4.0;
+
+    // 3rd order solution weights
+    const B1: f64 = 2.0 / 9.0;
+    const B2: f64 = 1.0 / 3.0;
+    const B3: f64 = 4.0 / 9.0;
+
+    // 2nd order embedded weights (uses k4)
+    const BH1: f64 = 7.0 / 24.0;
+    const BH2: f64 = 1.0 / 4.0;
+    const BH3: f64 = 1.0 / 3.0;
+    const BH4: f64 = 1.0 / 8.0;
+
+    // -----------------------
+    // Stage 1: k1 at m
+    // -----------------------
+    build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
+    for i in 0..n {
+        scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
+    }
+
+    // -----------------------
+    // Stage 2: m2 = m + dt*(1/2)*k1
+    // -----------------------
+    for i in 0..n {
+        let v = add_scaled(m.data[i], dt0 * A21, scratch.k1[i]);
+        scratch.m2.data[i] = normalize(v);
+    }
+    build_h_eff_masked(grid, &scratch.m2, &mut scratch.b2, params, material, mask);
+    for i in 0..n {
+        scratch.k2[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b2.data[i], gamma, alpha);
+    }
+
+    // -----------------------
+    // Stage 3: m3 = m + dt*(3/4)*k2
+    // -----------------------
+    for i in 0..n {
+        let v = add_scaled(m.data[i], dt0 * A32, scratch.k2[i]);
+        scratch.m3.data[i] = normalize(v);
+    }
+    build_h_eff_masked(grid, &scratch.m3, &mut scratch.b3, params, material, mask);
+    for i in 0..n {
+        scratch.k3[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b3.data[i], gamma, alpha);
+    }
+
+    // -----------------------
+    // 3rd-order solution: m4 = m + dt*(B1*k1 + B2*k2 + B3*k3)
+    // -----------------------
+    for i in 0..n {
+        let mut v = m.data[i];
+        v = add_scaled(v, dt0 * B1, scratch.k1[i]);
+        v = add_scaled(v, dt0 * B2, scratch.k2[i]);
+        v = add_scaled(v, dt0 * B3, scratch.k3[i]);
+        scratch.m4.data[i] = normalize(v);
+    }
+
+    // Stage 4 derivative at the 3rd-order solution
+    build_h_eff_masked(grid, &scratch.m4, &mut scratch.b4, params, material, mask);
+    for i in 0..n {
+        scratch.k4[i] = llg_rhs_relax(scratch.m4.data[i], scratch.b4.data[i], gamma, alpha);
+    }
+
+    // -----------------------
+    // 2nd-order embedded solution (reuse m2 buffer)
+    // m2 = m + dt*(BH1*k1 + BH2*k2 + BH3*k3 + BH4*k4)
+    // -----------------------
+    for i in 0..n {
+        let mut v = m.data[i];
+        v = add_scaled(v, dt0 * BH1, scratch.k1[i]);
+        v = add_scaled(v, dt0 * BH2, scratch.k2[i]);
+        v = add_scaled(v, dt0 * BH3, scratch.k3[i]);
+        v = add_scaled(v, dt0 * BH4, scratch.k4[i]);
+        scratch.m2.data[i] = normalize(v);
+    }
+
+    // -----------------------
+    // Error estimate: eps = max ||m3rd - m2nd||_inf
+    // -----------------------
+    let mut err_inf = 0.0_f64;
+    for i in 0..n {
+        let a = scratch.m4.data[i]; // 3rd order
+        let b = scratch.m2.data[i]; // 2nd order
+        let d0 = (a[0] - b[0]).abs();
+        let d1 = (a[1] - b[1]).abs();
+        let d2 = (a[2] - b[2]).abs();
+        let d = d0.max(d1).max(d2);
+        if d > err_inf {
+            err_inf = d;
+        }
+    }
+    let eps = err_inf;
+
+    // Next dt (order=3 controller)
+    let mut dt_next = if eps > 0.0 {
+        dt0 * headroom * (max_err / eps).powf(1.0 / 3.0)
+    } else {
+        dt0 * 2.0
+    };
+    dt_next = dt_next.clamp(dt_min, dt_max);
+
+    // Accept / reject (guarantee progress if at dt_min)
+    let accept = (eps <= max_err) || (dt0 <= dt_min * 1.0000000001);
+
+    if accept {
+        // Accept 3rd-order solution
+        m.data.clone_from(&scratch.m4.data);
+        params.dt = dt_next;
+        (eps, true, dt0)
+    } else {
+        // Reject: keep m unchanged, just shrink dt
+        params.dt = dt_next;
+        (eps, false, dt0)
+    }
+}
+
 /// Advance m by one step using explicit Euler, given precomputed B_eff (Tesla).
 pub fn step_llg_with_field(m: &mut VectorField2D, b_eff: &VectorField2D, params: &LLGParams) {
     let gamma = params.gamma;

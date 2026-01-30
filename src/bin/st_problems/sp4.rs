@@ -13,6 +13,31 @@
 //   cargo run --release --bin st_problems -- sp4 a
 //   cargo run --release --bin st_problems -- sp4 b
 //
+// Post-process (Standard Problem 4 comparison: MuMax vs Rust):
+//
+// MuMax reference data:
+//   mumax_outputs/st_problems/sp4/
+//     ├── sp4a_out/table.txt
+//     └── sp4b_out/table.txt
+//
+// Rust output data:
+//   runs/st_problems/sp4/
+//     ├── sp4a_rust/table.csv
+//     └── sp4b_rust/table.csv
+//
+// Generate comparison plots for SP4a and SP4b (two-panel figure):
+//
+// python3 scripts/compare_sp4.py \
+//   --mumax-root mumax_outputs/st_problems/sp4 \
+//   --rust-root runs/st_problems/sp4 \
+//   --out runs/st_problems/sp4/sp4_overlay.png
+//
+// Optional:
+//   --mark-mx-zero
+//     Mark first <m_x>=0 crossing time for MuMax (solid) and Rust (dashed).
+//
+// This produces:
+//   out/st_problems/sp4/sp4_overlay.png
 
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
@@ -20,10 +45,9 @@ use std::path::{Path, PathBuf};
 
 use llg_sim::effective_field::{build_h_eff_masked, FieldMask};
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{
-    step_llg_rk4_recompute_field_masked_relax_adaptive, step_llg_rk45_recompute_field_adaptive,
-    RK4Scratch, RK45Scratch,
-};
+use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
+use llg_sim::relax::{relax, RelaxSettings};
+use llg_sim::llg::RK23Scratch;
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vec3::{cross, normalize};
 use llg_sim::vector_field::VectorField2D;
@@ -105,10 +129,8 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
     // Relax controller (your relax stepper is RK4 step-doubling)
     let dt_relax0: f64 = 5e-14;
-    let relax_tol_step: f64 = 1e-6; // error tolerance for step-doubling controller
     let relax_dt_min: f64 = 1e-18;
     let relax_dt_max: f64 = 1e-11;
-    let relax_t_max: f64 = 5e-9;      // hard cap so we never hang
     let relax_torque_tol: f64 = 1e-4; // convergence criterion on |m x B|
 
     // -----------------------------------------------
@@ -133,70 +155,58 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
     let out_dir = out_dir_for_case(case);
     create_dir_all(&out_dir)?;
 
-    // --- RELAX stage (B_ext = 0), do NOT write table during relax ---
-    let mut params_relax = LLGParams {
-        gamma: GAMMA_E_RAD_PER_S_T,
-        alpha: alpha_run, // relax RHS uses alpha in prefactor; OK
-        dt: dt_relax0,
-        b_ext: [0.0, 0.0, 0.0],
-    };
+// --- RELAX stage (B_ext = 0), do NOT write table during relax ---
+let mut params_relax = LLGParams {
+    gamma: GAMMA_E_RAD_PER_S_T,
+    alpha: alpha_run,  // used in relax RHS prefactor
+    dt: dt_relax0,     // initial dt guess for adaptive relax
+    b_ext: [0.0, 0.0, 0.0],
+};
 
-    let mut scratch_rk4 = RK4Scratch::new(grid);
+// MuMax-like relax: RK23 + energy->torque phases + tolerance tightening
+let mut scratch_rk23 = RK23Scratch::new(grid);
+let mut relax_settings = RelaxSettings {
+    max_err: 1e-5,                 // MuMax-like starting MaxErr
+    headroom: 0.8,                 // MuMax-like Headroom
+    dt_min: relax_dt_min,
+    dt_max: relax_dt_max,
+    energy_stride: 3,              // MuMax uses N=3
+    rel_energy_tol: 1e-12,         // energy noise floor
+    torque_threshold: Some(relax_torque_tol), // use your existing 1e-4 threshold
+    tighten_factor: std::f64::consts::FRAC_1_SQRT_2, // /sqrt(2)
+    tighten_floor: 1e-9,           // MuMax-style floor
+    max_accepted_steps: 2_000_000, // safety cap
+};
 
-    let mut t_relax: f64 = 0.0;
-    let mut accepted_steps: usize = 0;
+// Log torque before relax (same as before)
+let torque0 = max_torque_inf(&grid, &m, &params_relax, &material);
+println!(
+    "SP4{} relax: start |m x B|_inf = {:.3e}, dt0={:.3e}",
+    case.to_ascii_uppercase(),
+    torque0,
+    params_relax.dt
+);
 
-    // Compute torque before relaxing (for logging)
-    let mut torque = max_torque_inf(&grid, &m, &params_relax, &material);
-    println!(
-        "SP4{} relax: start |m x B|_inf = {:.3e}, dt0={:.3e}",
-        case.to_ascii_uppercase(),
-        torque,
-        params_relax.dt
-    );
+// Run relax controller (does not advance physical time)
+relax(
+    &grid,
+    &mut m,
+    &mut params_relax,
+    &material,
+    &mut scratch_rk23,
+    FieldMask::Full,          // SP4 includes demag -> Full
+    &mut relax_settings,
+);
 
-    while t_relax < relax_t_max && torque > relax_torque_tol {
-        let dt_used = params_relax.dt;
-        let (_err, accepted) = step_llg_rk4_recompute_field_masked_relax_adaptive(
-            &mut m,
-            &mut params_relax,
-            &material,
-            &mut scratch_rk4,
-            FieldMask::Full,
-            relax_tol_step,
-            relax_dt_min,
-            relax_dt_max,
-        );
-
-        if accepted {
-            t_relax += dt_used;
-            accepted_steps += 1;
-
-            // Recompute torque occasionally (cheap enough at this grid size)
-            if accepted_steps % 50 == 0 {
-                torque = max_torque_inf(&grid, &m, &params_relax, &material);
-                println!(
-                    "SP4{} relax: t={:.3e} s, dt={:.3e}, |m x B|_inf={:.3e}",
-                    case.to_ascii_uppercase(),
-                    t_relax,
-                    params_relax.dt,
-                    torque
-                );
-            }
-        } else {
-            // rejected step: params_relax.dt updated smaller; try again
-        }
-    }
-
-    // Final torque check
-    torque = max_torque_inf(&grid, &m, &params_relax, &material);
-    println!(
-        "SP4{} relax: done t={:.3e} s, accepted_steps={}, |m x B|_inf={:.3e}",
-        case.to_ascii_uppercase(),
-        t_relax,
-        accepted_steps,
-        torque
-    );
+// Log torque after relax
+let torque1 = max_torque_inf(&grid, &m, &params_relax, &material);
+println!(
+    "SP4{} relax: done |m x B|_inf = {:.3e}, final max_err={:.3e}, final dt={:.3e}",
+    case.to_ascii_uppercase(),
+    torque1,
+    relax_settings.max_err,
+    params_relax.dt
+);
 
     // --- RUN stage (reset time to 0, apply B_ext, write table.csv) ---
     let b_ext = field_for_case(case);

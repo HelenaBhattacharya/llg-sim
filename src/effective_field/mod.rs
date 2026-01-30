@@ -1,4 +1,6 @@
 // src/effective_field/mod.rs
+/// NOTE: Despite the name build_h_eff*, this builds the effective induction B_eff (Tesla),
+/// consistent with the global convention used throughout the solver.
 
 pub mod anisotropy;
 pub mod exchange;

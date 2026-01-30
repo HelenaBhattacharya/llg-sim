@@ -8,7 +8,7 @@
 // Boundary conditions (Eq. 11–15) are imposed using ghost neighbours so derivatives remain central.
 // In case of nonzero D, these BCs must also be applied to exchange.
 //
-// IMPORTANT: NO μ0 in prefactor.  [oai_citation:5‡The design and verification of MuMax3 [1].pdf](sediment://file_000000002ef871f48e98082b4fbf5137)
+// IMPORTANT: NO μ0 in prefactor.
 
 use crate::grid::Grid2D;
 use crate::params::Material;

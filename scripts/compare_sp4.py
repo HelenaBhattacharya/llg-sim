@@ -8,16 +8,17 @@ from typing import Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 
-
 Array = np.ndarray
-MUMAX_MS = 2.0   # marker size for MuMax squares
-RUST_MS  = 2.0   # marker size for Rust circles
+
+# Style controls
+MUMAX_MS = 2.0   # marker size for MuMax points
+RUST_LW  = 1.6   # line width for Rust lines
 VLINE_LW = 0.6   # vertical line width (optional)
+
 
 def load_mumax_table(table_path: Path) -> Tuple[Array, Array, Array, Array]:
     """
     Load MuMax table.txt assuming first 4 numeric cols are: t, mx, my, mz.
-    This matches your original sp4_out.py behaviour.
     """
     data = np.loadtxt(table_path, comments="#")
     if data.ndim != 2 or data.shape[1] < 4:
@@ -33,8 +34,7 @@ def load_rust_csv(csv_path: Path) -> Tuple[Array, Array, Array, Array]:
     (extra columns allowed).
     """
     raw = np.genfromtxt(csv_path, delimiter=",", names=True)
-
-    names = raw.dtype.names or ()  # fixes Pylance: dtype.names can be None
+    names = raw.dtype.names or ()  # dtype.names can be None
 
     t_col = None
     for tkey in ("t_s", "t", "time_s"):
@@ -75,10 +75,27 @@ def first_zero_crossing_time(t: Array, x: Array) -> Optional[float]:
     return t0 + (0.0 - x0) * (t1 - t0) / (x1 - x0)
 
 
-def plot_triplet(ax, t_ns: Array, mx: Array, my: Array, mz: Array, fmt: str, prefix: str, ms: float):
-    ax.plot(t_ns, mx, fmt, label=f"{prefix}mx", markersize=ms)
-    ax.plot(t_ns, my, fmt, label=f"{prefix}my", markersize=ms)
-    ax.plot(t_ns, mz, fmt, label=f"{prefix}mz", markersize=ms)
+def plot_triplet(
+    ax,
+    t_ns: Array,
+    mx: Array,
+    my: Array,
+    mz: Array,
+    *,
+    marker: Optional[str],
+    linestyle: Optional[str],
+    prefix: str,
+    ms: float = 2.0,
+    lw: float = 1.6,
+):
+    """
+    Plot mx,my,mz on the given axes with consistent style.
+    - Use marker="o", linestyle="None" for points-only
+    - Use marker=None, linestyle="-" for line-only
+    """
+    ax.plot(t_ns, mx, label=f"{prefix}mx", marker=marker, linestyle=linestyle, markersize=ms, linewidth=lw)
+    ax.plot(t_ns, my, label=f"{prefix}my", marker=marker, linestyle=linestyle, markersize=ms, linewidth=lw)
+    ax.plot(t_ns, mz, label=f"{prefix}mz", marker=marker, linestyle=linestyle, markersize=ms, linewidth=lw)
 
 
 def main():
@@ -110,14 +127,14 @@ def main():
     )
     args = ap.parse_args()
 
-    # --- MuMax paths (match your existing naming convention) ---
+    # --- MuMax paths ---
     mumax_a = args.mumax_root / "sp4a_out" / "table.txt"
     mumax_b = args.mumax_root / "sp4b_out" / "table.txt"
 
     t_a, mx_a, my_a, mz_a = load_mumax_table(mumax_a)
     t_b, mx_b, my_b, mz_b = load_mumax_table(mumax_b)
 
-    # Convert to ns (match original)
+    # Convert to ns
     t_a_ns = t_a * 1e9
     t_b_ns = t_b * 1e9
 
@@ -132,54 +149,57 @@ def main():
         else:
             print(f"[warn] Rust tables not found at:\n  {ra}\n  {rb}\nContinuing with MuMax only.")
 
-    # --- Plot: SAME layout as your original sp4_out.py ---
+    # --- Plot layout ---
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(6, 6))
     ax_a, ax_b = axes
 
-    # SP4a – top panel (MuMax markers "s" as original)
-    plot_triplet(ax_a, t_a_ns, mx_a, my_a, mz_a, "s", prefix="", ms=MUMAX_MS)
+    # ---------- SP4a ----------
+    # MuMax: circles, points only
+    plot_triplet(ax_a, t_a_ns, mx_a, my_a, mz_a, marker="o", linestyle="None", prefix="MuMax ", ms=MUMAX_MS, lw=RUST_LW)
     ax_a.set_ylabel("<m>")
     ax_a.set_title("SP4a")
-    ax_a.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
 
-    # Overlay Rust if present (use a different marker for clarity)
+    # Rust: solid line, no markers
     if rust_a is not None:
         t_r, mx_r, my_r, mz_r = rust_a
-        plot_triplet(ax_a, t_r * 1e9, mx_r, my_r, mz_r, "o", prefix="Rust ", ms=RUST_MS)
-        ax_a.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
+        plot_triplet(ax_a, t_r * 1e9, mx_r, my_r, mz_r, marker=None, linestyle="-", prefix="Rust ", ms=MUMAX_MS, lw=RUST_LW)
 
-    # SP4b – bottom panel
-    plot_triplet(ax_b, t_b_ns, mx_b, my_b, mz_b, "s", prefix="", ms=MUMAX_MS)
+    ax_a.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
+
+    # ---------- SP4b ----------
+    plot_triplet(ax_b, t_b_ns, mx_b, my_b, mz_b, marker="o", linestyle="None", prefix="MuMax ", ms=MUMAX_MS, lw=RUST_LW)
     ax_b.set_xlabel("t (ns)")
     ax_b.set_ylabel("<m>")
     ax_b.set_title("SP4b")
-    ax_b.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
 
     if rust_b is not None:
         t_r, mx_r, my_r, mz_r = rust_b
-        plot_triplet(ax_b, t_r * 1e9, mx_r, my_r, mz_r, "o", prefix="Rust ", ms=RUST_MS)
-        ax_b.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
+        plot_triplet(ax_b, t_r * 1e9, mx_r, my_r, mz_r, marker=None, linestyle="-", prefix="Rust ", ms=MUMAX_MS, lw=RUST_LW)
 
+    ax_b.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
+
+    # ---------- Optional mx=0 markers ----------
     if args.mark_mx_zero:
         # MuMax crossings
         t0_ma = first_zero_crossing_time(t_a_ns, mx_a)
         t0_mb = first_zero_crossing_time(t_b_ns, mx_b)
         if t0_ma is not None:
-            ax_a.axvline(float(t0_ma), linestyle=":", linewidth=1)
+            ax_a.axvline(float(t0_ma), linestyle=":", linewidth=VLINE_LW)
         if t0_mb is not None:
-            ax_b.axvline(float(t0_mb), linestyle=":", linewidth=1)
+            ax_b.axvline(float(t0_mb), linestyle=":", linewidth=VLINE_LW)
 
         # Rust crossings
         if rust_a is not None:
             t_r, mx_r, _, _ = rust_a
             t0_ra = first_zero_crossing_time(t_r * 1e9, mx_r)
             if t0_ra is not None:
-                ax_a.axvline(float(t0_ra), linestyle="--", linewidth=1)
+                ax_a.axvline(float(t0_ra), linestyle="--", linewidth=VLINE_LW)
+
         if rust_b is not None:
             t_r, mx_r, _, _ = rust_b
             t0_rb = first_zero_crossing_time(t_r * 1e9, mx_r)
             if t0_rb is not None:
-                ax_b.axvline(float(t0_rb), linestyle="--", linewidth=1)
+                ax_b.axvline(float(t0_rb), linestyle="--", linewidth=VLINE_LW)
 
     plt.tight_layout()
 

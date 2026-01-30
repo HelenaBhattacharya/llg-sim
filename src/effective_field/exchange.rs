@@ -49,6 +49,8 @@ pub fn add_exchange_field(grid: &Grid2D, m: &VectorField2D, b_eff: &mut VectorFi
         Some(d) if d != 0.0 => Some(d / (2.0 * a)),
         _ => None,
     };
+    // If DMI is enabled, exchange must use modified (chiral) boundary conditions
+    // to remain consistent with the interfacial DMI formulation (MuMax-style)
 
     for j in 0..ny {
         for i in 0..nx {

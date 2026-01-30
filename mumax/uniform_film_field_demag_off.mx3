@@ -1,0 +1,48 @@
+// mumax/uniform_film_field_demag_off.mx3
+
+SetGridSize(128, 128, 1)
+SetCellSize(5e-9, 5e-9, 5e-9)
+
+Msat = 8e5
+Aex  = 13e-12
+Ku1  = 500
+anisU = vector(0, 0, 1)
+
+NoDemagSpins.Set(1)
+DemagAccuracy = 10
+
+alpha = 0.02
+B_ext = vector(0.01, 1e-4, 0)
+m = uniform(0, 0, 1)
+
+TableAdd(m)
+TableAdd(B_ext)
+TableAdd(B_demag)
+TableAdd(B_eff)
+
+TableAdd(E_total)
+TableAdd(E_exch)
+TableAdd(E_anis)
+TableAdd(E_zeeman)
+TableAdd(E_demag)
+
+// Solver diagnostics (SCARF build supports LastErr; LastTorque did not)
+TableAdd(LastErr)
+
+// Adaptive RK45 (Dormand–Prince)
+SetSolver(5)   // RK45, default for dynamics
+FixDt = 0      // adaptive dt
+
+MaxErr = 1e-5
+Headroom = 0.8
+MinDt = 1e-16
+MaxDt = 5e-12
+
+TableAutoSave(1e-12)
+Run(5e-9)
+
+//// Match Rust sampling cadence:
+// FixDt = 1e-13
+// TableAutoSave(1e-12)
+
+// Run(5e-9)

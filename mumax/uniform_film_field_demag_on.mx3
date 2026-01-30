@@ -1,4 +1,4 @@
-// mumax/uniform_film_field.mx3
+// mumax/uniform_film_field_demag_on.mx3
 
 SetGridSize(128, 128, 1)
 SetCellSize(5e-9, 5e-9, 5e-9)
@@ -30,8 +30,8 @@ TableAdd(E_demag)
 TableAdd(LastErr)
 
 // Adaptive RK45 (Dormand–Prince)
-SetSolver(5)   // RK45, default for dynamics  [oai_citation:3‡mumax.ugent.be](https://mumax.ugent.be/mumax3-workshop/tutorial3.pdf?utm_source=chatgpt.com)
-FixDt = 0      // adaptive dt  [oai_citation:4‡sinova-group.physik.uni-mainz.de](https://www.sinova-group.physik.uni-mainz.de/files/2017/08/2017-08-23_talk_Jeroen_Mulkers.pdf?utm_source=chatgpt.com)
+SetSolver(5)   // RK45, default for dynamics
+FixDt = 0      // adaptive dt
 
 MaxErr = 1e-5
 Headroom = 0.8

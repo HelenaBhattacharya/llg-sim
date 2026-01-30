@@ -1,7 +1,15 @@
 // src/bin/demag_cube.rs
 //
-// Quick demag sanity benchmark: compute implied demag factors Nxx, Nyy, Nzz
-// for a Nx×Ny×1 sample with cell sizes dx,dy,dz.
+// Developer diagnostic: demagnetisation kernel sanity checker.
+//
+// Computes implied demag factors (Nxx, Nyy, Nzz) for a uniform magnetisation
+// on an Nx×Ny×1 grid with given cell dimensions.
+//
+// This tool:
+//   - prints results to stdout only
+//   - does NOT write files
+//   - does NOT compare against MuMax
+//   - is intended for interactive inspection during demag development
 //
 // Usage examples:
 //   cargo run --bin demag_cube

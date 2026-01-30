@@ -94,7 +94,7 @@ pub fn save_mz_plot(
 /// and assumes numbering starts at 0 with no gaps.
 /// (main.rs will now generate frames that way.)
 pub fn make_movie_with_ffmpeg(pattern_glob: &str, output: &str, fps: u32) -> io::Result<()> {
-    let ffmpeg_path = "/opt/homebrew/bin/ffmpeg"; // update if needed
+    let ffmpeg_path = "/opt/homebrew/bin/ffmpeg"; // UPDATE TO REMOVE HARDCODED PATH
 
     let mut cmd = Command::new(ffmpeg_path);
     cmd.arg("-y")

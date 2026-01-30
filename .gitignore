@@ -7,7 +7,6 @@
 /mumax_outputs/
 /runs/
 /archive/
-/assets/
 
 # --- Legacy outputs written to repo root by src/main.rs (ignore these too) ---
 /avg_magnetisation.csv

@@ -13,12 +13,12 @@
 //
 // This mirrors the standard micromagnetics approach: treat each FD cell as having
 // uniform magnetization and compute the averaged field via a demag kernel, then
-// FFT accelerate the convolution (as in MuMax3 design/verification paper).  [oai_citation:1‡The design and verification of MuMax3 [1].pdf](sediment://file_000000006c6071f49e5dd71d017bc657)
+// FFT accelerate the convolution (as in MuMax3 design/verification paper)
 //
 // Notes:
 // - Grid is 2D (Nx×Ny) with a finite thickness dz (Nz=1).
 // - The kernel returns K in units of Tesla per (A/m), so B = K * M.
-// - For a cubic *single* cell, the self-demag factor should be exactly 1/3:
+// - For a cubic single cell, the self-demag factor should be exactly 1/3:
 //     B = -mu0/3 * M   (component-wise), and off-diagonals should be 0.
 
 use crate::grid::Grid2D;
@@ -575,7 +575,7 @@ const DEMAG_ACCURACY: f64 = 10.0;
 /// This follows MuMax3's approach: integrate magnetic surface charges on the two faces
 /// normal to the source magnetization axis, and average the resulting field over the
 /// destination cell volume, with adaptive integration point counts based on distance
-/// and cell aspect ratio.  [oai_citation:7‡The design and verification of MuMax3 [1].pdf](sediment://file_00000000a56c7246b826b37ad384ad79)  [oai_citation:8‡GitHub](https://raw.githubusercontent.com/mumax/3/master/mag/demagkernel.go)
+/// and cell aspect ratio
 fn prism_kernel_tensor_numeric(
     dx: f64,
     dy: f64,
@@ -765,6 +765,7 @@ fn delta_cell(d: isize) -> f64 {
     a
 }
 
+// Currently unused: kept for potential hybrid near-field / far-field kernels.
 #[allow(dead_code)]
 fn dipole_far_field(
     dx: f64,
@@ -804,7 +805,7 @@ mod tests {
     use crate::grid::Grid2D;
 
     #[test]
-    fn demag_single_cell_uniform_matches_cube_self_term() {
+    fn demag_single_cell_uniform_matches_analytic_cube_self_term() {
         let grid = Grid2D::new(1, 1, 1.0, 1.0, 1.0);
 
         let mut m = VectorField2D::new(grid);

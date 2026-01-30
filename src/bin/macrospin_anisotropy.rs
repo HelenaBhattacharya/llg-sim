@@ -6,6 +6,22 @@
 // Run:
 //   cargo run --bin macrospin_anisotropy
 //
+// Post-process (MuMax overlay: anisotropy-only macrospin):
+//
+//   # Overlay m_z(t):
+//   python3 scripts/overlay_macrospin.py \
+//     out/macrospin_anisotropy/rust_table_macrospin_anisotropy.csv \
+//     mumax_outputs/macrospin_anisotropy/table.txt \
+//     --col mz --clip_overlap --metrics \
+//     --out out/macrospin_anisotropy/overlay_mz_vs_time.png
+//
+//   # Overlay m_y(t):
+//   python3 scripts/overlay_macrospin.py \
+//     out/macrospin_anisotropy/rust_table_macrospin_anisotropy.csv \
+//     mumax_outputs/macrospin_anisotropy/table.txt \
+//     --col my --clip_overlap --metrics \
+//     --out out/macrospin_anisotropy/overlay_my_vs_time.png
+//
 // Output:
 //   out/macrospin_anisotropy/
 //     ├── config.json
