@@ -17,7 +17,7 @@ The focus is on clarity, modularity, and extensibility (e.g. adaptive meshing an
 
 ### Time integration and relaxation
 - Explicit Euler / RK4 / RK4 (recompute-field)
-- Adaptive RK45 (Dormand–Prince) with recompute-field (MuMax-like controller)
+- Adaptive RK45 (Dormand–Prince) with recompute-field
 - **MuMax-like relaxation controller** (`src/relax.rs`):
   - precession suppressed (damping-only RHS)
   - adaptive **RK23** (Bogacki–Shampine 3(2)) relax stepper
@@ -28,7 +28,7 @@ The focus is on clarity, modularity, and extensibility (e.g. adaptive meshing an
 - Reproducible benchmark binaries under `src/bin/*`
 - Python plotting scripts under `scripts/`
 - MuMax3 reference scripts under `mumax/`
-- Outputs are written to `out/` and `runs/` (ignored by git)
+- Outputs are written to `out/` and `runs/` and `mumax_outputs/` (ignored by git)
 
 ---
 
@@ -49,25 +49,26 @@ llg-sim/
 │   │   ├── uniform_film_field.rs       # uniform film benchmark (RK4 recompute)
 │   │   └── uniform_film_field_rk45.rs  # uniform film benchmark (adaptive RK45)
 │   ├── effective_field/                # exchange/anisotropy/zeeman/dmi/demag field terms
-│   ├── energy.rs                       # energy bookkeeping
-│   ├── grid.rs                         # grid helper
+│   ├── energy.rs  
+│   ├── main.rs                       
+│   ├── grid.rs                         
 │   ├── llg.rs                          # LLG RHS + integrators (incl RK23 + RK45)
-│   ├── relax.rs                        # MuMax-like Relax controller
+│   ├── relax.rs                        # relaxation regime controller
 │   ├── params.rs                       # material + solver parameters
-│   ├── vector_field.rs                 # magnetisation field container + initialisers
+│   ├── vector_field.rs
+│   ├── vec3.rs 
 │   ├── visualisation.rs                # plotting helpers for main.rs runs
-│   └── config.rs                       # config.json writer for benchmark outputs
+│   └── config.rs                       # config.json writer for outputs
 ├── scripts/
 │   ├── overlay_macrospin.py            # MuMax vs Rust overlays for macrospin/uniform film
 │   ├── compare_sp4.py                  # SP4 MuMax vs Rust comparison (two-panel)
 │   ├── overlay_relax.py                # relaxation validation (MuMax vs Rust final state)
 │   ├── bloch_dmi_analysis.py           # DMI chirality printout + plots (+D vs −D)
-│   └── compare_bloch_runs.py           # optional: compare multiple Bloch runs (diagnostics)
 ├── mumax/
 │   ├── st_problems/                    # μMAG standard problem mx3 scripts (SCARF)
 │   ├── macrospin_fmr.mx3
 │   ├── macrospin_anisotropy.mx3
-│   ├── relax_uniform_noisy.mx3         # MuMax Relax() reference for relaxation test
+│   ├── relax_uniform_noisy.mx3        
 │   ├── uniform_film_field_demag_on.mx3
 │   └── uniform_film_field_demag_off.mx3
 ├── tests/
