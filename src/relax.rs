@@ -34,6 +34,11 @@ pub struct RelaxSettings {
     /// then tighten max_err and continue until tighten_floor reached.
     pub torque_threshold: Option<f64>,
 
+    /// How often to compute the (expensive) torque metric during Phase 2.
+    /// 1 = every accepted step (exact previous behaviour).
+    /// Larger values reduce overhead (helpful for SP2), without changing the torque definition.
+    pub torque_check_stride: usize,
+
     /// Tighten factor applied to max_err each stage (MuMax uses /sqrt(2)).
     pub tighten_factor: f64,
     /// Stop tightening once max_err <= tighten_floor.
@@ -52,8 +57,9 @@ impl Default for RelaxSettings {
             dt_max: 1e-11,
             energy_stride: 3,
             rel_energy_tol: 1e-12,
-            torque_threshold: Some(1e-4), // reasonable default, adjust per problem
-            tighten_factor: std::f64::consts::FRAC_1_SQRT_2, // 1/sqrt(2)
+            torque_threshold: Some(1e-4),
+            torque_check_stride: 1, // default preserves existing behaviour (SP4 unchanged)
+            tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
             tighten_floor: 1e-9,
             max_accepted_steps: 2_000_000,
         }
@@ -111,10 +117,19 @@ pub fn relax(
                 return;
             }
             let (_eps, ok, _dt_used) = step_llg_rk23_recompute_field_masked_relax_adaptive(
-                m, params, material, scratch, mask,
-                settings.max_err, settings.headroom, settings.dt_min, settings.dt_max
+                m,
+                params,
+                material,
+                scratch,
+                mask,
+                settings.max_err,
+                settings.headroom,
+                settings.dt_min,
+                settings.dt_max,
             );
-            if ok { accepted += 1; }
+            if ok {
+                accepted += 1;
+            }
         }
 
         let e1 = compute_total_energy(grid, m, material, params.b_ext);
@@ -133,35 +148,73 @@ pub fn relax(
     // -------------------------
     // Tighten max_err progressively (MuMax style) while reducing torque.
     loop {
-        // If we have a torque threshold, step until below it.
         if let Some(tau) = settings.torque_threshold {
-            loop {
-                let tmax = max_torque_inf(grid, m, params, material, mask);
-                if tmax <= tau {
-                    break;
-                }
+            // Stride must be >= 1
+            let stride = settings.torque_check_stride.max(1);
+
+            // Compute torque once at the start of this tolerance stage
+            let mut tmax = max_torque_inf(grid, m, params, material, mask);
+
+            // Step until torque is below threshold, checking only every `stride` accepted steps
+            let mut since_check: usize = 0;
+            while tmax > tau {
                 if accepted >= settings.max_accepted_steps {
                     return;
                 }
+
                 let (_eps, ok, _dt_used) = step_llg_rk23_recompute_field_masked_relax_adaptive(
-                    m, params, material, scratch, mask,
-                    settings.max_err, settings.headroom, settings.dt_min, settings.dt_max
+                    m,
+                    params,
+                    material,
+                    scratch,
+                    mask,
+                    settings.max_err,
+                    settings.headroom,
+                    settings.dt_min,
+                    settings.dt_max,
                 );
-                if ok { accepted += 1; }
+
+                if !ok {
+                    continue;
+                }
+
+                accepted += 1;
+                since_check += 1;
+
+                if since_check >= stride {
+                    tmax = max_torque_inf(grid, m, params, material, mask);
+                    since_check = 0;
+                }
+            }
+
+            // Ensure we finish this stage with a “fresh” torque evaluation (for determinism)
+            if since_check != 0 {
+                let _ = max_torque_inf(grid, m, params, material, mask);
             }
         } else {
             // If no threshold: just do some steps and require torque to decrease on average
             let t0 = max_torque_inf(grid, m, params, material, mask);
+
             for _ in 0..(10 * settings.energy_stride) {
                 if accepted >= settings.max_accepted_steps {
                     return;
                 }
                 let (_eps, ok, _dt_used) = step_llg_rk23_recompute_field_masked_relax_adaptive(
-                    m, params, material, scratch, mask,
-                    settings.max_err, settings.headroom, settings.dt_min, settings.dt_max
+                    m,
+                    params,
+                    material,
+                    scratch,
+                    mask,
+                    settings.max_err,
+                    settings.headroom,
+                    settings.dt_min,
+                    settings.dt_max,
                 );
-                if ok { accepted += 1; }
+                if ok {
+                    accepted += 1;
+                }
             }
+
             let t1 = max_torque_inf(grid, m, params, material, mask);
             if !(t1 < t0) {
                 // torque not improving; proceed to tighten (or stop if already tight)

@@ -166,16 +166,17 @@ let mut params_relax = LLGParams {
 // MuMax-like relax: RK23 + energy->torque phases + tolerance tightening
 let mut scratch_rk23 = RK23Scratch::new(grid);
 let mut relax_settings = RelaxSettings {
-    max_err: 1e-5,                 // MuMax-like starting MaxErr
-    headroom: 0.8,                 // MuMax-like Headroom
+    max_err: 1e-5,
+    headroom: 0.8,
     dt_min: relax_dt_min,
     dt_max: relax_dt_max,
-    energy_stride: 3,              // MuMax uses N=3
-    rel_energy_tol: 1e-12,         // energy noise floor
-    torque_threshold: Some(relax_torque_tol), // use your existing 1e-4 threshold
-    tighten_factor: std::f64::consts::FRAC_1_SQRT_2, // /sqrt(2)
-    tighten_floor: 1e-9,           // MuMax-style floor
-    max_accepted_steps: 2_000_000, // safety cap
+    energy_stride: 3,
+    rel_energy_tol: 1e-12,
+    torque_threshold: Some(relax_torque_tol),
+    torque_check_stride: 1, // keep SP4 behaviour identical
+    tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
+    tighten_floor: 1e-9,
+    max_accepted_steps: 2_000_000,
 };
 
 // Log torque before relax (same as before)
