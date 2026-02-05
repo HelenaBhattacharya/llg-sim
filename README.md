@@ -84,8 +84,7 @@ Run MuMax3 code on GPU and compare outputs:
 python3 scripts/compare_sp4.py \
   --mumax-root mumax_outputs/st_problems/sp4 \
   --rust-root runs/st_problems/sp4 \
-  --metrics --metrics-interp mumax \
-  --out runs/st_problems/sp4/sp4_overlay.png
+  --metrics --metrics-interp mumax
 ```
 
 ### Uniform film field test (rk45 solver + demag ON)
