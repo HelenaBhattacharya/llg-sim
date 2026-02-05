@@ -1,0 +1,59 @@
+/*
+  demag2Dpbc.mx3  (comparison script for Rust)
+
+  PBC test for thin film (Nz=1), periodic along X with finite image count.
+  Matches the intent of MuMax's demag2Dpbc2 regression:
+    - SetPBC(32, 0, 0)
+    - Run with Nx=2 and Nx=3 (odd Nx case)
+    - For each geometry: evaluate uniform m = +x, +y, +z and save table rows.
+
+  Notes:
+    - Msat = 1/mu0 makes B_demag.Average() dimensionless demag tensor entries.
+    - DemagAccuracy set explicitly to 10 to match Rust's current DEMAG_ACCURACY.
+    - TableSave() appends one row each time (so table.txt will contain 6 rows total:
+        rows 1-3: Nx=2 cases (mx,my,mz)
+        rows 4-6: Nx=3 cases (mx,my,mz)
+*/
+
+SetPBC(32, 0, 0)
+SetCellSize(1e-9, 1e-9, 0.5e-9)
+
+Msat = 1/mu0
+DemagAccuracy = 10
+
+TableAdd(m)
+TableAdd(B_demag)
+
+// ----------------------------
+// Nx=2, Ny=128, Nz=1
+// ----------------------------
+SetGridSize(2, 128, 1)
+
+m = uniform(1, 0, 0)
+Run(0)
+TableSave()
+
+m = uniform(0, 1, 0)
+Run(0)
+TableSave()
+
+m = uniform(0, 0, 1)
+Run(0)
+TableSave()
+
+// ----------------------------
+// Nx=3, Ny=128, Nz=1 (odd Nx regression)
+// ----------------------------
+SetGridSize(3, 128, 1)
+
+m = uniform(1, 0, 0)
+Run(0)
+TableSave()
+
+m = uniform(0, 1, 0)
+Run(0)
+TableSave()
+
+m = uniform(0, 0, 1)
+Run(0)
+TableSave()

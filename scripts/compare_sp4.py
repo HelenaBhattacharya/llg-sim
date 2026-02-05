@@ -98,6 +98,95 @@ def plot_triplet(
     ax.plot(t_ns, mz, label=f"{prefix}mz", marker=marker, linestyle=linestyle, markersize=ms, linewidth=lw)
 
 
+# ----------------------------
+# Metrics helpers (NEW)
+# ----------------------------
+
+def overlap_window(
+    t1: Array,
+    t2: Array,
+    tmin: Optional[float] = None,
+    tmax: Optional[float] = None,
+) -> Tuple[float, float]:
+    lo = float(max(t1[0], t2[0]))
+    hi = float(min(t1[-1], t2[-1]))
+    if tmin is not None:
+        lo = max(lo, float(tmin))
+    if tmax is not None:
+        hi = min(hi, float(tmax))
+    if hi <= lo:
+        raise ValueError(f"No overlap window: lo={lo}, hi={hi}")
+    return lo, hi
+
+
+def clip_time(t: Array, *ys: Array, lo: float, hi: float) -> Tuple[Array, ...]:
+    mask = (t >= lo) & (t <= hi)
+    out = (t[mask],)
+    for y in ys:
+        out += (y[mask],)
+    return out
+
+
+def rmse(a: Array, b: Array) -> float:
+    d = a - b
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def max_abs_err(a: Array, b: Array) -> float:
+    return float(np.max(np.abs(a - b)))
+
+
+def metrics_on_grid(
+    t_ref: Array,
+    y_ref: Array,
+    t_other: Array,
+    y_other: Array,
+) -> Tuple[float, float]:
+    """
+    Interpolate y_other(t_other) onto t_ref and compute (rmse, max_abs_err).
+    Uses numpy.interp (1D linear interpolation; assumes monotonic t).   [oai_citation:2‡numpy.org](https://numpy.org/devdocs/reference/generated/numpy.interp.html?utm_source=chatgpt.com)
+    """
+    y_other_i = np.interp(t_ref, t_other, y_other)
+    return rmse(y_ref, y_other_i), max_abs_err(y_ref, y_other_i)
+
+
+def print_metrics_block(
+    label: str,
+    t_m: Array, mx_m: Array, my_m: Array, mz_m: Array,
+    t_r: Array, mx_r: Array, my_r: Array, mz_r: Array,
+    *,
+    tmin: Optional[float],
+    tmax: Optional[float],
+    interp_to: str,
+) -> None:
+    lo, hi = overlap_window(t_m, t_r, tmin=tmin, tmax=tmax)
+
+    # clip both to the same time window first
+    t_m2, mx_m2, my_m2, mz_m2 = clip_time(t_m, mx_m, my_m, mz_m, lo=lo, hi=hi)
+    t_r2, mx_r2, my_r2, mz_r2 = clip_time(t_r, mx_r, my_r, mz_r, lo=lo, hi=hi)
+
+    if len(t_m2) < 2 or len(t_r2) < 2:
+        print(f"[metrics] {label}: not enough points after clipping (lo={lo:.3e}, hi={hi:.3e})")
+        return
+
+    # choose reference grid
+    if interp_to == "rust":
+        tref = t_r2
+        rm_mx, ma_mx = metrics_on_grid(tref, mx_r2, t_m2, mx_m2)
+        rm_my, ma_my = metrics_on_grid(tref, my_r2, t_m2, my_m2)
+        rm_mz, ma_mz = metrics_on_grid(tref, mz_r2, t_m2, mz_m2)
+    else:
+        tref = t_m2
+        rm_mx, ma_mx = metrics_on_grid(tref, mx_m2, t_r2, mx_r2)
+        rm_my, ma_my = metrics_on_grid(tref, my_m2, t_r2, my_r2)
+        rm_mz, ma_mz = metrics_on_grid(tref, mz_m2, t_r2, mz_r2)
+
+    print(f"\n[metrics] {label}  window: t in [{lo:.3e}, {hi:.3e}] s  (interp_to={interp_to})")
+    print(f"  mx: RMSE = {rm_mx:.6e}   max|err| = {ma_mx:.6e}")
+    print(f"  my: RMSE = {rm_my:.6e}   max|err| = {ma_my:.6e}")
+    print(f"  mz: RMSE = {rm_mz:.6e}   max|err| = {ma_mz:.6e}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Plot Standard Problem 4 (a,b) MuMax outputs, optionally overlay Rust outputs."
@@ -125,6 +214,32 @@ def main():
         action="store_true",
         help="Mark the first <mx>=0 crossing time for MuMax and Rust (if present).",
     )
+
+    # NEW: metrics
+    ap.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Print quantitative comparison metrics (RMSE, max|err|) for mx/my/mz (requires Rust outputs).",
+    )
+    ap.add_argument(
+        "--metrics-tmin",
+        type=float,
+        default=None,
+        help="Optional metrics window start time in seconds (e.g. 3e-9).",
+    )
+    ap.add_argument(
+        "--metrics-tmax",
+        type=float,
+        default=None,
+        help="Optional metrics window end time in seconds (e.g. 5e-9).",
+    )
+    ap.add_argument(
+        "--metrics-interp",
+        choices=["rust", "mumax"],
+        default="rust",
+        help="Interpolate the other dataset onto this time grid for metrics (default: rust).",
+    )
+
     args = ap.parse_args()
 
     # --- MuMax paths ---
@@ -148,6 +263,31 @@ def main():
             rust_b = load_rust_csv(rb)
         else:
             print(f"[warn] Rust tables not found at:\n  {ra}\n  {rb}\nContinuing with MuMax only.")
+
+    # --- NEW: metrics printout ---
+    if args.metrics:
+        if rust_a is None or rust_b is None:
+            print("[metrics] Rust outputs not available; metrics require --rust-root with sp4a_rust/table.csv and sp4b_rust/table.csv")
+        else:
+            t_ra, mx_ra, my_ra, mz_ra = rust_a
+            t_rb, mx_rb, my_rb, mz_rb = rust_b
+
+            print_metrics_block(
+                "SP4a",
+                t_a, mx_a, my_a, mz_a,
+                t_ra, mx_ra, my_ra, mz_ra,
+                tmin=args.metrics_tmin,
+                tmax=args.metrics_tmax,
+                interp_to=args.metrics_interp,
+            )
+            print_metrics_block(
+                "SP4b",
+                t_b, mx_b, my_b, mz_b,
+                t_rb, mx_rb, my_rb, mz_rb,
+                tmin=args.metrics_tmin,
+                tmax=args.metrics_tmax,
+                interp_to=args.metrics_interp,
+            )
 
     # --- Plot layout ---
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(6, 6))

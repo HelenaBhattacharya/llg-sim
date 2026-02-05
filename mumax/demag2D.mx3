@@ -1,0 +1,32 @@
+// mumax/demag2D.mx3
+//
+// Export-style demag2D comparison for Rust.
+//
+// Grid: 128x128x1
+// Cell: 1e-9, 1e-9, 0.5e-9
+// Msat = 1/mu0 so B_demag.Average() gives dimensionless demag tensor entries
+// DemagAccuracy = 10 to match Rust's current demag accuracy setting.
+
+SetGridSize(128, 128, 1)
+SetCellSize(1e-9, 1e-9, 0.5e-9)
+
+Msat = 1/mu0
+DemagAccuracy = 10
+
+TableAdd(m)
+TableAdd(B_demag)
+
+// Case 1: m = +x
+m = uniform(1, 0, 0)
+Run(0)
+TableSave()
+
+// Case 2: m = +y
+m = uniform(0, 1, 0)
+Run(0)
+TableSave()
+
+// Case 3: m = +z
+m = uniform(0, 0, 1)
+Run(0)
+TableSave()

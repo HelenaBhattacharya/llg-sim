@@ -58,7 +58,7 @@ cargo build --release
 ### Run tests
 ```bash 
 cargo test
-# or just the integration-style tests:
+# or just the integration-style tests found in `tests/validation.rs`:
 cargo test --test validation
 ```
 ---
@@ -83,7 +83,9 @@ Run MuMax3 code on GPU and compare outputs:
 ```bash
 python3 scripts/compare_sp4.py \
   --mumax-root mumax_outputs/st_problems/sp4 \
-  --rust-root  runs/st_problems/sp4
+  --rust-root runs/st_problems/sp4 \
+  --metrics --metrics-interp mumax \
+  --out runs/st_problems/sp4/sp4_overlay.png
 ```
 
 ### Uniform film field test (rk45 solver + demag ON)

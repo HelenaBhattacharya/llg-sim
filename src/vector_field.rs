@@ -1,6 +1,7 @@
 // src/vector_field.rs
 
 use crate::grid::Grid2D;
+use crate::vec3::normalize;
 
 /// Magnetisation / vector field defined on a 2D grid.
 /// Each cell stores (x, y, z).
@@ -20,6 +21,8 @@ impl VectorField2D {
     }
 
     /// Set all cells to the same vector (x, y, z).
+    ///
+    /// NOTE: This does not normalise; callers should provide a unit vector if required.
     pub fn set_uniform(&mut self, x: f64, y: f64, z: f64) {
         for cell in &mut self.data {
             *cell = [x, y, z];
@@ -30,6 +33,52 @@ impl VectorField2D {
     #[inline]
     pub fn idx(&self, i: usize, j: usize) -> usize {
         self.grid.idx(i, j)
+    }
+
+    /// Set one cell (i,j) to the given vector (x,y,z), normalising to unit length.
+    ///
+    /// MuMax analogue: m.SetCell(i,j,0, vector(x,y,z)) for Nz=1.
+    pub fn set_cell(&mut self, i: usize, j: usize, x: f64, y: f64, z: f64) {
+        assert!(
+            i < self.grid.nx,
+            "set_cell: i={} out of bounds (nx={})",
+            i,
+            self.grid.nx
+        );
+        assert!(
+            j < self.grid.ny,
+            "set_cell: j={} out of bounds (ny={})",
+            j,
+            self.grid.ny
+        );
+        let idx = self.idx(i, j);
+        self.data[idx] = normalize([x, y, z]);
+    }
+
+    /// Set one cell (i,j) to the given vector, normalising to unit length.
+    pub fn set_cell_vec(&mut self, i: usize, j: usize, v: [f64; 3]) {
+        self.set_cell(i, j, v[0], v[1], v[2]);
+    }
+
+    /// Set one cell by flat index, normalising to unit length.
+    pub fn set_cell_idx(&mut self, idx: usize, v: [f64; 3]) {
+        assert!(
+            idx < self.data.len(),
+            "set_cell_idx: idx={} out of bounds (len={})",
+            idx,
+            self.data.len()
+        );
+        self.data[idx] = normalize(v);
+    }
+
+    /// Checked variant: returns false if (i,j) out of bounds; otherwise sets the cell and returns true.
+    pub fn set_cell_checked(&mut self, i: usize, j: usize, v: [f64; 3]) -> bool {
+        if i >= self.grid.nx || j >= self.grid.ny {
+            return false;
+        }
+        let idx = self.idx(i, j);
+        self.data[idx] = normalize(v);
+        true
     }
 
     /// Initialise a 180° Néel wall (rotation in x–z plane), centered at x0 with characteristic width.
@@ -153,6 +202,37 @@ mod tests {
             let v = m.data[m.idx(i, 0)];
             let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
             assert!((norm - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn set_cell_normalizes_and_only_changes_one_cell() {
+        let grid = Grid2D::new(4, 3, 1.0, 1.0, 1.0);
+        let mut m = VectorField2D::new(grid);
+
+        // Start uniform +z
+        m.set_uniform(0.0, 0.0, 1.0);
+
+        // Set a single cell with a non-unit vector
+        m.set_cell(2, 1, 0.0, 2.0, 0.0);
+
+        // That cell should now be (0,1,0)
+        let v = m.data[m.idx(2, 1)];
+        assert!((v[0] - 0.0).abs() < 1e-12);
+        assert!((v[1] - 1.0).abs() < 1e-12);
+        assert!((v[2] - 0.0).abs() < 1e-12);
+
+        // All other cells should still be +z
+        for j in 0..m.grid.ny {
+            for i in 0..m.grid.nx {
+                if i == 2 && j == 1 {
+                    continue;
+                }
+                let w = m.data[m.idx(i, j)];
+                assert!((w[0] - 0.0).abs() < 1e-12);
+                assert!((w[1] - 0.0).abs() < 1e-12);
+                assert!((w[2] - 1.0).abs() < 1e-12);
+            }
         }
     }
 }

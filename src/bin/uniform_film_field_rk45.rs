@@ -36,13 +36,13 @@
 //     mumax_outputs/uniform_film_field_demag_on/table.txt \
 //     --col my --clip_overlap --metrics \
 //     --out out/uniform_film_rk45_demag_on/overlay_my_vs_time.png
-//
+
 //   python3 scripts/overlay_macrospin.py \
 //     out/uniform_film_rk45_demag_on/rust_table_uniform_film.csv \
 //     mumax_outputs/uniform_film_field_demag_on/table.txt \
 //     --col mz --clip_overlap --metrics \
 //     --out out/uniform_film_rk45_demag_on/overlay_mz_vs_time.png
-//
+
 // Depending on the `demag=` flag, outputs are written to:
 //
 //   - demag=off -> out/uniform_film_rk45_demag_off/
@@ -316,5 +316,8 @@ fn main() -> std::io::Result<()> {
     println!("Wrote outputs to {:?}", out_dir);
     println!("Demag enabled: {}", enable_demag);
     println!("t_total={}, dt_out={}, n_out={}", t_total, dt_out, n_out);
+    // Final state summary (spatial average)
+    let [mx_f, my_f, mz_f] = avg_vec(&m);
+    println!("FINAL <m> at t = {:.3e} s: mx={:.6e}, my={:.6e}, mz={:.6e}", t_total, mx_f, my_f, mz_f);
     Ok(())
 }
