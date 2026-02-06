@@ -13,6 +13,8 @@
 //   cargo run --release --bin st_problems -- sp4 a
 //   cargo run --release --bin st_problems -- sp4 b
 //
+// Can also provide additional arguments: RAYON_NUM_THREADS=8 LLG_DEMAG_TIMING=1 cargo run --release --bin st_problems -- sp4 a
+//
 // Post-process (Standard Problem 4 comparison: MuMax vs Rust):
 //
 // MuMax reference data:
@@ -30,11 +32,16 @@
 // python3 scripts/compare_sp4.py \
 //   --mumax-root mumax_outputs/st_problems/sp4 \
 //   --rust-root runs/st_problems/sp4 \
+//   --metrics \
 //   --out runs/st_problems/sp4/sp4_overlay.png
 //
 // Optional:
 //   --mark-mx-zero
 //     Mark first <m_x>=0 crossing time for MuMax (solid) and Rust (dashed).
+//   --metrics --metrics-tmin 3e-9 --metrics-tmax 5e-9 \
+//     Compute and display metrics insets for the time window [3 ns, 5 ns].
+//   --metrics --metrics-interp mumax \
+//     Interpolate Rust data to MuMax time points before computing metrics (for a fair comparison).
 //
 // This produces:
 //   out/st_problems/sp4/sp4_overlay.png

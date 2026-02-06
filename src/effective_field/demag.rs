@@ -36,8 +36,14 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use rayon::prelude::*;
 
 static DEMAG_CACHE: OnceLock<Mutex<Option<Demag2D>>> = OnceLock::new();
+fn demag_timing_enabled() -> bool {
+    std::env::var("LLG_DEMAG_TIMING").is_ok()
+}
 
 /// Backwards-compatible: open boundaries in x/y (no PBC).
 pub fn add_demag_field(grid: &Grid2D, m: &VectorField2D, b_eff: &mut VectorField2D, mat: &Material) {
@@ -326,6 +332,7 @@ struct Demag2D {
 
     px: usize,
     py: usize,
+    #[allow(dead_code)]
     n_pad: usize,
 
     // K-space kernel (Tesla per (A/m))
@@ -362,6 +369,9 @@ impl Demag2D {
         let py = if pbc_y > 0 { ny } else { 2 * ny };
         let n_pad = px * py;
 
+        let do_timing = demag_timing_enabled();
+        let t_total = Instant::now();
+
         let mut planner = FftPlanner::<f64>::new();
         let fft_x_fwd = planner.plan_fft_forward(px);
         let fft_x_inv = planner.plan_fft_inverse(px);
@@ -376,6 +386,7 @@ impl Demag2D {
         let mut kzz = vec![zero; n_pad];
 
         let cache_path = demag_cache_path(grid, pbc_x, pbc_y, px, py, DEMAG_ACCURACY);
+        let t_load = Instant::now();
         let loaded = try_load_kernel_kspace(
             &cache_path,
             grid,
@@ -391,6 +402,20 @@ impl Demag2D {
         )
         .unwrap_or(false);
 
+    if do_timing {
+        println!(
+            "[demag timing] cache load: loaded={} in {:.3}s (nx={}, ny={}, px={}, py={}, pbc_x={}, pbc_y={})",
+            loaded,
+            t_load.elapsed().as_secs_f64(),
+            grid.nx,
+            grid.ny,
+            px,
+            py,
+            pbc_x,
+            pbc_y
+        );
+    }
+
         let mut col_buf = vec![zero; py];
 
         if !loaded {
@@ -398,6 +423,7 @@ impl Demag2D {
                 "[demag] cache miss -> building kernel (pbc_x={}, pbc_y={}) ...",
                 pbc_x, pbc_y
             );
+            let t_build = Instant::now();
 
             if pbc_x == 0 && pbc_y == 0 {
                 // Open boundaries: keep your parity-enforced builder.
@@ -406,12 +432,25 @@ impl Demag2D {
                 // PBC: sum over image ranges and accumulate into wrapped bins (MuMax-style).
                 build_kernel_realspace_pbc(&grid, px, py, pbc_x, pbc_y, &mut kxx, &mut kxy, &mut kyy, &mut kzz, DEMAG_ACCURACY);
             }
-
+            if do_timing {
+                println!(
+                    "[demag timing] build real-space kernel took {:.3}s",
+                    t_build.elapsed().as_secs_f64()
+                );
+            }
+            let t_fft = Instant::now();
             // FFT to k-space
             fft2_forward_in_place(&mut kxx, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
             fft2_forward_in_place(&mut kxy, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
             fft2_forward_in_place(&mut kyy, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
             fft2_forward_in_place(&mut kzz, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
+
+            if do_timing {
+                println!(
+                    "[demag timing] FFT kernel -> k-space took {:.3}s",
+                    t_fft.elapsed().as_secs_f64()
+                );
+            }
 
             let header = KernelCacheHeader::new(grid, pbc_x, pbc_y, px, py, DEMAG_ACCURACY);
             if let Err(e) = write_kernel_kspace(&cache_path, header, &kxx, &kxy, &kyy, &kzz) {
@@ -422,7 +461,13 @@ impl Demag2D {
         } else {
             println!("[demag] cache hit -> loaded kernel from {:?}", cache_path);
         }
-
+        if do_timing {
+            println!(
+                "[demag timing] Demag2D::new total {:.3}s (loaded={})",
+                t_total.elapsed().as_secs_f64(),
+                loaded
+            );
+        }
         Self {
             grid,
             pbc_x,
@@ -454,7 +499,7 @@ impl Demag2D {
 
     fn add_field(&mut self, m: &VectorField2D, b_eff: &mut VectorField2D, ms: f64) {
         debug_assert!(same_grid(&m.grid, &self.grid));
-
+    
         let zero = Complex::new(0.0, 0.0);
         self.mx.fill(zero);
         self.my.fill(zero);
@@ -465,49 +510,128 @@ impl Demag2D {
         let ny = self.grid.ny;
         let px = self.px;
 
-        for j in 0..ny {
-            for i in 0..nx {
-                let src = j * nx + i;
-                let dst = j * px + i;
-                let v = m.data[src];
-                self.mx[dst].re = ms * v[0];
-                self.my[dst].re = ms * v[1];
-                self.mz[dst].re = ms * v[2];
-            }
+        // Only touch the first `ny` rows of the padded buffers.
+        // This avoids any take()/zip length mismatch issues.
+        let n_rows = ny * px;
+
+        {
+            let mx_buf = &mut self.mx[..n_rows];
+            let my_buf = &mut self.my[..n_rows];
+            let mz_buf = &mut self.mz[..n_rows];
+
+            mx_buf
+                .par_chunks_mut(px)
+                .zip_eq(my_buf.par_chunks_mut(px))
+                .zip_eq(mz_buf.par_chunks_mut(px))
+                .enumerate()
+                .for_each(|(j, ((mx_row, my_row), mz_row))| {
+                    let src_row = &m.data[j * nx..(j + 1) * nx];
+                    for i in 0..nx {
+                        let v = src_row[i];
+                        mx_row[i].re = ms * v[0];
+                        my_row[i].re = ms * v[1];
+                        mz_row[i].re = ms * v[2];
+                    }
+                });
         }
 
         // FFT M
-        fft2_forward_in_place(&mut self.mx, self.px, self.py, &self.fft_x_fwd, &self.fft_y_fwd, &mut self.col_buf);
-        fft2_forward_in_place(&mut self.my, self.px, self.py, &self.fft_x_fwd, &self.fft_y_fwd, &mut self.col_buf);
-        fft2_forward_in_place(&mut self.mz, self.px, self.py, &self.fft_x_fwd, &self.fft_y_fwd, &mut self.col_buf);
+        fft2_forward_in_place(
+            &mut self.mx,
+            self.px,
+            self.py,
+            &self.fft_x_fwd,
+            &self.fft_y_fwd,
+            &mut self.col_buf,
+        );
+        fft2_forward_in_place(
+            &mut self.my,
+            self.px,
+            self.py,
+            &self.fft_x_fwd,
+            &self.fft_y_fwd,
+            &mut self.col_buf,
+        );
+        fft2_forward_in_place(
+            &mut self.mz,
+            self.px,
+            self.py,
+            &self.fft_x_fwd,
+            &self.fft_y_fwd,
+            &mut self.col_buf,
+        );
 
-        // MuMax 2D demag: XY coupled via XX, YY, XY; Z only via ZZ.
-        for idx in 0..self.n_pad {
-            let mx = self.mx[idx];
-            let my = self.my[idx];
-            let mz = self.mz[idx];
+        // k-space multiply (parallel per idx; deterministic)
+        let kxx = &self.kxx;
+        let kxy = &self.kxy;
+        let kyy = &self.kyy;
+        let kzz = &self.kzz;
 
-            self.bx[idx] = self.kxx[idx] * mx + self.kxy[idx] * my;
-            self.by[idx] = self.kxy[idx] * mx + self.kyy[idx] * my;
-            self.bz[idx] = self.kzz[idx] * mz;
-        }
+        let mxk = &self.mx;
+        let myk = &self.my;
+        let mzk = &self.mz;
+
+        self.bx
+            .par_iter_mut()
+            .zip_eq(self.by.par_iter_mut())
+            .zip_eq(self.bz.par_iter_mut())
+            .enumerate()
+            .for_each(|(idx, ((bx_i, by_i), bz_i))| {
+                let mx = mxk[idx];
+                let my = myk[idx];
+                let mz = mzk[idx];
+
+                *bx_i = kxx[idx] * mx + kxy[idx] * my;
+                *by_i = kxy[idx] * mx + kyy[idx] * my;
+                *bz_i = kzz[idx] * mz;
+            });
 
         // iFFT back
-        fft2_inverse_in_place(&mut self.bx, self.px, self.py, &self.fft_x_inv, &self.fft_y_inv, &mut self.col_buf);
-        fft2_inverse_in_place(&mut self.by, self.px, self.py, &self.fft_x_inv, &self.fft_y_inv, &mut self.col_buf);
-        fft2_inverse_in_place(&mut self.bz, self.px, self.py, &self.fft_x_inv, &self.fft_y_inv, &mut self.col_buf);
+        fft2_inverse_in_place(
+            &mut self.bx,
+            self.px,
+            self.py,
+            &self.fft_x_inv,
+            &self.fft_y_inv,
+            &mut self.col_buf,
+        );
+        fft2_inverse_in_place(
+            &mut self.by,
+            self.px,
+            self.py,
+            &self.fft_x_inv,
+            &self.fft_y_inv,
+            &mut self.col_buf,
+        );
+        fft2_inverse_in_place(
+            &mut self.bz,
+            self.px,
+            self.py,
+            &self.fft_x_inv,
+            &self.fft_y_inv,
+            &mut self.col_buf,
+        );
 
-        // Add physical region back into b_eff
-        for j in 0..ny {
-            for i in 0..nx {
-                let dst_field = j * nx + i;
-                let src_pad = j * px + i;
-                b_eff.data[dst_field][0] += self.bx[src_pad].re;
-                b_eff.data[dst_field][1] += self.by[src_pad].re;
-                b_eff.data[dst_field][2] += self.bz[src_pad].re;
-            }
-        }
+        // Add physical region back into b_eff (parallel over rows)
+        let bx = &self.bx;
+        let by = &self.by;
+        let bz = &self.bz;
+
+        b_eff
+            .data
+            .par_chunks_mut(nx)
+            .enumerate()
+            .for_each(|(j, row)| {
+                let src_base = j * px;
+                for i in 0..nx {
+                    let src = src_base + i;
+                    row[i][0] += bx[src].re;
+                    row[i][1] += by[src].re;
+                    row[i][2] += bz[src].re;
+                }
+            });
     }
+
 }
 
 /// 2D forward FFT (in-place), applying 1D FFTs over rows then columns.
