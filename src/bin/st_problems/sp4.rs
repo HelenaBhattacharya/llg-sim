@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use llg_sim::effective_field::{build_h_eff_masked, FieldMask};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
-use llg_sim::relax::{relax, RelaxSettings};
+use llg_sim::relax::{relax, RelaxSettings, TorqueMetric};
 use llg_sim::llg::RK23Scratch;
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vec3::{cross, normalize};
@@ -177,6 +177,11 @@ let mut relax_settings = RelaxSettings {
     headroom: 0.8,
     dt_min: relax_dt_min,
     dt_max: relax_dt_max,
+
+    // NEW: keep SP4 behaviour exactly the same as before
+    phase1_enabled: true,
+    phase2_enabled: true,
+
     energy_stride: 3,
     rel_energy_tol: 1e-12,
     torque_threshold: Some(relax_torque_tol),
@@ -184,6 +189,10 @@ let mut relax_settings = RelaxSettings {
     tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
     tighten_floor: 1e-9,
     max_accepted_steps: 2_000_000,
+    torque_metric: TorqueMetric::Max,
+    torque_plateau_checks: 0,
+    torque_plateau_rel: 1e-3,
+    torque_plateau_min_checks: 5,
 };
 
 // Log torque before relax (same as before)

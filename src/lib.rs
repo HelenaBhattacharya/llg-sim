@@ -10,4 +10,5 @@ pub mod vector_field;
 pub mod visualisation;
 pub mod config;
 pub mod relax;
+pub mod minimize;
 
