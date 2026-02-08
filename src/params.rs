@@ -75,11 +75,11 @@ pub struct LLGParams {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Material {
-    pub ms: f64,           // A/m
-    pub a_ex: f64,         // J/m
-    pub k_u: f64,          // J/m^3
+    pub ms: f64,   // A/m
+    pub a_ex: f64, // J/m
+    pub k_u: f64,  // J/m^3
     pub easy_axis: Vec3,
-    pub dmi: Option<f64>,  // J/m^2 (interfacial DMI), None = OFF
+    pub dmi: Option<f64>, // J/m^2 (interfacial DMI), None = OFF
 
     /// Include magnetostatic (demag) field via FFT convolution.
     /// Default: false to preserve previous benchmarks.

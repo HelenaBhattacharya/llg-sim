@@ -18,7 +18,7 @@
 
 use llg_sim::effective_field::demag::compute_demag_field;
 use llg_sim::grid::Grid2D;
-use llg_sim::params::{Material, MU0};
+use llg_sim::params::{MU0, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn main() {
@@ -54,8 +54,14 @@ fn main() {
     let nyy = infer_nii(&grid, &mat, 1);
     let nzz = infer_nii(&grid, &mat, 2);
 
-    println!("Grid: {}x{}, dx={:.3e}, dy={:.3e}, dz={:.3e}", nx, ny, dx, dy, dz);
-    println!("Implied demag factors: Nxx={:.6}, Nyy={:.6}, Nzz={:.6}", nxx, nyy, nzz);
+    println!(
+        "Grid: {}x{}, dx={:.3e}, dy={:.3e}, dz={:.3e}",
+        nx, ny, dx, dy, dz
+    );
+    println!(
+        "Implied demag factors: Nxx={:.6}, Nyy={:.6}, Nzz={:.6}",
+        nxx, nyy, nzz
+    );
     println!("Trace check: Nxx+Nyy+Nzz = {:.6}", nxx + nyy + nzz);
 }
 

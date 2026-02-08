@@ -22,15 +22,15 @@
 //   out/bloch_dmi/Dminus/
 // -----------------------------------------------------------------------------
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use llg_sim::effective_field::FieldMask;
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{step_llg_rk4_recompute_field_masked_relax, RK4Scratch};
+use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
-use llg_sim::effective_field::FieldMask;
 
 fn write_midrow_slice(m: &VectorField2D, grid: &Grid2D, path: &Path) -> std::io::Result<()> {
     let j = grid.ny / 2;
@@ -48,7 +48,7 @@ fn write_midrow_slice(m: &VectorField2D, grid: &Grid2D, path: &Path) -> std::io:
 
 fn out_dir_for_sign(sign: &str) -> PathBuf {
     match sign {
-        "plus"  => Path::new("out").join("bloch_dmi").join("Dplus"),
+        "plus" => Path::new("out").join("bloch_dmi").join("Dplus"),
         "minus" => Path::new("out").join("bloch_dmi").join("Dminus"),
         _ => panic!("Expected 'plus' or 'minus'"),
     }
@@ -57,14 +57,16 @@ fn out_dir_for_sign(sign: &str) -> PathBuf {
 fn dmi_value_for_sign(sign: &str) -> f64 {
     let d0 = 1e-4;
     match sign {
-        "plus"  =>  d0,
+        "plus" => d0,
         "minus" => -d0,
         _ => panic!("Expected 'plus' or 'minus'"),
     }
 }
 
 fn main() -> std::io::Result<()> {
-    let sign = std::env::args().nth(1).expect("Usage: bloch_dmi <plus|minus>");
+    let sign = std::env::args()
+        .nth(1)
+        .expect("Usage: bloch_dmi <plus|minus>");
 
     // Geometry
     let nx = 256;

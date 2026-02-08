@@ -66,16 +66,18 @@
 //     ├── rust_table_uniform_film.csv
 //     └── dt_history.csv
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use llg_sim::config::{FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo};
+use llg_sim::config::{
+    FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo,
+};
 use llg_sim::effective_field::demag::compute_demag_field;
-use llg_sim::effective_field::{build_h_eff_masked, FieldMask};
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
+use llg_sim::llg::{RK45Scratch, step_llg_rk45_recompute_field_adaptive};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
@@ -128,13 +130,20 @@ fn write_row(
     let [bdx, bdy, bdz] = avg_vec(b_demag);
 
     // Base effective field without demag (Zeeman + exchange + anisotropy)
-    build_h_eff_masked(grid, m, b_eff_base, &LLGParams {
-        // Only b_ext is used by zeeman in field builder; other params not used here.
-        gamma: 0.0,
-        alpha: 0.0,
-        dt: 0.0,
-        b_ext,
-    }, material, FieldMask::ExchAnis);
+    build_h_eff_masked(
+        grid,
+        m,
+        b_eff_base,
+        &LLGParams {
+            // Only b_ext is used by zeeman in field builder; other params not used here.
+            gamma: 0.0,
+            alpha: 0.0,
+            dt: 0.0,
+            b_ext,
+        },
+        material,
+        FieldMask::ExchAnis,
+    );
 
     let [bbx, bby, bbz] = avg_vec(b_eff_base);
     let bex = bbx + bdx;
@@ -145,15 +154,23 @@ fn write_row(
         w,
         "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
         t,
-        mx, my, mz,
+        mx,
+        my,
+        mz,
         e.total(),
         e.exchange,
         e.anisotropy,
         e.zeeman,
         e.demag,
-        b_ext[0], b_ext[1], b_ext[2],
-        bdx, bdy, bdz,
-        bex, bey, bez
+        b_ext[0],
+        b_ext[1],
+        b_ext[2],
+        bdx,
+        bdy,
+        bdz,
+        bex,
+        bey,
+        bez
     )?;
     Ok(())
 }
@@ -227,9 +244,25 @@ fn main() -> std::io::Result<()> {
 
     // config.json
     let run_config = RunConfig {
-        geometry: GeometryConfig { nx, ny, nz: 1, dx, dy, dz },
-        material: MaterialConfig { ms, aex: a_ex, ku1: k_u, easy_axis },
-        fields: FieldConfig { b_ext, demag: material.demag, dmi: material.dmi },
+        geometry: GeometryConfig {
+            nx,
+            ny,
+            nz: 1,
+            dx,
+            dy,
+            dz,
+        },
+        material: MaterialConfig {
+            ms,
+            aex: a_ex,
+            ku1: k_u,
+            easy_axis,
+        },
+        fields: FieldConfig {
+            b_ext,
+            demag: material.demag,
+            dmi: material.dmi,
+        },
         numerics: NumericsConfig {
             integrator: "rk45".to_string(),
             dt: dt0,
@@ -242,7 +275,12 @@ fn main() -> std::io::Result<()> {
         },
         run: RunInfo {
             binary: "uniform_film_field_rk45".to_string(),
-            run_id: if enable_demag { "uniform_film_rk45_demag_on" } else { "uniform_film_rk45_demag_off" }.to_string(),
+            run_id: if enable_demag {
+                "uniform_film_rk45_demag_on"
+            } else {
+                "uniform_film_rk45_demag_off"
+            }
+            .to_string(),
             git_commit: None,
             timestamp_utc: None,
         },
@@ -267,7 +305,16 @@ fn main() -> std::io::Result<()> {
     let mut b_eff_base = VectorField2D::new(grid);
 
     // Write t=0
-    write_row(&mut w, 0.0, &grid, &m, &material, b_ext, &mut b_demag, &mut b_eff_base)?;
+    write_row(
+        &mut w,
+        0.0,
+        &grid,
+        &m,
+        &material,
+        b_ext,
+        &mut b_demag,
+        &mut b_eff_base,
+    )?;
 
     // Integrate to each output time
     let tol_time = 1e-18_f64;
@@ -300,7 +347,11 @@ fn main() -> std::io::Result<()> {
             writeln!(
                 wdt,
                 "{},{:.16e},{:.16e},{:.16e},{}",
-                attempt, t, dt_used, eps, if accepted { 1 } else { 0 }
+                attempt,
+                t,
+                dt_used,
+                eps,
+                if accepted { 1 } else { 0 }
             )?;
 
             if !accepted {
@@ -310,7 +361,16 @@ fn main() -> std::io::Result<()> {
         }
 
         t = t_target;
-        write_row(&mut w, t, &grid, &m, &material, b_ext, &mut b_demag, &mut b_eff_base)?;
+        write_row(
+            &mut w,
+            t,
+            &grid,
+            &m,
+            &material,
+            b_ext,
+            &mut b_demag,
+            &mut b_eff_base,
+        )?;
     }
 
     println!("Wrote outputs to {:?}", out_dir);
@@ -318,6 +378,9 @@ fn main() -> std::io::Result<()> {
     println!("t_total={}, dt_out={}, n_out={}", t_total, dt_out, n_out);
     // Final state summary (spatial average)
     let [mx_f, my_f, mz_f] = avg_vec(&m);
-    println!("FINAL <m> at t = {:.3e} s: mx={:.6e}, my={:.6e}, mz={:.6e}", t_total, mx_f, my_f, mz_f);
+    println!(
+        "FINAL <m> at t = {:.3e} s: mx={:.6e}, my={:.6e}, mz={:.6e}",
+        t_total, mx_f, my_f, mz_f
+    );
     Ok(())
 }

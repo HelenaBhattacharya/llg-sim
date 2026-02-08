@@ -14,13 +14,13 @@
 // Compare against:
 //   mumax_outputs/demagSmall/table.txt
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use llg_sim::effective_field::demag::compute_demag_field;
 use llg_sim::grid::Grid2D;
-use llg_sim::params::{Material, MU0};
+use llg_sim::params::{MU0, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn avg_vec(field: &VectorField2D) -> [f64; 3] {
@@ -84,14 +84,7 @@ fn main() -> std::io::Result<()> {
         writeln!(
             w,
             "{},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
-            label,
-            0.0,
-            mx,
-            my,
-            mz,
-            bdx,
-            bdy,
-            bdz
+            label, 0.0, mx, my, mz, bdx, bdy, bdz
         )?;
     }
 

@@ -194,7 +194,10 @@ mod tests {
 
         // Check centre has my bump and mx ~ 0
         let v_mid = m.data[m.idx(nx / 2, 0)];
-        assert!(v_mid[1].abs() > 0.1, "expected sizable my bump at wall center");
+        assert!(
+            v_mid[1].abs() > 0.1,
+            "expected sizable my bump at wall center"
+        );
         assert!(v_mid[0].abs() < 1e-6, "expected mx ~ 0 for Bloch(y) wall");
 
         // Norm check

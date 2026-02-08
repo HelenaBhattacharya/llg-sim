@@ -40,7 +40,11 @@ fn ghost_x(m: [f64; 3], n_x: f64, eta: f64, dx: f64) -> [f64; 3] {
     let dmx_dx = -eta * mz;
     let dmy_dx = 0.0;
     let dmz_dx = eta * mx;
-    [mx + n_x * dx * dmx_dx, my + n_x * dx * dmy_dx, mz + n_x * dx * dmz_dx]
+    [
+        mx + n_x * dx * dmx_dx,
+        my + n_x * dx * dmy_dx,
+        mz + n_x * dx * dmz_dx,
+    ]
 }
 
 #[inline]
@@ -51,7 +55,11 @@ fn ghost_y(m: [f64; 3], n_y: f64, eta: f64, dy: f64) -> [f64; 3] {
     let dmx_dy = 0.0;
     let dmy_dy = -eta * mz;
     let dmz_dy = eta * my;
-    [mx + n_y * dy * dmx_dy, my + n_y * dy * dmy_dy, mz + n_y * dy * dmz_dy]
+    [
+        mx + n_y * dy * dmx_dy,
+        my + n_y * dy * dmy_dy,
+        mz + n_y * dy * dmz_dy,
+    ]
 }
 
 pub fn compute_energy(
@@ -150,10 +158,26 @@ pub fn compute_energy(
                         (m.data[grid.idx(i, j - 1)], m.data[grid.idx(i, j + 1)])
                     };
 
-                    let dmz_dx = if nx > 1 { (m_ip[2] - m_im[2]) / (2.0 * dx) } else { 0.0 };
-                    let dmz_dy = if ny > 1 { (m_jp[2] - m_jm[2]) / (2.0 * dy) } else { 0.0 };
-                    let dmx_dx = if nx > 1 { (m_ip[0] - m_im[0]) / (2.0 * dx) } else { 0.0 };
-                    let dmy_dy = if ny > 1 { (m_jp[1] - m_jm[1]) / (2.0 * dy) } else { 0.0 };
+                    let dmz_dx = if nx > 1 {
+                        (m_ip[2] - m_im[2]) / (2.0 * dx)
+                    } else {
+                        0.0
+                    };
+                    let dmz_dy = if ny > 1 {
+                        (m_jp[2] - m_jm[2]) / (2.0 * dy)
+                    } else {
+                        0.0
+                    };
+                    let dmx_dx = if nx > 1 {
+                        (m_ip[0] - m_im[0]) / (2.0 * dx)
+                    } else {
+                        0.0
+                    };
+                    let dmy_dy = if ny > 1 {
+                        (m_jp[1] - m_jm[1]) / (2.0 * dy)
+                    } else {
+                        0.0
+                    };
 
                     let bdm_x = pref * dmz_dx;
                     let bdm_y = pref * dmz_dy;
@@ -182,6 +206,11 @@ pub fn compute_energy(
     }
 }
 
-pub fn compute_total_energy(grid: &Grid2D, m: &VectorField2D, material: &Material, b_ext: [f64; 3]) -> f64 {
+pub fn compute_total_energy(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    material: &Material,
+    b_ext: [f64; 3],
+) -> f64 {
     compute_energy(grid, m, material, b_ext).total()
 }

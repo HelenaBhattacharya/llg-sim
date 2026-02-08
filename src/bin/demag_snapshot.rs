@@ -28,13 +28,13 @@
 //     --col B_demagz --clip_overlap --metrics \
 //     --out out/demag_snapshot/overlay_z_B_demagz.png
 
-use llg_sim::effective_field::{build_h_eff_masked, FieldMask};
 use llg_sim::effective_field::demag::compute_demag_field;
+use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
 use llg_sim::grid::Grid2D;
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
-use std::fs::create_dir_all;
 use std::fs::File;
+use std::fs::create_dir_all;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -67,16 +67,7 @@ fn write_snapshot_csv(
     writeln!(
         f,
         "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
-        0.0,
-        mx,
-        my,
-        mz,
-        b_demag[0],
-        b_demag[1],
-        b_demag[2],
-        b_eff[0],
-        b_eff[1],
-        b_eff[2]
+        0.0, mx, my, mz, b_demag[0], b_demag[1], b_demag[2], b_eff[0], b_eff[1], b_eff[2]
     )?;
     Ok(())
 }

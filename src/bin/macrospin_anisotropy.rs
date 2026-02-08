@@ -38,12 +38,7 @@ use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
 use llg_sim::config::{
-    RunConfig,
-    GeometryConfig,
-    MaterialConfig,
-    FieldConfig,
-    NumericsConfig,
-    RunInfo,
+    FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo,
 };
 
 fn main() -> std::io::Result<()> {
@@ -53,13 +48,13 @@ fn main() -> std::io::Result<()> {
     let dz = 5e-9;
 
     let alpha = 0.02_f64;
-    let dt = 1e-12_f64;        // seconds
-    let t_total = 100e-9_f64;  // 100 ns
-    let theta_deg = 20.0_f64;  // initial tilt angle (from +z in x–z plane)
+    let dt = 1e-12_f64; // seconds
+    let t_total = 100e-9_f64; // 100 ns
+    let theta_deg = 20.0_f64; // initial tilt angle (from +z in x–z plane)
 
-    let ms = 8.0e5_f64;        // A/m
-    let a_ex = 0.0_f64;        // J/m (OFF)
-    let k_u = 500.0_f64;       // J/m^3 (ON)
+    let ms = 8.0e5_f64; // A/m
+    let a_ex = 0.0_f64; // J/m (OFF)
+    let k_u = 500.0_f64; // J/m^3 (ON)
     let easy_axis = [0.0, 0.0, 1.0];
 
     // External field OFF for this test (anisotropy-only dynamics)

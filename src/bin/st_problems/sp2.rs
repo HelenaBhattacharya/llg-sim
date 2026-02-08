@@ -36,7 +36,7 @@
 // effective field build per equilibrium in SP2.
 
 use std::collections::HashSet;
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -44,14 +44,15 @@ use std::time::Instant;
 use llg_sim::effective_field::FieldMask;
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::RK23Scratch;
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material, MU0};
-use llg_sim::relax::{relax, RelaxSettings, TorqueMetric};
+use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, MU0, Material};
+use llg_sim::relax::{RelaxSettings, TorqueMetric, RelaxReport, RelaxStopReason, relax_with_report};
+
 use llg_sim::vec3::normalize;
 use llg_sim::vector_field::VectorField2D;
 
 // New: SP2-only minimiser (one field build per iter)
-// Requires: src/minimize.rs + `pub mod minimize;` in lib.rs
-use llg_sim::minimize::{minimize_damping_only, MinimizeReport, MinimizeSettings};
+// Requires: src/minimize.rs + pub mod minimize; in lib.rs
+use llg_sim::minimize::{MinimizeReport, MinimizeSettings, minimize_damping_only};
 
 // -------------------------
 // Debug-fast knobs
@@ -59,42 +60,19 @@ use llg_sim::minimize::{minimize_damping_only, MinimizeReport, MinimizeSettings}
 
 // Start with a small subset so you can see it completing.
 // Set to (1, 30) when runtime is under control.
-const D_MIN: usize = 18;
-const D_MAX: usize = 20;
+const D_MIN: usize = 1;
+const D_MAX: usize = 30;
 
 // SP2 coercivity bracketing/bisection:
 // - MuMax step is 0.00005*Ms. We'll use a coarse bracket step (e.g. 20×) then bisect.
 const BC_BRACKET_MULT: f64 = 20.0; // coarse step multiplier for bracketing
-const BC_TARGET_MULT: f64 = 1.0;   // target resolution multiplier (1.0 => MuMax resolution)
+const BC_TARGET_MULT: f64 = 1.0; // target resolution multiplier (1.0 => MuMax resolution)
 
 // Relax effort caps per call (prevents "hangs" from very strict tightening on CPU)
 const MAX_ACCEPTED_STEPS_REMANENCE: usize = 80_000;
 const MAX_ACCEPTED_STEPS_COERCIVITY: usize = 30_000;
 
-// Bisection needs only a reliable sign of <m_sum>, not a fully polished state.
-// Use a smaller relax cap for bisect points to save runtime.
-const MAX_ACCEPTED_STEPS_BISECT_STRICT: usize = 10_000;
-
-// If Minimize() already converged very tightly (MuMax-style max dM), we can often skip Relax()
-// at bisection points without changing the sign of <m_sum>.
-const DM_SKIP_RELAX: f64 = 5e-7;
-
-// Additional safety gates for skipping Relax() at bisection points.
-// - DM criterion alone can be misleading if the minimizer step size collapses.
-// - Only skip Relax if torque is also small, and we are not right on the decision boundary.
-const TORQUE_SKIP_RELAX: f64 = 2e-3;      // Tesla (tunable)
-const MSUM_SKIP_RELAX_MIN: f64 = 2e-2;    // dimensionless (tunable)
-
-// During the coarse bracket scan, occasionally re-anchor the branch with a strict equilibration
-// when we are close to switching. This reduces metastability drift that can bias Hc.
-const MSUM_NEAR_SWITCH: f64 = 5e-2;       // dimensionless (tunable)
-
-// NOTE: we no longer use a relax fallback in the coarse bracket scan. Keep this constant for
-// experimentation (e.g. if you re-enable a fallback later) but silence unused warnings.
-#[allow(dead_code)]
-const MAX_ACCEPTED_STEPS_COARSE_FALLBACK: usize = 2000;
-
-const MIN_ITERS_COARSE: usize = 400;   // start here; tune 200–1000
+// (removed unused constants for slimness)
 
 // Baseline relax settings (close-ish to MuMax but workable on CPU)
 const RELAX_TIGHTEN_FLOOR: f64 = 1e-6;
@@ -109,9 +87,7 @@ const MIN_ITERS_COERCIVITY: usize = 20_000;
 const MIN_TAU_COARSE: f64 = 6e-4;
 const MIN_TAU_STRICT: f64 = 4e-4;
 
-// Print progress:
-const BRACKET_PRINT_EVERY: usize = 1;
-const BISECT_PRINT_EVERY: usize = 1;
+// (removed unused progress print constants)
 
 // Remanence cache location
 const REM_CACHE_DIR: &str = "runs/st_problems/sp2/cache";
@@ -323,12 +299,6 @@ fn read_rem_cache(path: &Path, d_lex: usize, g: &Grid2D) -> std::io::Result<Opti
 // Equilibration (two-tier)
 // -------------------------
 
-#[derive(Debug, Clone, Copy)]
-enum EqTier {
-    Coarse, // minimize only (fast)
-    Strict, // minimize precondition + relax (robust)
-}
-
 fn set_bext_from_bc(params: &mut LLGParams, bc_amps_per_m: f64) {
     // Apply B_ext (Tesla) along (-1,-1,-1)/sqrt(3), matching MuMax
     let b = -bc_amps_per_m * MU0 / 3.0_f64.sqrt();
@@ -370,9 +340,9 @@ fn minimize_call(
         || label.starts_with("bisect/")
         || label.starts_with("remanence/");
     if strictish {
-        s.lambda_min = 5e-5;      // allow a bit more motion per iter (tunable)
-        s.dm_stop = Some(5e-7);   // stricter than default 1e-6 (tunable)
-        s.dm_samples = 10;        // keep MuMax-like smoothing
+        s.lambda_min = 5e-5; // allow a bit more motion per iter (tunable)
+        s.dm_stop = Some(5e-7); // stricter than default 1e-6 (tunable)
+        s.dm_samples = 10; // keep MuMax-like smoothing
     }
 
     let do_timing = sp2_timing_enabled();
@@ -405,62 +375,6 @@ fn minimize_call(
     rep
 }
 
-// Dedicated coarse minimiser wrapper: disables dM early stop and forces fixed work
-fn minimize_call_coarse_fixed(
-    grid: &Grid2D,
-    m: &mut VectorField2D,
-    params: &LLGParams,
-    material: &Material,
-    max_iters: usize,
-    label: &str,
-) -> MinimizeReport {
-    let fast = sp2_fast_enabled();
-
-    // Force fixed-iteration behaviour for coarse bracketing:
-    // - disable dM early stop (dm_stop=None)
-    // - disable torque-threshold early stop (set to 0.0 which can never be reached)
-    // - disable stall detection (iters too small to matter, but keep it safe)
-    let mut s = MinimizeSettings {
-        torque_threshold: 0.0,
-        max_iters,
-        ..Default::default()
-    };
-    s.dm_stop = None;
-    s.stall_iters = usize::MAX;
-    s.min_iters_before_stall = usize::MAX;
-
-    // Keep the coarse minimizer moving near the switch (reduces "sticky" positive m_sum)
-    s.lambda_min = 5e-5;
-    s.shrink = 0.9;
-    s.grow = 1.02;
-
-    if fast {
-        // In fast mode, reduce work further.
-        s.max_iters = (max_iters / 4).max(50);
-    }
-
-    let do_timing = sp2_timing_enabled();
-    let t0 = Instant::now();
-
-    let rep = minimize_damping_only(grid, m, params, material, FieldMask::Full, &s);
-
-    if do_timing {
-        println!(
-            "      [sp2 timing] minimize({}) iters={} conv={} dm_conv={} max_dm={:.3e} stalled={} tmax={:.3e} took {:.3}s",
-            label,
-            rep.iters,
-            if rep.converged { 1 } else { 0 },
-            if rep.dm_converged { 1 } else { 0 },
-            rep.final_max_dm,
-            if rep.stalled { 1 } else { 0 },
-            rep.final_torque,
-            t0.elapsed().as_secs_f64()
-        );
-    }
-
-    rep
-}
-
 fn relax_call(
     grid: &Grid2D,
     m: &mut VectorField2D,
@@ -469,7 +383,7 @@ fn relax_call(
     rk23: &mut RK23Scratch,
     max_steps: usize,
     label: &str,
-) {
+) -> RelaxReport {
     let fast = sp2_fast_enabled();
 
     // Fresh relax settings each call (MuMax-like baseline, with optional fast overrides)
@@ -493,14 +407,56 @@ fn relax_call(
         settings.torque_threshold = Some(1e-4);
     } else {
         settings.phase1_enabled = false;
-        settings.torque_metric = TorqueMetric::Mean;
 
-        // MuMax-like: rely on average-torque plateau rather than a hard absolute threshold
-        settings.torque_threshold = None;
+        // Coercivity branch-following uses three modes:
+        // - hc/coarse: cheap plateau settle used during coarse bracketing
+        // - hc/fine:   slightly tighter plateau settle used during fine scan inside the bracket
+        // - hc/strict: escalation only if coarse/fine hit the accepted-step cap
+        if label == "hc/coarse" {
+            settings.torque_metric = TorqueMetric::Mean;
+            settings.torque_threshold = None;
+            settings.torque_plateau_checks = 3;
+            settings.torque_plateau_rel = 5e-3;      // plateau sooner (0.5% improvement required)
+            settings.torque_plateau_min_checks = 3;
 
-        settings.torque_plateau_checks = 8;
-        settings.torque_plateau_rel = 1e-3;
-        settings.torque_plateau_min_checks = 5;
+            settings.max_err = 5e-5;                 // larger steps
+            settings.tighten_floor = 5e-5;           // single stage
+            settings.max_accepted_steps = max_steps; // use caller cap
+            settings.torque_check_stride = 200;
+        } else if label == "hc/fine" {
+            settings.torque_metric = TorqueMetric::Mean;
+            settings.torque_threshold = None;
+            settings.torque_plateau_checks = 4;
+            settings.torque_plateau_rel = 2e-3;      // a bit tighter
+            settings.torque_plateau_min_checks = 3;
+
+            settings.max_err = 2e-5;
+            settings.tighten_floor = 2e-5;
+            settings.max_accepted_steps = max_steps;
+            settings.torque_check_stride = 200;
+        } else if label == "hc/strict" {
+            // Escalation: keep plateau stopping, but smaller error and larger cap.
+            // Avoid hard torque thresholds here, since they often force max-step termination.
+            settings.torque_metric = TorqueMetric::Mean;
+            settings.torque_threshold = None;
+            settings.torque_plateau_checks = 6;
+            settings.torque_plateau_rel = 1e-3;
+            settings.torque_plateau_min_checks = 4;
+
+            settings.max_err = 1e-5;
+            settings.tighten_floor = RELAX_TIGHTEN_FLOOR;
+            settings.max_accepted_steps = max_steps;
+            settings.torque_check_stride = TORQUE_CHECK_STRIDE;
+        } else {
+            settings.torque_metric = TorqueMetric::Mean;
+
+            // Plateau-only by default for other (non-remanence) relax calls.
+            settings.torque_threshold = None;
+
+            settings.torque_plateau_checks = 8;
+            settings.torque_plateau_rel = 1e-3;
+            settings.torque_plateau_min_checks = 5;
+        }
     }
 
     // For bisection relax calls, prefer plateau-only stopping (no hard torque threshold)
@@ -517,13 +473,16 @@ fn relax_call(
         settings.max_err = 2e-5;
     }
 
-    // Reset dt guess each relax call (MuMax-like)
-    params.dt = 1e-13;
+    // Reset dt guess for remanence and other one-off relax calls.
+    // For hc_scan/hc continuation, keep the dt warm-start to avoid tiny-step re-ramping each field step.
+    if !(label.starts_with("hc/") || label.starts_with("hc_scan/")) {
+        params.dt = 1e-13;
+    }
 
     let do_timing = sp2_timing_enabled();
     let t0 = Instant::now();
 
-    relax(
+    let rep = relax_with_report(
         grid,
         m,
         params,
@@ -535,104 +494,56 @@ fn relax_call(
 
     if do_timing {
         println!(
-            "      [sp2 timing] relax({}) max_steps={} fast={} took {:.3}s",
+            "      [sp2 timing] relax({}) max_steps={} stop={:?} took {:.3}s",
             label,
-            max_steps,
-            if fast { 1 } else { 0 },
+            settings.max_accepted_steps,
+            rep.stop_reason,
             t0.elapsed().as_secs_f64()
         );
     }
+    rep
 }
 
-/// Equilibrate in-place under current params.b_ext.
-/// Returns avg m_sum after equilibration.
-/// Robustness policy:
-/// - Coarse: minimize only; if it stalls, fall back to strict relax.
-/// - Strict: minimize precondition; then relax.
-fn equilibrate_and_msum_in_place(
+/// One hysteresis continuation step at a given bc.
+/// Performs a short minimization to stay on the metastable branch, then a bounded plateau relax.
+fn hysteresis_step(
     grid: &Grid2D,
-    m: &mut VectorField2D,
+    m_work: &mut VectorField2D,
     params: &mut LLGParams,
     material: &Material,
     rk23: &mut RK23Scratch,
-    tier: EqTier,
-    label: &str,
+    bc: f64,
+    mode_label: &str,
+    relax_cap: usize,
 ) -> f64 {
-    match tier {
-        EqTier::Coarse => {
-            // Coarse bracket scan: run a fixed iteration budget (no dm_stop early exit)
-            // to better follow the equilibrium branch without calling Relax().
-            let _rep = minimize_call_coarse_fixed(
-                grid,
-                m,
-                params,
-                material,
-                MIN_ITERS_COARSE,
-                label,
-            );
-        }
-        EqTier::Strict => {
-            let rep = minimize_call(
-                grid,
-                m,
-                params,
-                material,
-                MIN_ITERS_COERCIVITY,
-                MIN_TAU_STRICT,
-                label,
-            );
+    set_bext_from_bc(params, bc);
 
-            // For bisection points: skip Relax only if both dM and torque are tight, and we are not
-            // exactly on the decision boundary.
-            let is_bisect = label.starts_with("bisect/");
-            let tight_dm = rep.dm_converged && rep.final_max_dm < DM_SKIP_RELAX;
-            let tight_torque = rep.final_torque < TORQUE_SKIP_RELAX;
+    // Coarse focusing: keep us on the same metastable branch.
+    let pre_iters = if mode_label == "hc/coarse" { 200 } else { 300 };
+    let _ = minimize_call(
+        grid,
+        m_work,
+        params,
+        material,
+        pre_iters,
+        MIN_TAU_COARSE,
+        "hc/premin",
+    );
 
-            // Compute current m_sum cheaply (no extra field builds) to avoid skipping Relax
-            // exactly where the sign decision is delicate.
-            let mm_pre = avg_m(m);
-            let msum_pre = mm_pre[0] + mm_pre[1] + mm_pre[2];
-            let near_boundary = msum_pre.abs() < MSUM_SKIP_RELAX_MIN;
-
-            if is_bisect && tight_dm && tight_torque && !near_boundary {
-                // Skip Relax; minimizer is genuinely converged and we are away from the boundary.
-            } else {
-                let steps = if is_bisect {
-                    MAX_ACCEPTED_STEPS_BISECT_STRICT
-                } else {
-                    MAX_ACCEPTED_STEPS_COERCIVITY
-                };
-                relax_call(grid, m, params, material, rk23, steps, label);
-            }
-        }
+    // Fine focusing: plateau relax. Escalate once if we hit the cap.
+    let rep1 = relax_call(grid, m_work, params, material, rk23, relax_cap, mode_label);
+    if rep1.stop_reason == RelaxStopReason::MaxAcceptedSteps {
+        let _ = relax_call(grid, m_work, params, material, rk23, 8000, "hc/strict");
     }
 
-    let mm = avg_m(m);
+    let mm = avg_m(m_work);
     mm[0] + mm[1] + mm[2]
 }
 
-/// Convenience: set B_ext from bc, equilibrate, return m_sum.
-fn equilibrate_bc_and_msum(
-    grid: &Grid2D,
-    m: &mut VectorField2D,
-    params: &mut LLGParams,
-    material: &Material,
-    rk23: &mut RK23Scratch,
-    bc_amps_per_m: f64,
-    tier: EqTier,
-    label: &str,
-) -> f64 {
-    set_bext_from_bc(params, bc_amps_per_m);
-    equilibrate_and_msum_in_place(grid, m, params, material, rk23, tier, label)
-}
-
-// Coercivity: continuation bracket scan + bisection from last-positive state.
-// New behaviour:
-// - Bracket scan: Coarse tier (minimize-only) for speed
-// - When sign flip found: verify bc_high with Strict tier starting from last-positive state
-// - Before bisection: polish last-positive state with Strict tier for determinism/robustness
-// - Bisection midpoints: Strict tier
-fn find_hc_over_ms(
+// Coercivity (branch-following hybrid):
+// 1) Coarse bracket using larger field steps, but still doing a local settle at each step.
+// 2) Fine scan inside the bracket using MuMax step size until first <m_sum> <= 0.
+fn find_hc_over_ms_branch_following_hybrid(
     grid: &Grid2D,
     m_work: &mut VectorField2D,
     m_rem: &VectorField2D,
@@ -642,289 +553,74 @@ fn find_hc_over_ms(
     ms: f64,
 ) -> f64 {
     let bc0 = 0.0445 * ms; // MuMax starting point
-    let bc_target_step = (0.00005 * BC_TARGET_MULT) * ms;
-    let bc_bracket_step = (0.00005 * BC_BRACKET_MULT) * ms;
+    let bc_step_fine = (0.00005 * BC_TARGET_MULT) * ms;
+    let bc_step_coarse = (0.00005 * BC_BRACKET_MULT) * ms;
 
-    // Start from remanent state once
+    // Start from the remanent state once
     m_work.data.clone_from(&m_rem.data);
 
-    // Evaluate the starting field point with a STRICT seed.
-    // This gives a robust continuation starting state and avoids paying repeated relax costs in the bracket scan.
-    let mut bc_low = bc0;
-    let s0 = equilibrate_bc_and_msum(
-        grid,
-        m_work,
-        params,
-        material,
-        rk23,
-        bc_low,
-        EqTier::Strict,
-        "bc0/strict_seed",
-    );
-
-    // If already switched at bc0, return immediately (matches the MuMax loop condition).
-    if s0 <= 0.0 {
-        return bc_low / ms;
+    // --- Seed at bc0 (must be on the correct branch) ---
+    let mut bc = bc0;
+    let msum0 = hysteresis_step(grid, m_work, params, material, rk23, bc, "hc/fine", 2500);
+    if sp2_timing_enabled() {
+        println!("    [hc_seed] bc/Ms={:.6}  <m_sum>={:.6}", bc / ms, msum0);
+    }
+    if msum0 <= 0.0 {
+        return bc / ms;
     }
 
-    // Save the strict seed state at bc0. This is guaranteed positive under strict equilibrium.
-    let mut m_seed_state = VectorField2D::new(*grid);
-    m_seed_state.data.clone_from(&m_work.data);
-
-    // Save last-positive state (updated during bracketing)
+    // Track last-positive bracket state
+    let mut bc_low = bc;
     let mut m_low_state = VectorField2D::new(*grid);
     m_low_state.data.clone_from(&m_work.data);
 
-    // Bracket upward (continuation)
-    let mut bc_high = bc_low;
-    let mut s_high = s0;
-    let mut k = 0usize;
-
-    while s_high > 0.0 && bc_high <= 0.2 * ms {
-        bc_high += bc_bracket_step;
-        k += 1;
-
-        // continuation: do not reset m_work
-        s_high = equilibrate_bc_and_msum(
-            grid,
-            m_work,
-            params,
-            material,
-            rk23,
-            bc_high,
-            EqTier::Coarse,
-            "bracket/coarse",
-        );
-
-        // If we are close to switching, re-anchor using a strict equilibration at this field.
-        // This keeps the continuation state closer to the true equilibrium branch and reduces
-        // systematic Hc overestimation from metastable drift.
-        if s_high > 0.0 && s_high.abs() < MSUM_NEAR_SWITCH {
-            let mut m_anchor = VectorField2D::new(*grid);
-            m_anchor.data.clone_from(&m_work.data);
-            let s_anchor = equilibrate_bc_and_msum(
-                grid,
-                &mut m_anchor,
-                params,
-                material,
-                rk23,
-                bc_high,
-                EqTier::Strict,
-                "bracket/anchor_strict",
-            );
-            // Continue from the strict-anchored state.
-            m_work.data.clone_from(&m_anchor.data);
-            s_high = s_anchor;
+    // --- Coarse bracket ---
+    loop {
+        bc += bc_step_coarse;
+        if bc >= 0.2 * ms {
+            println!("    WARNING: failed to bracket coercivity before bc cap; returning bc/Ms at cap.");
+            return bc / ms;
         }
 
-        // Additional near-switch probe: if coarse minimize still claims small positive m_sum,
-        // do a short plateau-only relax to avoid "sticky" false-positives.
-        if s_high > 0.0 && s_high < 0.15 {
-            let mut m_probe = VectorField2D::new(*grid);
-            m_probe.data.clone_from(&m_work.data);
-            relax_call(
-                grid,
-                &mut m_probe,
-                params,
-                material,
-                rk23,
-                2000,
-                "bracket/probe_relax",
-            );
-            let mm = avg_m(&m_probe);
-            s_high = mm[0] + mm[1] + mm[2];
-            m_work.data.clone_from(&m_probe.data);
+        let msum = hysteresis_step(grid, m_work, params, material, rk23, bc, "hc/coarse", 1500);
+        if sp2_timing_enabled() {
+            println!("    [hc_bracket] bc/Ms={:.6}  <m_sum>={:.6}", bc / ms, msum);
         }
 
-        if BRACKET_PRINT_EVERY > 0 && k % BRACKET_PRINT_EVERY == 0 {
-            println!(
-                "    [bracket] k={:>3} bc/Ms={:.6}  <m_sum>={:.6}",
-                k,
-                bc_high / ms,
-                s_high
-            );
-        }
-
-        if s_high > 0.0 {
-            // Still positive: update the last-positive state and continue
-            bc_low = bc_high;
+        if msum > 0.0 {
+            bc_low = bc;
             m_low_state.data.clone_from(&m_work.data);
             continue;
         }
 
-        // Coarse found sign flip: verify with STRICT starting from last-positive state.
-        // This prevents a loose minimize from producing a false negative.
-        let mut m_verify = VectorField2D::new(*grid);
-        m_verify.data.clone_from(&m_low_state.data);
+        // First negative found: bc is bc_high.
+        let bc_high = bc;
 
-        let s_high_strict = equilibrate_bc_and_msum(
-            grid,
-            &mut m_verify,
-            params,
-            material,
-            rk23,
-            bc_high,
-            EqTier::Strict,
-            "bracket/verify_strict",
-        );
-
-        if s_high_strict > 0.0 {
-            // Not actually switched under strict -> treat as still positive and continue scanning
-            bc_low = bc_high;
-            m_low_state.data.clone_from(&m_verify.data);
-
-            // Continue from strict state (better seed)
-            m_work.data.clone_from(&m_verify.data);
-            s_high = s_high_strict;
-            continue;
-        }
-
-        // Verified bracket: keep bc_low from last positive and bc_high as first negative.
-        // Proceed to bisection.
-        s_high = s_high_strict;
-        break;
-    }
-
-    if s_high > 0.0 {
-        println!("    WARNING: failed to bracket coercivity before bc cap; returning bc_high/Ms.");
-        return bc_high / ms;
-    }
-
-    // Ensure the low bracket is truly POSITIVE under strict equilibrium.
-    // If coarse bracketing stayed metastable too long, bc_low may be negative under strict relaxation.
-    // In that case, reset the low bracket to the original strict seed at bc0.
-    {
-        let mut m_low_strict = VectorField2D::new(*grid);
-        m_low_strict.data.clone_from(&m_low_state.data);
-
-        let s_low_strict = equilibrate_bc_and_msum(
-            grid,
-            &mut m_low_strict,
-            params,
-            material,
-            rk23,
-            bc_low,
-            EqTier::Strict,
-            "bracket/low_strict",
-        );
-
-        if s_low_strict > 0.0 {
-            // Great: update the last-positive state to the strict-equilibrated one.
-            m_low_state.data.clone_from(&m_low_strict.data);
-        } else {
-            println!(
-                "    [bracket] NOTE: bc_low not positive under strict; repairing low bracket by stepping downward (keep continuation seed)."
-            );
-
-            // Repair strategy: step bc_low downward and re-test under STRICT,
-            // always seeding from the continuation state (m_low_state) rather than bc0.
-            // This avoids biasing Hc upward by re-seeding bisection from a deep-positive state.
-            let step_down = bc_bracket_step / 4.0;
-            let mut repaired = false;
-
-            let mut bc_try = bc_low;
-            for _ in 0..60 {
-                if bc_try <= bc0 + step_down {
-                    break;
-                }
-                bc_try -= step_down;
-
-                let mut m_try = VectorField2D::new(*grid);
-                // Always seed from the continuation state near the switch (NOT from bc0)
-                m_try.data.clone_from(&m_low_state.data);
-
-                let s_try = equilibrate_bc_and_msum(
-                    grid,
-                    &mut m_try,
-                    params,
-                    material,
-                    rk23,
-                    bc_try,
-                    EqTier::Strict,
-                    "bracket/repair_low_strict",
-                );
-
-                if s_try > 0.0 {
-                    bc_low = bc_try;
-                    m_low_state.data.clone_from(&m_try.data);
-                    repaired = true;
-                    break;
-                }
-            }
-
-            if !repaired {
-                println!(
-                    "    [bracket] WARNING: failed to repair low bracket; falling back to bc0 strict seed for bisection (may be biased)."
-                );
-                bc_low = bc0;
-                m_low_state.data.clone_from(&m_seed_state.data);
-            }
-        }
-    }
-
-    // Polish last-positive state with STRICT at bc_low before bisection (robust seed).
-    {
-        let mut m_polish = VectorField2D::new(*grid);
-        m_polish.data.clone_from(&m_low_state.data);
-
-        let s_polish = equilibrate_bc_and_msum(
-            grid,
-            &mut m_polish,
-            params,
-            material,
-            rk23,
-            bc_low,
-            EqTier::Strict,
-            "bisect/seed_polish",
-        );
-
-        // If polishing keeps positive, use polished seed (good).
-        // If polishing flips negative, we still proceed; bisection will handle it,
-        // but keeping the polished state would be inconsistent with "last-positive seed".
-        if s_polish > 0.0 {
-            m_low_state.data.clone_from(&m_polish.data);
-        }
-    }
-
-    // Bisection: start each midpoint from last-positive state (strict-polished)
-    let mut iter = 0usize;
-    while (bc_high - bc_low) > bc_target_step && iter < 60 {
-        iter += 1;
-        let bc_mid = 0.5 * (bc_low + bc_high);
-
-        // Start from last-positive state
+        // --- Fine scan inside bracket ---
         m_work.data.clone_from(&m_low_state.data);
-        let s_mid = equilibrate_bc_and_msum(
-            grid,
-            m_work,
-            params,
-            material,
-            rk23,
-            bc_mid,
-            EqTier::Strict,
-            "bisect/strict",
-        );
+        bc = bc_low;
 
-        if BISECT_PRINT_EVERY > 0 && iter % BISECT_PRINT_EVERY == 0 {
-            println!(
-                "    [bisect {:>2}] low={:.6} high={:.6} mid={:.6}  <m_sum>={:.6}",
-                iter,
-                bc_low / ms,
-                bc_high / ms,
-                bc_mid / ms,
-                s_mid
-            );
-        }
+        loop {
+            bc += bc_step_fine;
+            if bc > bc_high + 1e-12 {
+                // Safety: should not happen, but avoids infinite loops.
+                return bc_high / ms;
+            }
 
-        if s_mid > 0.0 {
-            bc_low = bc_mid;
-            m_low_state.data.clone_from(&m_work.data);
-        } else {
-            bc_high = bc_mid;
+            let msum_f = hysteresis_step(grid, m_work, params, material, rk23, bc, "hc/fine", 2500);
+            if sp2_timing_enabled() {
+                // light print every ~10 fine steps
+                let k = ((bc - bc_low) / bc_step_fine).round() as i32;
+                if k == 1 || k % 10 == 0 {
+                    println!("    [hc_fine] bc/Ms={:.6}  <m_sum>={:.6}", bc / ms, msum_f);
+                }
+            }
+
+            if msum_f <= 0.0 {
+                return bc / ms;
+            }
         }
     }
-
-    bc_high / ms
 }
 
 pub fn run_sp2() -> std::io::Result<()> {
@@ -934,18 +630,31 @@ pub fn run_sp2() -> std::io::Result<()> {
     let k_u: f64 = 0.0;
 
     let lex: f64 = (2.0 * a_ex / (MU0 * ms * ms)).sqrt();
+    let rem_only = std::env::var("SP2_REM_ONLY").is_ok();
 
     println!("SP2: d range = [{}..{}]", D_MIN, D_MAX);
     println!("SP2: relax tighten_floor = {:.1e}", RELAX_TIGHTEN_FLOOR);
     println!("SP2: relax torque_check_stride = {}", TORQUE_CHECK_STRIDE);
-    println!("SP2: relax max steps remanence  = {}", MAX_ACCEPTED_STEPS_REMANENCE);
-    println!("SP2: relax max steps coercivity = {}", MAX_ACCEPTED_STEPS_COERCIVITY);
+    println!(
+        "SP2: relax max steps remanence  = {}",
+        MAX_ACCEPTED_STEPS_REMANENCE
+    );
+    println!(
+        "SP2: relax max steps coercivity = {}",
+        MAX_ACCEPTED_STEPS_COERCIVITY
+    );
     println!("SP2: minimize iters remanence   = {}", MIN_ITERS_REMANENCE);
     println!("SP2: minimize iters coercivity  = {}", MIN_ITERS_COERCIVITY);
-    println!("SP2: minimize tau coarse/strict = {:.1e} / {:.1e}", MIN_TAU_COARSE, MIN_TAU_STRICT);
+    println!(
+        "SP2: minimize tau coarse/strict = {:.1e} / {:.1e}",
+        MIN_TAU_COARSE, MIN_TAU_STRICT
+    );
     println!("SP2: bracket mult = {}", BC_BRACKET_MULT);
     println!("SP2: target step mult = {}", BC_TARGET_MULT);
-    println!("SP2: fast mode = {}", if sp2_fast_enabled() { "ON" } else { "OFF" });
+    println!(
+        "SP2: fast mode = {}",
+        if sp2_fast_enabled() { "ON" } else { "OFF" }
+    );
 
     let out_dir = Path::new("runs").join("st_problems").join("sp2");
     create_dir_all(&out_dir)?;
@@ -962,7 +671,10 @@ pub fn run_sp2() -> std::io::Result<()> {
     }
 
     let file_exists = table_path.exists();
-    let f = OpenOptions::new().create(true).append(true).open(&table_path)?;
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&table_path)?;
     let mut w = BufWriter::new(f);
 
     // Write header if file is new OR empty
@@ -1029,10 +741,17 @@ pub fn run_sp2() -> std::io::Result<()> {
         // -------------------------
         let cache_path = rem_cache_path(d_int, &grid);
         let m = if let Some(m_cached) = read_rem_cache(&cache_path, d_int, &grid)? {
-            println!("SP2 d/lex={:>2}: remanence cache HIT -> {}", d_int, cache_path.display());
+            println!(
+                "SP2 d/lex={:>2}: remanence cache HIT -> {}",
+                d_int,
+                cache_path.display()
+            );
             m_cached
         } else {
-            println!("SP2 d/lex={:>2}: remanence cache MISS -> equilibrating (minimize + relax)", d_int);
+            println!(
+                "SP2 d/lex={:>2}: remanence cache MISS -> equilibrating (minimize + relax)",
+                d_int
+            );
 
             let mut m0_field = VectorField2D::new(grid);
             let m0 = normalize([1.0, 0.3, 0.0]);
@@ -1055,11 +774,14 @@ pub fn run_sp2() -> std::io::Result<()> {
                 "remanence/premin",
             );
             if rep.stalled {
-                println!("SP2 d/lex={:>2}: remanence pre-minimize stalled -> proceeding to relax anyway", d_int);
+                println!(
+                    "SP2 d/lex={:>2}: remanence pre-minimize stalled -> proceeding to relax anyway",
+                    d_int
+                );
             }
 
             // Strict relax to certify final remanence state
-            relax_call(
+            let _ = relax_call(
                 &grid,
                 &mut m0_field,
                 &mut params,
@@ -1079,7 +801,11 @@ pub fn run_sp2() -> std::io::Result<()> {
 
             let hdr = RemCacheHeader::new(d_int, &grid);
             write_rem_cache(&cache_path, hdr, &m0_field)?;
-            println!("SP2 d/lex={:>2}: cached remanence -> {}", d_int, cache_path.display());
+            println!(
+                "SP2 d/lex={:>2}: cached remanence -> {}",
+                d_int,
+                cache_path.display()
+            );
 
             m0_field
         };
@@ -1097,35 +823,51 @@ pub fn run_sp2() -> std::io::Result<()> {
         // -------------------------
         // Coercivity
         // -------------------------
-        println!("SP2 d/lex={:>2.0}: coercivity search start", d);
-        let m_rem = VectorField2D { grid, data: m.data.clone() };
-        let mut m_work = VectorField2D::new(grid);
+        let hc_over_ms = if rem_only {
+            f64::NAN
+        } else {
+            println!("SP2 d/lex={:>2.0}: coercivity search start", d);
+            let m_rem = VectorField2D {
+                grid,
+                data: m.data.clone(),
+            };
+            let mut m_work = VectorField2D::new(grid);
 
-        let t_hc = Instant::now();
-        let hc_over_ms = find_hc_over_ms(
-            &grid,
-            &mut m_work,
-            &m_rem,
-            &mut params,
-            &material,
-            &mut rk23,
-            ms,
-        );
-        println!(
-            "SP2 d/lex={:>2.0}: coercivity done in {:.1}s  hc/Ms={:.6}",
-            d,
-            t_hc.elapsed().as_secs_f64(),
+            let t_hc = Instant::now();
+            let hc_over_ms = find_hc_over_ms_branch_following_hybrid(
+                &grid,
+                &mut m_work,
+                &m_rem,
+                &mut params,
+                &material,
+                &mut rk23,
+                ms,
+            );
+            println!(
+                "SP2 d/lex={:>2.0}: coercivity done in {:.1}s  hc/Ms={:.6}",
+                d,
+                t_hc.elapsed().as_secs_f64(),
+                hc_over_ms
+            );
             hc_over_ms
-        );
+        };
 
         // Restore B_ext = 0 (matches MuMax script end-of-loop)
         params.b_ext = [0.0, 0.0, 0.0];
 
-        writeln!(w, "{:.0},{:.16e},{:.16e},{:.16e}", d, mx_rem, my_rem, hc_over_ms)?;
+        writeln!(
+            w,
+            "{:.0},{:.16e},{:.16e},{:.16e}",
+            d, mx_rem, my_rem, hc_over_ms
+        )?;
         w.flush()?;
         println!("SP2 d/lex={:>2.0}: row written", d);
     }
 
-    println!("\nSP2 complete. Output: {}", Path::new("runs/st_problems/sp2/table.csv").display());
+    println!(
+        "\nSP2 complete. Output: {}",
+        Path::new("runs/st_problems/sp2/table.csv").display()
+    );
     Ok(())
 }
+	

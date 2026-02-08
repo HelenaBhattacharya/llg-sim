@@ -25,7 +25,7 @@
 // - For Nz=1, MuMax's 2D path uses only XX, YY, XY for in-plane and ZZ for out-of-plane.
 
 use crate::grid::Grid2D;
-use crate::params::{Material, MU0};
+use crate::params::{MU0, Material};
 use crate::vector_field::VectorField2D;
 
 use rustfft::num_complex::Complex;
@@ -46,12 +46,22 @@ fn demag_timing_enabled() -> bool {
 }
 
 /// Backwards-compatible: open boundaries in x/y (no PBC).
-pub fn add_demag_field(grid: &Grid2D, m: &VectorField2D, b_eff: &mut VectorField2D, mat: &Material) {
+pub fn add_demag_field(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    b_eff: &mut VectorField2D,
+    mat: &Material,
+) {
     add_demag_field_pbc(grid, m, b_eff, mat, 0, 0);
 }
 
 /// Backwards-compatible: open boundaries in x/y (no PBC).
-pub fn compute_demag_field(grid: &Grid2D, m: &VectorField2D, out: &mut VectorField2D, mat: &Material) {
+pub fn compute_demag_field(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    out: &mut VectorField2D,
+    mat: &Material,
+) {
     compute_demag_field_pbc(grid, m, out, mat, 0, 0);
 }
 
@@ -151,7 +161,15 @@ impl KernelCacheHeader {
         }
     }
 
-    fn matches(&self, grid: Grid2D, pbc_x: usize, pbc_y: usize, px: usize, py: usize, accuracy: f64) -> bool {
+    fn matches(
+        &self,
+        grid: Grid2D,
+        pbc_x: usize,
+        pbc_y: usize,
+        px: usize,
+        py: usize,
+        accuracy: f64,
+    ) -> bool {
         self.magic == *b"LLGDMAG\0"
             && self.version == 2
             && self.nx == grid.nx as u32
@@ -167,7 +185,14 @@ impl KernelCacheHeader {
     }
 }
 
-fn demag_cache_path(grid: Grid2D, pbc_x: usize, pbc_y: usize, px: usize, py: usize, accuracy: f64) -> PathBuf {
+fn demag_cache_path(
+    grid: Grid2D,
+    pbc_x: usize,
+    pbc_y: usize,
+    px: usize,
+    py: usize,
+    accuracy: f64,
+) -> PathBuf {
     let mut dir = PathBuf::from("out");
     dir.push("demag_cache");
 
@@ -301,7 +326,11 @@ fn try_load_kernel_kspace(
 
     let n_pad = px * py;
 
-    fn read_complex_vec(f: &mut File, out: &mut Vec<Complex<f64>>, n: usize) -> std::io::Result<()> {
+    fn read_complex_vec(
+        f: &mut File,
+        out: &mut Vec<Complex<f64>>,
+        n: usize,
+    ) -> std::io::Result<()> {
         out.clear();
         out.reserve(n);
         let mut buf = [0u8; 8];
@@ -402,19 +431,19 @@ impl Demag2D {
         )
         .unwrap_or(false);
 
-    if do_timing {
-        println!(
-            "[demag timing] cache load: loaded={} in {:.3}s (nx={}, ny={}, px={}, py={}, pbc_x={}, pbc_y={})",
-            loaded,
-            t_load.elapsed().as_secs_f64(),
-            grid.nx,
-            grid.ny,
-            px,
-            py,
-            pbc_x,
-            pbc_y
-        );
-    }
+        if do_timing {
+            println!(
+                "[demag timing] cache load: loaded={} in {:.3}s (nx={}, ny={}, px={}, py={}, pbc_x={}, pbc_y={})",
+                loaded,
+                t_load.elapsed().as_secs_f64(),
+                grid.nx,
+                grid.ny,
+                px,
+                py,
+                pbc_x,
+                pbc_y
+            );
+        }
 
         let mut col_buf = vec![zero; py];
 
@@ -427,10 +456,30 @@ impl Demag2D {
 
             if pbc_x == 0 && pbc_y == 0 {
                 // Open boundaries: keep your parity-enforced builder.
-                build_kernel_realspace_open(&grid, px, py, &mut kxx, &mut kxy, &mut kyy, &mut kzz, DEMAG_ACCURACY);
+                build_kernel_realspace_open(
+                    &grid,
+                    px,
+                    py,
+                    &mut kxx,
+                    &mut kxy,
+                    &mut kyy,
+                    &mut kzz,
+                    DEMAG_ACCURACY,
+                );
             } else {
                 // PBC: sum over image ranges and accumulate into wrapped bins (MuMax-style).
-                build_kernel_realspace_pbc(&grid, px, py, pbc_x, pbc_y, &mut kxx, &mut kxy, &mut kyy, &mut kzz, DEMAG_ACCURACY);
+                build_kernel_realspace_pbc(
+                    &grid,
+                    px,
+                    py,
+                    pbc_x,
+                    pbc_y,
+                    &mut kxx,
+                    &mut kxy,
+                    &mut kyy,
+                    &mut kzz,
+                    DEMAG_ACCURACY,
+                );
             }
             if do_timing {
                 println!(
@@ -454,7 +503,10 @@ impl Demag2D {
 
             let header = KernelCacheHeader::new(grid, pbc_x, pbc_y, px, py, DEMAG_ACCURACY);
             if let Err(e) = write_kernel_kspace(&cache_path, header, &kxx, &kxy, &kyy, &kzz) {
-                eprintln!("[demag] warning: failed to write cache {:?}: {}", cache_path, e);
+                eprintln!(
+                    "[demag] warning: failed to write cache {:?}: {}",
+                    cache_path, e
+                );
             } else {
                 println!("[demag] cached kernel to {:?}", cache_path);
             }
@@ -499,7 +551,7 @@ impl Demag2D {
 
     fn add_field(&mut self, m: &VectorField2D, b_eff: &mut VectorField2D, ms: f64) {
         debug_assert!(same_grid(&m.grid, &self.grid));
-    
+
         let zero = Complex::new(0.0, 0.0);
         self.mx.fill(zero);
         self.my.fill(zero);
@@ -631,7 +683,6 @@ impl Demag2D {
                 }
             });
     }
-
 }
 
 /// 2D forward FFT (in-place), applying 1D FFTs over rows then columns.
@@ -647,11 +698,10 @@ fn fft2_forward_in_place(
         col_buf.resize(ny, Complex::new(0.0, 0.0));
     }
 
-    // Rows
-    for y in 0..ny {
-        let row = &mut data[y * nx..(y + 1) * nx];
+    // Rows (parallel over independent rows)
+    data.par_chunks_mut(nx).for_each(|row| {
         fft_x.process(row);
-    }
+    });
 
     // Columns
     for x in 0..nx {
@@ -678,11 +728,10 @@ fn fft2_inverse_in_place(
         col_buf.resize(ny, Complex::new(0.0, 0.0));
     }
 
-    // Rows
-    for y in 0..ny {
-        let row = &mut data[y * nx..(y + 1) * nx];
+    // Rows (parallel over independent rows)
+    data.par_chunks_mut(nx).for_each(|row| {
         fft_x_inv.process(row);
-    }
+    });
 
     // Columns
     for x in 0..nx {
@@ -757,7 +806,8 @@ fn build_kernel_realspace_pbc(
             let ix = wrap_index(sx, px);
             let idx = iy * px + ix;
 
-            let (k_xx, k_xy, k_yy, k_zz) = kernel_2d_components_mumax_like(grid.dx, grid.dy, grid.dz, sx, sy, accuracy);
+            let (k_xx, k_xy, k_yy, k_zz) =
+                kernel_2d_components_mumax_like(grid.dx, grid.dy, grid.dz, sx, sy, accuracy);
 
             kxx[idx].re += k_xx;
             kxy[idx].re += k_xy;
@@ -809,7 +859,8 @@ fn build_kernel_realspace_mumax_2d(
     // Fill base quadrant sx>=0, sy>=0 (including axes), then reflect with exact parity.
     for sy in 0..=ry_max {
         for sx in 0..=rx_max {
-            let (k_xx, k_xy, k_yy, k_zz) = kernel_2d_components_mumax_like(grid.dx, grid.dy, grid.dz, sx, sy, accuracy);
+            let (k_xx, k_xy, k_yy, k_zz) =
+                kernel_2d_components_mumax_like(grid.dx, grid.dy, grid.dz, sx, sy, accuracy);
 
             let mut set_at = |sx_s: isize, sy_s: isize, xx: f64, xy: f64, yy: f64, zz: f64| {
                 let ix = wrap_index(sx_s, px);
@@ -931,24 +982,22 @@ fn mumax_like_h_from_unit_m(
         pole[v] = pv;
 
         for j in 0..nw {
-            let pw = -0.5 * cell[w] + cell[w] / (2.0 * nw as f64) + (j as f64) * (cell[w] / nw as f64);
+            let pw =
+                -0.5 * cell[w] + cell[w] / (2.0 * nw as f64) + (j as f64) * (cell[w] / nw as f64);
             pole[w] = pw;
 
             for ax in 0..nx {
-                let rx = r_center[0]
-                    - 0.5 * cell[0]
+                let rx = r_center[0] - 0.5 * cell[0]
                     + cell[0] / (2.0 * nx as f64)
                     + (ax as f64) * (cell[0] / nx as f64);
 
                 for ay in 0..ny {
-                    let ry = r_center[1]
-                        - 0.5 * cell[1]
+                    let ry = r_center[1] - 0.5 * cell[1]
                         + cell[1] / (2.0 * ny as f64)
                         + (ay as f64) * (cell[1] / ny as f64);
 
                     for az in 0..nz {
-                        let rz = r_center[2]
-                            - 0.5 * cell[2]
+                        let rz = r_center[2] - 0.5 * cell[2]
                             + cell[2] / (2.0 * nz as f64)
                             + (az as f64) * (cell[2] / nz as f64);
 
@@ -1025,11 +1074,14 @@ mod tests {
         let expected = -MU0 / 3.0;
 
         // Loose tolerance to avoid brittle tests across accuracy implementations.
-        assert!((bz - expected).abs() < 1e-3, "bz={}, expected={}", bz, expected);
+        assert!(
+            (bz - expected).abs() < 1e-3,
+            "bz={}, expected={}",
+            bz,
+            expected
+        );
     }
 }
-
-
 
 // // src/effective_field/demag.rs
 // //
@@ -1830,7 +1882,6 @@ mod tests {
 
 //     (kxx, kxy, kxz, kyy, kyz, kzz)
 // }
-
 
 // #[cfg(test)]
 // mod tests {

@@ -19,13 +19,13 @@
 //
 // Note: requires compute_demag_field_pbc(...) in effective_field::demag.
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use llg_sim::effective_field::demag::compute_demag_field_pbc;
 use llg_sim::grid::Grid2D;
-use llg_sim::params::{Material, MU0};
+use llg_sim::params::{MU0, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn avg_vec(field: &VectorField2D) -> [f64; 3] {
@@ -81,19 +81,7 @@ fn run_block(
         writeln!(
             w,
             "{},{},{},{},{},{},{},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
-            nx,
-            ny,
-            1,
-            pbc_x,
-            pbc_y,
-            case,
-            0.0,
-            mx,
-            my,
-            mz,
-            bdx,
-            bdy,
-            bdz
+            nx, ny, 1, pbc_x, pbc_y, case, 0.0, mx, my, mz, bdx, bdy, bdz
         )?;
     }
 

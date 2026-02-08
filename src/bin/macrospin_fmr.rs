@@ -23,14 +23,16 @@
 //     ├── rust_table_macrospin_fmr.csv
 //     └── dt_history.csv
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use llg_sim::config::{FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo};
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::config::{
+    FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo,
+};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
+use llg_sim::llg::{RK45Scratch, step_llg_rk45_recompute_field_adaptive};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
@@ -40,15 +42,15 @@ fn main() -> std::io::Result<()> {
     let dy = 5e-9;
     let dz = 5e-9;
 
-    let b0 = 1.0_f64;         // Tesla
+    let b0 = 1.0_f64; // Tesla
     let alpha = 0.01_f64;
-    let dt0 = 5e-14_f64;      // initial dt guess (seconds)
-    let t_total = 5e-9_f64;   // 5 ns
-    let theta_deg = 5.0_f64;  // initial tilt angle
+    let dt0 = 5e-14_f64; // initial dt guess (seconds)
+    let t_total = 5e-9_f64; // 5 ns
+    let theta_deg = 5.0_f64; // initial tilt angle
 
-    let ms = 8.0e5_f64;       // A/m
-    let a_ex = 0.0_f64;       // J/m (OFF for macrospin)
-    let k_u = 0.0_f64;        // J/m^3 (OFF for macrospin)
+    let ms = 8.0e5_f64; // A/m
+    let a_ex = 0.0_f64; // J/m (OFF for macrospin)
+    let k_u = 0.0_f64; // J/m^3 (OFF for macrospin)
 
     // RK45 controller (MuMax-like defaults)
     let max_err = 1e-5_f64;
@@ -101,9 +103,25 @@ fn main() -> std::io::Result<()> {
     // Write config.json
     // -------------------------------------------------
     let run_config = RunConfig {
-        geometry: GeometryConfig { nx: 1, ny: 1, nz: 1, dx, dy, dz },
-        material: MaterialConfig { ms, aex: a_ex, ku1: k_u, easy_axis: [0.0, 0.0, 1.0] },
-        fields: FieldConfig { b_ext: [0.0, 0.0, b0], demag: material.demag, dmi: material.dmi },
+        geometry: GeometryConfig {
+            nx: 1,
+            ny: 1,
+            nz: 1,
+            dx,
+            dy,
+            dz,
+        },
+        material: MaterialConfig {
+            ms,
+            aex: a_ex,
+            ku1: k_u,
+            easy_axis: [0.0, 0.0, 1.0],
+        },
+        fields: FieldConfig {
+            b_ext: [0.0, 0.0, b0],
+            demag: material.demag,
+            dmi: material.dmi,
+        },
         numerics: NumericsConfig {
             integrator: "rk45".to_string(),
             dt: dt0,
@@ -143,9 +161,16 @@ fn main() -> std::io::Result<()> {
             w,
             "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             0.0,
-            v[0], v[1], v[2],
-            e.total(), e.exchange, e.anisotropy, e.zeeman,
-            params.b_ext[0], params.b_ext[1], params.b_ext[2],
+            v[0],
+            v[1],
+            v[2],
+            e.total(),
+            e.exchange,
+            e.anisotropy,
+            e.zeeman,
+            params.b_ext[0],
+            params.b_ext[1],
+            params.b_ext[2],
         )?;
     }
 
@@ -209,9 +234,16 @@ fn main() -> std::io::Result<()> {
             w,
             "{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
             t,
-            v[0], v[1], v[2],
-            e.total(), e.exchange, e.anisotropy, e.zeeman,
-            params.b_ext[0], params.b_ext[1], params.b_ext[2],
+            v[0],
+            v[1],
+            v[2],
+            e.total(),
+            e.exchange,
+            e.anisotropy,
+            e.zeeman,
+            params.b_ext[0],
+            params.b_ext[1],
+            params.b_ext[2],
         )?;
     }
 

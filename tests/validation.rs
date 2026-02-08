@@ -6,11 +6,11 @@
 // To run ignored (FFT) test too: cargo test --test validation -- --ignored
 
 use llg_sim::effective_field::build_h_eff;
+use llg_sim::energy::compute_total_energy;
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::step_llg_with_field;
 use llg_sim::params::{LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
-use llg_sim::energy::compute_total_energy;
 
 fn unit(v: [f64; 3]) -> [f64; 3] {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -263,18 +263,32 @@ fn energy_gradient_consistency_exchange_anisotropy() {
     // Choose a perturbation direction perpendicular to m0
     let a = [0.37, -0.24, 0.91];
     let mdota = m0[0] * a[0] + m0[1] * a[1] + m0[2] * a[2];
-    let mut dir = [a[0] - mdota * m0[0], a[1] - mdota * m0[1], a[2] - mdota * m0[2]];
+    let mut dir = [
+        a[0] - mdota * m0[0],
+        a[1] - mdota * m0[1],
+        a[2] - mdota * m0[2],
+    ];
     let n = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-    assert!(n > 1e-12, "failed to construct a perpendicular perturbation");
+    assert!(
+        n > 1e-12,
+        "failed to construct a perpendicular perturbation"
+    );
     dir = [dir[0] / n, dir[1] / n, dir[2] / n];
 
     // Small perturbation + renormalise
     let eps = 1e-6;
-    let m1 = unit([m0[0] + eps * dir[0], m0[1] + eps * dir[1], m0[2] + eps * dir[2]]);
+    let m1 = unit([
+        m0[0] + eps * dir[0],
+        m0[1] + eps * dir[1],
+        m0[2] + eps * dir[2],
+    ]);
     let dm = [m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2]];
 
     // Copy field and perturb one cell
-    let mut m_pert = VectorField2D { grid, data: m.data.clone() };
+    let mut m_pert = VectorField2D {
+        grid,
+        data: m.data.clone(),
+    };
     m_pert.data[idx] = m1;
 
     let e1 = compute_total_energy(&grid, &m_pert, &material, params.b_ext);
@@ -293,7 +307,10 @@ fn energy_gradient_consistency_exchange_anisotropy() {
     assert!(
         err < 5e-2 * scale,
         "ΔE mismatch: num={:.6e}, pred={:.6e}, err={:.6e}, scale={:.6e}",
-        de_num, de_pred, err, scale
+        de_num,
+        de_pred,
+        err,
+        scale
     );
 }
 
@@ -372,7 +389,6 @@ fn macrospin_fmr_fft_peak_matches_gamma_b() {
     );
 }
 
-
 #[test]
 fn dmi_field_flips_sign_with_d() {
     use llg_sim::effective_field::build_h_eff;
@@ -445,10 +461,10 @@ fn dmi_field_flips_sign_with_d() {
     assert!(
         (bx_plus + bx_minus).abs() < 1e-10 * bx_plus.abs().max(1.0),
         "DMI field should flip sign with D: bx+= {}, bx-= {}",
-        bx_plus, bx_minus
+        bx_plus,
+        bx_minus
     );
 }
-
 
 // ------------------------------------------------------------
 // Demag: small-grid sanity checks (FFT convolution + symmetry)
@@ -458,7 +474,7 @@ fn dmi_field_flips_sign_with_d() {
 fn demag_uniform_2x2_cube_cells_has_symmetry_and_reasonable_factor() {
     use llg_sim::effective_field::demag::add_demag_field;
     use llg_sim::grid::Grid2D;
-    use llg_sim::params::{Material, MU0};
+    use llg_sim::params::{MU0, Material};
     use llg_sim::vector_field::VectorField2D;
 
     // 2×2 in-plane grid with cubic cells (dx=dy=dz=1).
@@ -497,8 +513,16 @@ fn demag_uniform_2x2_cube_cells_has_symmetry_and_reasonable_factor() {
     let mut bz_max = b0[2];
 
     for (idx, b) in b_eff.data.iter().enumerate() {
-        assert!(b[0].abs() < tol_xy, "cell {idx}: expected Bx~0, got {}", b[0]);
-        assert!(b[1].abs() < tol_xy, "cell {idx}: expected By~0, got {}", b[1]);
+        assert!(
+            b[0].abs() < tol_xy,
+            "cell {idx}: expected Bx~0, got {}",
+            b[0]
+        );
+        assert!(
+            b[1].abs() < tol_xy,
+            "cell {idx}: expected By~0, got {}",
+            b[1]
+        );
 
         bz_min = bz_min.min(b[2]);
         bz_max = bz_max.max(b[2]);
@@ -521,7 +545,6 @@ fn demag_uniform_2x2_cube_cells_has_symmetry_and_reasonable_factor() {
     assert!(nzz > 0.05 && nzz < 1.05, "unexpected Nzz={}", nzz);
 }
 
-
 // ------------------------------------------------------------
 // Demag: print Nxx, Nyy, Nzz for a small 2×2×1 sample
 // ------------------------------------------------------------
@@ -530,7 +553,7 @@ fn demag_uniform_2x2_cube_cells_has_symmetry_and_reasonable_factor() {
 fn demag_uniform_2x2_prints_nxx_nyy_nzz() {
     use llg_sim::effective_field::demag::add_demag_field;
     use llg_sim::grid::Grid2D;
-    use llg_sim::params::{Material, MU0};
+    use llg_sim::params::{MU0, Material};
     use llg_sim::vector_field::VectorField2D;
 
     let grid = Grid2D::new(2, 2, 1.0, 1.0, 1.0);
@@ -572,7 +595,10 @@ fn demag_uniform_2x2_prints_nxx_nyy_nzz() {
     let nyy = infer_nii(1, grid, ms, &mat);
     let nzz = infer_nii(2, grid, ms, &mat);
 
-    println!("2x2x1 implied demag factors: Nxx={:.6}, Nyy={:.6}, Nzz={:.6}", nxx, nyy, nzz);
+    println!(
+        "2x2x1 implied demag factors: Nxx={:.6}, Nyy={:.6}, Nzz={:.6}",
+        nxx, nyy, nzz
+    );
 
     // Loose physical sanity: factors should be positive-ish and sum should be O(1).
     assert!(nxx > 0.0 && nxx < 1.2);
@@ -612,8 +638,8 @@ fn demag_energy_is_nonnegative_for_uniform_state() {
 #[test]
 fn macrospin_precession_quarter_turn_rk45_adaptive() {
     use llg_sim::grid::Grid2D;
-    use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
-    use llg_sim::params::{LLGParams, Material, GAMMA_E_RAD_PER_S_T};
+    use llg_sim::llg::{RK45Scratch, step_llg_rk45_recompute_field_adaptive};
+    use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
     use llg_sim::vector_field::VectorField2D;
 
     // 1-cell macrospin
@@ -661,7 +687,10 @@ fn macrospin_precession_quarter_turn_rk45_adaptive() {
 
     while t < t_target {
         attempts += 1;
-        assert!(attempts < 200_000, "RK45 took too many attempts; dt may be stuck");
+        assert!(
+            attempts < 200_000,
+            "RK45 took too many attempts; dt may be stuck"
+        );
 
         // Clamp dt so we land exactly on t_target
         let remaining = t_target - t;

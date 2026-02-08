@@ -8,12 +8,15 @@
 //
 // Stop: max |m × B| < torque_threshold (Tesla)
 
-use crate::effective_field::{build_h_eff_masked, FieldMask};
+use crate::effective_field::{FieldMask, build_h_eff_masked};
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
 use crate::vec3::cross;
 use crate::vector_field::VectorField2D;
+
+use rayon::prelude::*;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct MinimizeSettings {
@@ -48,6 +51,10 @@ pub struct MinimizeSettings {
     /// Do not allow dm_stop-based early exit until at least this many iterations have run.
     pub dm_min_iters: usize,
 
+    /// Enable Rayon parallelism for the per-cell update/metric pass.
+    /// Off by default for maximal reproducibility; callers can also enable via env `LLG_MINIMIZE_PAR=1`.
+    pub parallel: bool,
+
     // Optional: print every N iterations (0 disables)
     pub print_every: usize,
 }
@@ -57,18 +64,24 @@ impl Default for MinimizeSettings {
         Self {
             torque_threshold: 5e-4,
             max_iters: 20_000,
+
             lambda0: 2e-2,
             lambda_min: 1e-5,
             lambda_max: 5e-2,
             grow: 1.05,
             shrink: 0.8,
+
             stall_iters: 5000,
             stall_rel: 5e-4,
             min_iters_before_stall: 500,
+
             dm_stop: Some(1e-6),
             dm_samples: 10,
             dm_torque_gate: Some(2e-3),
             dm_min_iters: 50,
+
+            parallel: false,
+
             print_every: 0,
         }
     }
@@ -97,6 +110,11 @@ pub fn minimize_damping_only(
 ) -> MinimizeReport {
     let mut b_eff = VectorField2D::new(*grid);
 
+    // Optional Rayon parallelism for the per-cell update/metric pass.
+    // We keep reductions deterministic by aggregating per-chunk stats in a fixed order.
+    let use_parallel = settings.parallel || std::env::var("LLG_MINIMIZE_PAR").is_ok();
+    const CHUNK: usize = 2048;
+
     let mut lambda = settings.lambda0;
     // Track previous *mean* torque for controller decisions (more robust than max torque).
     let mut t_prev_mean = f64::INFINITY;
@@ -115,44 +133,117 @@ pub fn minimize_damping_only(
         let mut tmax = 0.0;
         let mut tsum = 0.0;
         let mut max_dm = 0.0;
-        for (mi, bi) in m.data.iter_mut().zip(b_eff.data.iter()) {
-            let m0 = *mi;
-            let b0 = *bi;
 
-            // torque = m × B
-            let t = cross(m0, b0);
-            let tmag = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
-            tsum += tmag;
-            if tmag > tmax {
-                tmax = tmag;
+        if use_parallel {
+            let n_tot = m.data.len();
+            let n_chunks = (n_tot + CHUNK - 1) / CHUNK;
+
+            // Deterministic aggregation: each chunk writes (tmax, tsum, max_dm) into a fixed slot.
+            let stats = Mutex::new(vec![(0.0_f64, 0.0_f64, 0.0_f64); n_chunks]);
+
+            m.data
+                .par_chunks_mut(CHUNK)
+                .zip(b_eff.data.par_chunks(CHUNK))
+                .enumerate()
+                .for_each(|(ci, (m_chunk, b_chunk))| {
+                    let mut ltmax = 0.0_f64;
+                    let mut ltsum = 0.0_f64;
+                    let mut lmax_dm = 0.0_f64;
+
+                    for (mi, bi) in m_chunk.iter_mut().zip(b_chunk.iter()) {
+                        let m0 = *mi;
+                        let b0 = *bi;
+
+                        // torque = m × B
+                        let t = cross(m0, b0);
+                        let tmag = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                        ltsum += tmag;
+                        if tmag > ltmax {
+                            ltmax = tmag;
+                        }
+
+                        // descent direction: d = (m × B) × m  (damping-only direction)
+                        let d = cross(t, m0);
+
+                        let mut x = m0[0] + lambda * d[0];
+                        let mut y = m0[1] + lambda * d[1];
+                        let mut z = m0[2] + lambda * d[2];
+
+                        // renormalise
+                        let n2 = x * x + y * y + z * z;
+                        if n2 > 0.0 {
+                            let inv = 1.0 / n2.sqrt();
+                            x *= inv;
+                            y *= inv;
+                            z *= inv;
+                        }
+
+                        // Track max dM = max_i ||m_new - m_old||
+                        let dx = x - m0[0];
+                        let dy = y - m0[1];
+                        let dz = z - m0[2];
+                        let dm = (dx * dx + dy * dy + dz * dz).sqrt();
+                        if dm > lmax_dm {
+                            lmax_dm = dm;
+                        }
+
+                        *mi = [x, y, z];
+                    }
+
+                    let mut g = stats.lock().expect("minimize stats mutex poisoned");
+                    g[ci] = (ltmax, ltsum, lmax_dm);
+                });
+
+            let g = stats.lock().expect("minimize stats mutex poisoned");
+            for &(ltmax, ltsum, lmax_dm) in g.iter() {
+                tsum += ltsum;
+                if ltmax > tmax {
+                    tmax = ltmax;
+                }
+                if lmax_dm > max_dm {
+                    max_dm = lmax_dm;
+                }
             }
+        } else {
+            for (mi, bi) in m.data.iter_mut().zip(b_eff.data.iter()) {
+                let m0 = *mi;
+                let b0 = *bi;
 
-            // descent direction: d = (m × B) × m  (damping-only direction)
-            let d = cross(t, m0);
+                // torque = m × B
+                let t = cross(m0, b0);
+                let tmag = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                tsum += tmag;
+                if tmag > tmax {
+                    tmax = tmag;
+                }
 
-            let mut x = m0[0] + lambda * d[0];
-            let mut y = m0[1] + lambda * d[1];
-            let mut z = m0[2] + lambda * d[2];
+                // descent direction: d = (m × B) × m  (damping-only direction)
+                let d = cross(t, m0);
 
-            // renormalise
-            let n2 = x * x + y * y + z * z;
-            if n2 > 0.0 {
-                let inv = 1.0 / n2.sqrt();
-                x *= inv;
-                y *= inv;
-                z *= inv;
+                let mut x = m0[0] + lambda * d[0];
+                let mut y = m0[1] + lambda * d[1];
+                let mut z = m0[2] + lambda * d[2];
+
+                // renormalise
+                let n2 = x * x + y * y + z * z;
+                if n2 > 0.0 {
+                    let inv = 1.0 / n2.sqrt();
+                    x *= inv;
+                    y *= inv;
+                    z *= inv;
+                }
+
+                // Track max dM = max_i ||m_new - m_old||
+                let dx = x - m0[0];
+                let dy = y - m0[1];
+                let dz = z - m0[2];
+                let dm = (dx * dx + dy * dy + dz * dz).sqrt();
+                if dm > max_dm {
+                    max_dm = dm;
+                }
+
+                *mi = [x, y, z];
             }
-
-            // Track max dM = max_i ||m_new - m_old||
-            let dx = x - m0[0];
-            let dy = y - m0[1];
-            let dz = z - m0[2];
-            let dm = (dx * dx + dy * dy + dz * dz).sqrt();
-            if dm > max_dm {
-                max_dm = dm;
-            }
-
-            *mi = [x, y, z];
         }
 
         let n = m.data.len() as f64;
@@ -163,10 +254,7 @@ pub fn minimize_damping_only(
         if settings.print_every > 0 && it % settings.print_every == 0 {
             println!(
                 "      [minimize] it={}  tmax={:.3e}  tmean={:.3e}  lambda={:.3e}",
-                it,
-                tmax,
-                tmean,
-                lambda
+                it, tmax, tmean, lambda
             );
         }
 
@@ -193,14 +281,14 @@ pub fn minimize_damping_only(
                 while dm_hist.len() > settings.dm_samples.max(1) {
                     dm_hist.pop_front();
                 }
-                if dm_hist.len() == settings.dm_samples.max(1) && dm_hist.iter().all(|&v| v < dm_stop) {
+                if dm_hist.len() == settings.dm_samples.max(1)
+                    && dm_hist.iter().all(|&v| v < dm_stop)
+                {
                     let torque_ok = match settings.dm_torque_gate {
                         None => true,
                         Some(g) => tmean <= g,
                     };
-                    // Note: dm_converged=true means the dm_stop criterion fired.
-                    // Whether this is a *fully* converged equilibrium is indicated by `converged` (torque gate).
-                    // Callers that consider skipping Relax() should require `converged == true`.
+                    // dm_converged=true means dm_stop fired; converged indicates torque gate passed
                     return MinimizeReport {
                         iters: it + 1,
                         final_torque: tmax,
@@ -232,6 +320,7 @@ pub fn minimize_damping_only(
                 stall_count = 0;
             }
         }
+
         // Do NOT treat hitting lambda_min as an automatic stall.
         // In demag-dominated problems (SP2), the step size can collapse early even while
         // the configuration continues to improve slowly. We rely on the plateau counter

@@ -164,7 +164,11 @@ pub fn save_energy_components_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-30 {
-        let delta = if y_max.abs() < 1e-30 { 1.0 } else { 0.1 * y_max.abs() };
+        let delta = if y_max.abs() < 1e-30 {
+            1.0
+        } else {
+            0.1 * y_max.abs()
+        };
         y_min -= delta;
         y_max += delta;
     } else {
@@ -225,7 +229,10 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times.iter().zip(e_zee.iter()).map(|(&t, &e)| (t, e / scale)),
+            times
+                .iter()
+                .zip(e_zee.iter())
+                .map(|(&t, &e)| (t, e / scale)),
             &GREEN,
         ))?
         .label("Zeeman")
@@ -233,7 +240,10 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times.iter().zip(e_dmi.iter()).map(|(&t, &e)| (t, e / scale)),
+            times
+                .iter()
+                .zip(e_dmi.iter())
+                .map(|(&t, &e)| (t, e / scale)),
             &MAGENTA,
         ))?
         .label("DMI")
@@ -241,7 +251,10 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times.iter().zip(e_demag.iter()).map(|(&t, &e)| (t, e / scale)),
+            times
+                .iter()
+                .zip(e_demag.iter())
+                .map(|(&t, &e)| (t, e / scale)),
             &CYAN,
         ))?
         .label("Demag")
@@ -249,7 +262,10 @@ pub fn save_energy_components_plot(
 
     chart
         .draw_series(LineSeries::new(
-            times.iter().zip(e_tot.iter()).map(|(&t, &e)| (t, e / scale)),
+            times
+                .iter()
+                .zip(e_tot.iter())
+                .map(|(&t, &e)| (t, e / scale)),
             &BLACK,
         ))?
         .label("Total")
@@ -293,7 +309,11 @@ pub fn save_energy_residual_plot(
         y_min = -1.0;
         y_max = 1.0;
     } else if (y_max - y_min).abs() < 1e-30 {
-        let delta = if y_max.abs() < 1e-30 { 1.0 } else { 0.1 * y_max.abs() };
+        let delta = if y_max.abs() < 1e-30 {
+            1.0
+        } else {
+            0.1 * y_max.abs()
+        };
         y_min -= delta;
         y_max += delta;
     } else {
@@ -614,7 +634,10 @@ pub fn save_eps_vs_time_plot(
 
     // Horizontal line: max_err
     chart
-        .draw_series(LineSeries::new(vec![(t_min, max_err), (t_max, max_err)], &BLACK))?
+        .draw_series(LineSeries::new(
+            vec![(t_min, max_err), (t_max, max_err)],
+            &BLACK,
+        ))?
         .label("max_err")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
 

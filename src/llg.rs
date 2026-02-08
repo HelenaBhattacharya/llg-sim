@@ -1,6 +1,6 @@
 // src/llg.rs
 
-use crate::effective_field::{build_h_eff_masked, zeeman::add_zeeman_field, FieldMask};
+use crate::effective_field::{FieldMask, build_h_eff_masked, zeeman::add_zeeman_field};
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
 use crate::vec3::{cross, normalize};
@@ -177,6 +177,10 @@ pub struct RK23Scratch {
     k2: Vec<[f64; 3]>,
     k3: Vec<[f64; 3]>,
     k4: Vec<[f64; 3]>,
+
+    // Whether `b4` currently corresponds to the accepted state stored in `m`.
+    // This lets higher-level routines reuse the last computed field for torque checks.
+    last_b_eff_valid: bool,
 }
 
 impl RK23Scratch {
@@ -196,6 +200,20 @@ impl RK23Scratch {
             k2: vec![[0.0; 3]; n],
             k3: vec![[0.0; 3]; n],
             k4: vec![[0.0; 3]; n],
+            last_b_eff_valid: false,
+        }
+    }
+
+    /// Returns the last computed effective field for the accepted state, if available.
+    ///
+    /// When a relax RK23 step is accepted, `b4` is the effective field evaluated at the
+    /// accepted 3rd-order solution. We mark it valid so callers can avoid rebuilding the
+    /// effective field just to compute torque metrics.
+    pub fn last_b_eff(&self) -> Option<&VectorField2D> {
+        if self.last_b_eff_valid {
+            Some(&self.b4)
+        } else {
+            None
         }
     }
 }
@@ -333,10 +351,14 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
     if accept {
         // Accept 3rd-order solution
         m.data.clone_from(&scratch.m4.data);
+        // `b4` is the field evaluated at `m4`, which is now the accepted state in `m`.
+        scratch.last_b_eff_valid = true;
         params.dt = dt_next;
         (eps, true, dt0)
     } else {
         // Reject: keep m unchanged, just shrink dt
+        // `b4` corresponds to a trial state, so it is not valid for the current `m`.
+        scratch.last_b_eff_valid = false;
         params.dt = dt_next;
         (eps, false, dt0)
     }
@@ -635,7 +657,10 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
             + BH6 * scratch.k6[i][2]
             + BH7 * scratch.k7[i][2];
 
-        let d = (th0 - tl0).abs().max((th1 - tl1).abs()).max((th2 - tl2).abs());
+        let d = (th0 - tl0)
+            .abs()
+            .max((th1 - tl1).abs())
+            .max((th2 - tl2).abs());
         if d > err_inf {
             err_inf = d;
         }
@@ -786,7 +811,11 @@ pub fn step_llg_rk4_recompute_field_masked_relax_adaptive(
         m.data.clone_from(&m_small.data);
 
         let safety = 0.9;
-        let grow = if err == 0.0 { 2.0 } else { (tol / err).powf(0.2) };
+        let grow = if err == 0.0 {
+            2.0
+        } else {
+            (tol / err).powf(0.2)
+        };
         let dt_new = (dt0 * safety * grow).min(dt_max);
         params.dt = dt_new.max(dt_min);
 

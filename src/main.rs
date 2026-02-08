@@ -35,32 +35,27 @@
 //     └── mz_evolution.mp4        (if `movie` is enabled)
 
 use std::env;
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use llg_sim::config::{FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo};
+use llg_sim::config::{
+    FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo,
+};
 use llg_sim::effective_field::build_h_eff;
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{
-    step_llg_rk4_recompute_field,
-    step_llg_rk45_recompute_field_adaptive,
-    step_llg_with_field,
-    step_llg_with_field_rk4,
-    RK4Scratch,
-    RK45Scratch,
+    RK4Scratch, RK45Scratch, step_llg_rk4_recompute_field, step_llg_rk45_recompute_field_adaptive,
+    step_llg_with_field, step_llg_with_field_rk4,
 };
 use llg_sim::params::{InitKind, Preset, SimConfig};
 use llg_sim::vector_field::VectorField2D;
 use llg_sim::visualisation::{
-    make_movie_with_ffmpeg,
-    save_energy_components_plot,
-    save_energy_residual_plot,
-    save_m_avg_plot,
-    save_mz_plot,
+    make_movie_with_ffmpeg, save_energy_components_plot, save_energy_residual_plot,
+    save_m_avg_plot, save_mz_plot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +126,13 @@ fn default_run_id(preset: Preset, init: InitKind, integrator: Integrator) -> Str
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0));
     let ts = format!("{}{:03}", now.as_secs(), now.subsec_millis());
-    format!("{}_{}_{}_{}", ts, preset.as_str(), init.as_str(), integrator.as_str())
+    format!(
+        "{}_{}_{}_{}",
+        ts,
+        preset.as_str(),
+        init.as_str(),
+        integrator.as_str()
+    )
 }
 
 fn unique_run_dir(out_root: &str, run_id: &str) -> PathBuf {
@@ -379,8 +380,16 @@ fn main() -> std::io::Result<()> {
             } else {
                 None
             },
-            dt_min: if integrator == Integrator::Rk45 { dtmin_override } else { None },
-            dt_max: if integrator == Integrator::Rk45 { dtmax_override } else { None },
+            dt_min: if integrator == Integrator::Rk45 {
+                dtmin_override
+            } else {
+                None
+            },
+            dt_max: if integrator == Integrator::Rk45 {
+                dtmax_override
+            } else {
+                None
+            },
         },
         run: RunInfo {
             binary: "llg-sim".to_string(),
@@ -394,7 +403,13 @@ fn main() -> std::io::Result<()> {
     // Keep frame ordering stable under glob
     let frame_pad: usize = 6;
 
-    let grid: Grid2D = Grid2D::new(grid_spec.nx, grid_spec.ny, grid_spec.dx, grid_spec.dy, grid_spec.dz);
+    let grid: Grid2D = Grid2D::new(
+        grid_spec.nx,
+        grid_spec.ny,
+        grid_spec.dx,
+        grid_spec.dy,
+        grid_spec.dz,
+    );
 
     let mut m: VectorField2D = VectorField2D::new(grid);
     let mut b_eff: VectorField2D = VectorField2D::new(grid);
@@ -419,12 +434,7 @@ fn main() -> std::io::Result<()> {
     );
     println!(
         "LLG:    gamma={:.6e} alpha={:.3} dt0={:.6e}  B_ext=[{:.3e},{:.3e},{:.3e}]",
-        params.gamma,
-        params.alpha,
-        params.dt,
-        params.b_ext[0],
-        params.b_ext[1],
-        params.b_ext[2]
+        params.gamma, params.alpha, params.dt, params.b_ext[0], params.b_ext[1], params.b_ext[2]
     );
     println!(
         "mat:    Ms={:.3e} A={:.3e} Ku={:.3e}  u=[{:.3},{:.3},{:.3}]",
@@ -436,7 +446,10 @@ fn main() -> std::io::Result<()> {
         material.easy_axis[2]
     );
     println!("fields: demag={} dmi={:?}", material.demag, material.dmi);
-    println!("run:    steps={} save_every={} fps={} zoom_t_max={}", run.n_steps, run.save_every, run.fps, run.zoom_t_max);
+    println!(
+        "run:    steps={} save_every={} fps={} zoom_t_max={}",
+        run.n_steps, run.save_every, run.fps, run.zoom_t_max
+    );
     println!("movie frame_dt (physical) = {:.3e} s", frame_dt);
 
     if integrator == Integrator::Rk4 && (material.a_ex != 0.0 || material.k_u != 0.0) {
@@ -458,7 +471,10 @@ fn main() -> std::io::Result<()> {
         dt_max = (dt_min * 10.0).max(params.dt);
     }
     if integrator == Integrator::Rk45 {
-        println!("rk45:   MaxErr={} headroom={} dt_min={} dt_max={}", max_err, headroom, dt_min, dt_max);
+        println!(
+            "rk45:   MaxErr={} headroom={} dt_min={} dt_max={}",
+            max_err, headroom, dt_min, dt_max
+        );
     }
     println!("--------------------------");
 
@@ -676,14 +692,16 @@ fn main() -> std::io::Result<()> {
         // - Else: old behaviour (every save_every accepted steps).
         if make_movie_flag {
             if t + tol_time >= next_frame_t {
-                let fname = frames_dir.join(format!("mz_{:0width$}.png", frame_idx, width = frame_pad));
+                let fname =
+                    frames_dir.join(format!("mz_{:0width$}.png", frame_idx, width = frame_pad));
                 save_mz_plot(&m, fname.to_str().unwrap()).expect("failed to save m_z plot");
                 frame_idx += 1;
                 next_frame_t += frame_dt;
             }
         } else {
             if step % run.save_every == 0 || step == run.n_steps {
-                let fname = frames_dir.join(format!("mz_{:0width$}.png", frame_idx, width = frame_pad));
+                let fname =
+                    frames_dir.join(format!("mz_{:0width$}.png", frame_idx, width = frame_pad));
                 save_mz_plot(&m, fname.to_str().unwrap()).expect("failed to save m_z plot");
                 frame_idx += 1;
             }
@@ -704,7 +722,10 @@ fn main() -> std::io::Result<()> {
     let _ = save_energy_residual_plot(
         &times,
         &e_tot_vec,
-        run_dir.join("energy_residual_vs_time.png").to_str().unwrap(),
+        run_dir
+            .join("energy_residual_vs_time.png")
+            .to_str()
+            .unwrap(),
     );
     let _ = save_m_avg_plot(
         &times,
@@ -717,7 +738,9 @@ fn main() -> std::io::Result<()> {
     // Optional movie
     if make_movie_flag {
         let movie_path = run_dir.join("mz_evolution.mp4");
-        if let Err(e) = make_movie_with_ffmpeg(&ffmpeg_pattern, movie_path.to_str().unwrap(), run.fps) {
+        if let Err(e) =
+            make_movie_with_ffmpeg(&ffmpeg_pattern, movie_path.to_str().unwrap(), run.fps)
+        {
             eprintln!("Could not create movie with ffmpeg: {e}");
         } else {
             println!("Saved movie to {}", movie_path.to_string_lossy());

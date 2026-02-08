@@ -36,17 +36,17 @@
 // The script also prints slice-level L_inf and RMS errors to confirm agreement.
 // -----------------------------------------------------------------------------
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use llg_sim::effective_field::FieldMask;
+use llg_sim::effective_field::build_h_eff_masked;
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::RK23Scratch;
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
-use llg_sim::relax::{relax, RelaxSettings};
+use llg_sim::relax::{RelaxSettings, relax};
 use llg_sim::vec3::cross;
-use llg_sim::effective_field::build_h_eff_masked;
 use llg_sim::vector_field::VectorField2D;
 
 fn write_midrow_slice(m: &VectorField2D, grid: &Grid2D, path: &Path) -> std::io::Result<()> {
@@ -64,7 +64,13 @@ fn write_midrow_slice(m: &VectorField2D, grid: &Grid2D, path: &Path) -> std::io:
 }
 
 /// max |m x B_eff| over grid (Tesla) for reporting convergence
-fn max_torque_inf(grid: &Grid2D, m: &VectorField2D, params: &LLGParams, material: &Material, mask: FieldMask) -> f64 {
+fn max_torque_inf(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    params: &LLGParams,
+    material: &Material,
+    mask: FieldMask,
+) -> f64 {
     let mut b_eff = VectorField2D::new(*grid);
     build_h_eff_masked(grid, m, &mut b_eff, params, material, mask);
 
@@ -100,13 +106,13 @@ fn main() -> std::io::Result<()> {
     };
 
     // ---------------- Initial condition ----------------
-    let eps:f64 = 0.05; // tilt magnitude
+    let eps: f64 = 0.05; // tilt magnitude
     let mut m = VectorField2D::new(grid);
 
     // Near-uniform tilted state (matches MuMax IC)
-    let mx0:f64 = eps;
-    let my0:f64 = 0.0;
-    let mz0:f64 = (1.0 - eps * eps).sqrt();
+    let mx0: f64 = eps;
+    let my0: f64 = 0.0;
+    let mz0: f64 = (1.0 - eps * eps).sqrt();
     m.set_uniform(mx0, my0, mz0);
 
     // ---------------- Relaxation params ----------------
@@ -115,8 +121,8 @@ fn main() -> std::io::Result<()> {
     let mut params_relax = LLGParams {
         gamma: GAMMA_E_RAD_PER_S_T,
         alpha: 0.5,
-        dt: 2e-13,                 // initial dt guess (adaptive will adjust)
-        b_ext: [0.0, 0.0, 1e-6],   // tiny bias to remove ±z degeneracy
+        dt: 2e-13,               // initial dt guess (adaptive will adjust)
+        b_ext: [0.0, 0.0, 1e-6], // tiny bias to remove ±z degeneracy
     };
 
     let mut rk23 = RK23Scratch::new(grid);
@@ -150,9 +156,7 @@ fn main() -> std::io::Result<()> {
     let t1 = max_torque_inf(&grid, &m, &params_relax, &material, FieldMask::ExchAnis);
     println!(
         "relax_uniform_noisy: done  max|m×B| = {:.3e} T  (final max_err={:.3e}, dt={:.3e})",
-        t1,
-        settings.max_err,
-        params_relax.dt
+        t1, settings.max_err, params_relax.dt
     );
 
     // ---------------- Output ----------------

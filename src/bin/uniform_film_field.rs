@@ -47,16 +47,18 @@
 //     ├── config.json
 //     └── rust_table_uniform_film.csv
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use llg_sim::config::{FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo};
-use llg_sim::effective_field::{build_h_eff_masked, FieldMask};
+use llg_sim::config::{
+    FieldConfig, GeometryConfig, MaterialConfig, NumericsConfig, RunConfig, RunInfo,
+};
 use llg_sim::effective_field::demag::compute_demag_field;
-use llg_sim::energy::{compute_energy, EnergyBreakdown};
+use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
+use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{step_llg_rk4_recompute_field, RK4Scratch};
+use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
@@ -204,7 +206,14 @@ fn main() -> std::io::Result<()> {
 
         // 2) Base effective field without demag (Zeeman + exchange + anisotropy)
         //    Then we define B_eff = B_base + B_demag.
-        build_h_eff_masked(&grid, m, &mut b_eff_base, &params, &material, FieldMask::ExchAnis);
+        build_h_eff_masked(
+            &grid,
+            m,
+            &mut b_eff_base,
+            &params,
+            &material,
+            FieldMask::ExchAnis,
+        );
         let [bbx, bby, bbz] = avg_vec(&b_eff_base);
         let bex = bbx + bdx;
         let bey = bby + bdy;

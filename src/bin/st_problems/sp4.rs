@@ -46,16 +46,16 @@
 // This produces:
 //   out/st_problems/sp4/sp4_overlay.png
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use llg_sim::effective_field::{build_h_eff_masked, FieldMask};
+use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{step_llg_rk45_recompute_field_adaptive, RK45Scratch};
-use llg_sim::relax::{relax, RelaxSettings, TorqueMetric};
 use llg_sim::llg::RK23Scratch;
+use llg_sim::llg::{RK45Scratch, step_llg_rk45_recompute_field_adaptive};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::relax::{RelaxSettings, TorqueMetric, relax};
 use llg_sim::vec3::{cross, normalize};
 use llg_sim::vector_field::VectorField2D;
 
@@ -72,7 +72,12 @@ fn avg_vec(field: &VectorField2D) -> [f64; 3] {
     [sx / n, sy / n, sz / n]
 }
 
-fn max_torque_inf(grid: &Grid2D, m: &VectorField2D, params: &LLGParams, material: &Material) -> f64 {
+fn max_torque_inf(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    params: &LLGParams,
+    material: &Material,
+) -> f64 {
     // Build full effective field at current m
     let mut b_eff = VectorField2D::new(*grid);
     build_h_eff_masked(grid, m, &mut b_eff, params, material, FieldMask::Full);
@@ -99,9 +104,18 @@ fn field_for_case(case: char) -> [f64; 3] {
 
 fn out_dir_for_case(case: char) -> PathBuf {
     match case {
-        'a' | 'A' => Path::new("runs").join("st_problems").join("sp4").join("sp4a_rust"),
-        'b' | 'B' => Path::new("runs").join("st_problems").join("sp4").join("sp4b_rust"),
-        _ => Path::new("runs").join("st_problems").join("sp4").join("sp4a_rust"),
+        'a' | 'A' => Path::new("runs")
+            .join("st_problems")
+            .join("sp4")
+            .join("sp4a_rust"),
+        'b' | 'B' => Path::new("runs")
+            .join("st_problems")
+            .join("sp4")
+            .join("sp4b_rust"),
+        _ => Path::new("runs")
+            .join("st_problems")
+            .join("sp4")
+            .join("sp4a_rust"),
     }
 }
 
@@ -124,7 +138,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
     // Output times
     let dt_out: f64 = 10e-12; // 10 ps
-    let t_total: f64 = 1e-9;  // 1 ns
+    let t_total: f64 = 1e-9; // 1 ns
     let n_out: usize = (t_total / dt_out).round() as usize; // 100
 
     // RK45 controller (same style as uniform_film_field_rk45.rs)
@@ -162,68 +176,68 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
     let out_dir = out_dir_for_case(case);
     create_dir_all(&out_dir)?;
 
-// --- RELAX stage (B_ext = 0), do NOT write table during relax ---
-let mut params_relax = LLGParams {
-    gamma: GAMMA_E_RAD_PER_S_T,
-    alpha: alpha_run,  // used in relax RHS prefactor
-    dt: dt_relax0,     // initial dt guess for adaptive relax
-    b_ext: [0.0, 0.0, 0.0],
-};
+    // --- RELAX stage (B_ext = 0), do NOT write table during relax ---
+    let mut params_relax = LLGParams {
+        gamma: GAMMA_E_RAD_PER_S_T,
+        alpha: alpha_run, // used in relax RHS prefactor
+        dt: dt_relax0,    // initial dt guess for adaptive relax
+        b_ext: [0.0, 0.0, 0.0],
+    };
 
-// MuMax-like relax: RK23 + energy->torque phases + tolerance tightening
-let mut scratch_rk23 = RK23Scratch::new(grid);
-let mut relax_settings = RelaxSettings {
-    max_err: 1e-5,
-    headroom: 0.8,
-    dt_min: relax_dt_min,
-    dt_max: relax_dt_max,
+    // MuMax-like relax: RK23 + energy->torque phases + tolerance tightening
+    let mut scratch_rk23 = RK23Scratch::new(grid);
+    let mut relax_settings = RelaxSettings {
+        max_err: 1e-5,
+        headroom: 0.8,
+        dt_min: relax_dt_min,
+        dt_max: relax_dt_max,
 
-    // NEW: keep SP4 behaviour exactly the same as before
-    phase1_enabled: true,
-    phase2_enabled: true,
+        // NEW: keep SP4 behaviour exactly the same as before
+        phase1_enabled: true,
+        phase2_enabled: true,
 
-    energy_stride: 3,
-    rel_energy_tol: 1e-12,
-    torque_threshold: Some(relax_torque_tol),
-    torque_check_stride: 1, // keep SP4 behaviour identical
-    tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
-    tighten_floor: 1e-9,
-    max_accepted_steps: 2_000_000,
-    torque_metric: TorqueMetric::Max,
-    torque_plateau_checks: 0,
-    torque_plateau_rel: 1e-3,
-    torque_plateau_min_checks: 5,
-};
+        energy_stride: 3,
+        rel_energy_tol: 1e-12,
+        torque_threshold: Some(relax_torque_tol),
+        torque_check_stride: 1, // keep SP4 behaviour identical
+        tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
+        tighten_floor: 1e-9,
+        max_accepted_steps: 2_000_000,
+        torque_metric: TorqueMetric::Max,
+        torque_plateau_checks: 0,
+        torque_plateau_rel: 1e-3,
+        torque_plateau_min_checks: 5,
+    };
 
-// Log torque before relax (same as before)
-let torque0 = max_torque_inf(&grid, &m, &params_relax, &material);
-println!(
-    "SP4{} relax: start |m x B|_inf = {:.3e}, dt0={:.3e}",
-    case.to_ascii_uppercase(),
-    torque0,
-    params_relax.dt
-);
+    // Log torque before relax (same as before)
+    let torque0 = max_torque_inf(&grid, &m, &params_relax, &material);
+    println!(
+        "SP4{} relax: start |m x B|_inf = {:.3e}, dt0={:.3e}",
+        case.to_ascii_uppercase(),
+        torque0,
+        params_relax.dt
+    );
 
-// Run relax controller (does not advance physical time)
-relax(
-    &grid,
-    &mut m,
-    &mut params_relax,
-    &material,
-    &mut scratch_rk23,
-    FieldMask::Full,          // SP4 includes demag -> Full
-    &mut relax_settings,
-);
+    // Run relax controller (does not advance physical time)
+    relax(
+        &grid,
+        &mut m,
+        &mut params_relax,
+        &material,
+        &mut scratch_rk23,
+        FieldMask::Full, // SP4 includes demag -> Full
+        &mut relax_settings,
+    );
 
-// Log torque after relax
-let torque1 = max_torque_inf(&grid, &m, &params_relax, &material);
-println!(
-    "SP4{} relax: done |m x B|_inf = {:.3e}, final max_err={:.3e}, final dt={:.3e}",
-    case.to_ascii_uppercase(),
-    torque1,
-    relax_settings.max_err,
-    params_relax.dt
-);
+    // Log torque after relax
+    let torque1 = max_torque_inf(&grid, &m, &params_relax, &material);
+    println!(
+        "SP4{} relax: done |m x B|_inf = {:.3e}, final max_err={:.3e}, final dt={:.3e}",
+        case.to_ascii_uppercase(),
+        torque1,
+        relax_settings.max_err,
+        params_relax.dt
+    );
 
     // --- RUN stage (reset time to 0, apply B_ext, write table.csv) ---
     let b_ext = field_for_case(case);
@@ -282,6 +296,10 @@ println!(
         writeln!(w, "{:.16e},{:.16e},{:.16e},{:.16e}", t, mx, my, mz)?;
     }
 
-    println!("SP4{} wrote {:?}", case.to_ascii_uppercase(), out_dir.join("table.csv"));
+    println!(
+        "SP4{} wrote {:?}",
+        case.to_ascii_uppercase(),
+        out_dir.join("table.csv")
+    );
     Ok(())
 }
