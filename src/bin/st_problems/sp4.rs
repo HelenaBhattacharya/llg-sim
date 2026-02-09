@@ -192,21 +192,27 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
         dt_min: relax_dt_min,
         dt_max: relax_dt_max,
 
-        // NEW: keep SP4 behaviour exactly the same as before
+        // Keep SP4 behaviour exactly the same as before
         phase1_enabled: true,
         phase2_enabled: true,
 
         energy_stride: 3,
         rel_energy_tol: 1e-12,
+
+        // SP4 convergence criterion on |m x B|
+        torque_metric: TorqueMetric::Max,
         torque_threshold: Some(relax_torque_tol),
-        torque_check_stride: 1, // keep SP4 behaviour identical
+        torque_check_stride: 1,
+
         tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
         tighten_floor: 1e-9,
         max_accepted_steps: 2_000_000,
-        torque_metric: TorqueMetric::Max,
+
+        // Plateau logic is disabled for SP4.
         torque_plateau_checks: 0,
-        torque_plateau_rel: 1e-3,
-        torque_plateau_min_checks: 5,
+
+        // Fill any additional / newly-added settings fields with defaults.
+        ..Default::default()
     };
 
     // Log torque before relax (same as before)

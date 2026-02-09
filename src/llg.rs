@@ -216,6 +216,14 @@ impl RK23Scratch {
             None
         }
     }
+
+    /// Invalidate the cached effective field for the last accepted state.
+    ///
+    /// Call this whenever external parameters that affect B_eff (e.g. B_ext) may have changed
+    /// between relax calls. This prevents reusing a stale field in torque checks.
+    pub fn invalidate_last_b_eff(&mut self) {
+        self.last_b_eff_valid = false;
+    }
 }
 
 /// Adaptive Bogacki–Shampine RK23 (3(2)) step in relax mode (precession suppressed),

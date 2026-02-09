@@ -16,7 +16,6 @@ use crate::vector_field::VectorField2D;
 
 use rayon::prelude::*;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct MinimizeSettings {
@@ -48,6 +47,10 @@ pub struct MinimizeSettings {
     /// `dm_converged=true` but `converged=false` (caller can then decide to run Relax()).
     pub dm_torque_gate: Option<f64>,
 
+    /// Optional: require max torque to be below this value for dm_stop to count as full convergence.
+    /// Works alongside `dm_torque_gate` (mean torque gate).
+    pub dm_torque_gate_max: Option<f64>,
+
     /// Do not allow dm_stop-based early exit until at least this many iterations have run.
     pub dm_min_iters: usize,
 
@@ -78,6 +81,7 @@ impl Default for MinimizeSettings {
             dm_stop: Some(1e-6),
             dm_samples: 10,
             dm_torque_gate: Some(2e-3),
+            dm_torque_gate_max: Some(5e-3),
             dm_min_iters: 50,
 
             parallel: false,
@@ -115,6 +119,12 @@ pub fn minimize_damping_only(
     let use_parallel = settings.parallel || std::env::var("LLG_MINIMIZE_PAR").is_ok();
     const CHUNK: usize = 2048;
 
+    // Preallocate a per-chunk stats buffer for deterministic aggregation in the parallel path.
+    // This avoids per-iteration allocations and avoids locking.
+    let n_tot = m.data.len();
+    let n_chunks = (n_tot + CHUNK - 1) / CHUNK;
+    let mut stats_buf: Vec<(f64, f64, f64)> = vec![(0.0_f64, 0.0_f64, 0.0_f64); n_chunks];
+
     let mut lambda = settings.lambda0;
     // Track previous *mean* torque for controller decisions (more robust than max torque).
     let mut t_prev_mean = f64::INFINITY;
@@ -135,17 +145,18 @@ pub fn minimize_damping_only(
         let mut max_dm = 0.0;
 
         if use_parallel {
-            let n_tot = m.data.len();
-            let n_chunks = (n_tot + CHUNK - 1) / CHUNK;
+            // Capture lambda by value for thread-safe use in Rayon closures.
+            let lambda_step = lambda;
 
-            // Deterministic aggregation: each chunk writes (tmax, tsum, max_dm) into a fixed slot.
-            let stats = Mutex::new(vec![(0.0_f64, 0.0_f64, 0.0_f64); n_chunks]);
-
-            m.data
-                .par_chunks_mut(CHUNK)
-                .zip(b_eff.data.par_chunks(CHUNK))
-                .enumerate()
-                .for_each(|(ci, (m_chunk, b_chunk))| {
+            // Deterministic aggregation: write chunk stats into preallocated buffer.
+            stats_buf
+                .par_iter_mut()
+                .zip(
+                    m.data
+                        .par_chunks_mut(CHUNK)
+                        .zip(b_eff.data.par_chunks(CHUNK)),
+                )
+                .for_each(|(slot, (m_chunk, b_chunk))| {
                     let mut ltmax = 0.0_f64;
                     let mut ltsum = 0.0_f64;
                     let mut lmax_dm = 0.0_f64;
@@ -165,9 +176,9 @@ pub fn minimize_damping_only(
                         // descent direction: d = (m × B) × m  (damping-only direction)
                         let d = cross(t, m0);
 
-                        let mut x = m0[0] + lambda * d[0];
-                        let mut y = m0[1] + lambda * d[1];
-                        let mut z = m0[2] + lambda * d[2];
+                        let mut x = m0[0] + lambda_step * d[0];
+                        let mut y = m0[1] + lambda_step * d[1];
+                        let mut z = m0[2] + lambda_step * d[2];
 
                         // renormalise
                         let n2 = x * x + y * y + z * z;
@@ -190,12 +201,10 @@ pub fn minimize_damping_only(
                         *mi = [x, y, z];
                     }
 
-                    let mut g = stats.lock().expect("minimize stats mutex poisoned");
-                    g[ci] = (ltmax, ltsum, lmax_dm);
+                    *slot = (ltmax, ltsum, lmax_dm);
                 });
 
-            let g = stats.lock().expect("minimize stats mutex poisoned");
-            for &(ltmax, ltsum, lmax_dm) in g.iter() {
+            for &(ltmax, ltsum, lmax_dm) in stats_buf.iter() {
                 tsum += ltsum;
                 if ltmax > tmax {
                     tmax = ltmax;
@@ -284,11 +293,17 @@ pub fn minimize_damping_only(
                 if dm_hist.len() == settings.dm_samples.max(1)
                     && dm_hist.iter().all(|&v| v < dm_stop)
                 {
-                    let torque_ok = match settings.dm_torque_gate {
+                    let mean_ok = match settings.dm_torque_gate {
                         None => true,
                         Some(g) => tmean <= g,
                     };
-                    // dm_converged=true means dm_stop fired; converged indicates torque gate passed
+                    let max_ok = match settings.dm_torque_gate_max {
+                        None => true,
+                        Some(g) => tmax <= g,
+                    };
+                    let torque_ok = mean_ok && max_ok;
+
+                    // dm_converged=true means dm_stop fired; converged indicates torque gates passed
                     return MinimizeReport {
                         iters: it + 1,
                         final_torque: tmax,
