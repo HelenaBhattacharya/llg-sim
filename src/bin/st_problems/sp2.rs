@@ -1,3 +1,4 @@
+
 // ===============================
 // src/bin/st_problems/sp2.rs (FULL FILE)
 // ===============================
@@ -38,7 +39,12 @@
 //   runs/st_problems/sp2/table.csv
 //
 // Post-process overlay (your existing script):
-//   python3 scripts/compare_sp2.py --mumax-root ... --rust-root ... --metrics --out ...
+// python3 scripts/compare_sp2.py \
+//   --mumax-root mumax_outputs/st_problems/sp2 \
+//   --rust-root runs/st_problems/sp2 \
+//   --metrics \
+//   --out runs/st_problems/sp2/sp2_overlay.png
+
 
 use std::collections::HashSet;
 use std::fs::{create_dir_all, File, OpenOptions};
@@ -73,6 +79,11 @@ const MAX_ACCEPTED_STEPS_REMANENCE: usize = 120_000;
 
 // Default relax tightening floor (CPU-feasible). MuMax uses ~1e-9; on CPU this is often too expensive.
 const RELAX_TIGHTEN_FLOOR: f64 = 1e-6;
+
+// Stricter coercivity floor used only for (by default) the largest SP2 d/lex point.
+// This fixes the d/lex=30 coercivity match without globally tightening all d.
+const HC_TIGHTEN_FLOOR_STRICT_DEFAULT: f64 = 3e-7;
+const HC_TIGHTEN_FLOOR_STRICT_D_LEX_DEFAULT: usize = 30;
 
 // Remanence cache location
 const REM_CACHE_DIR: &str = "runs/st_problems/sp2/cache";
@@ -131,6 +142,45 @@ fn sp2_tighten_floor() -> f64 {
     // Allow tightening floor override without editing code.
     // Smaller = stricter relax (more tightening stages / more steps); larger = faster but less accurate.
     env_f64("SP2_TIGHTEN_FLOOR", RELAX_TIGHTEN_FLOOR)
+}
+
+fn sp2_rem_tighten_floor() -> f64 {
+    // Optional: override remanence relaxation floor without affecting coercivity.
+    env_f64("SP2_REM_TIGHTEN_FLOOR", sp2_tighten_floor())
+}
+
+fn sp2_hc_tighten_floor() -> f64 {
+    // Optional: override coercivity relaxation floor without affecting remanence.
+    env_f64("SP2_HC_TIGHTEN_FLOOR", sp2_tighten_floor())
+}
+
+fn sp2_hc_tighten_floor_strict() -> f64 {
+    env_f64("SP2_HC_TIGHTEN_FLOOR_STRICT", HC_TIGHTEN_FLOOR_STRICT_DEFAULT)
+}
+
+fn sp2_hc_tighten_floor_strict_d_lex() -> usize {
+    env_usize(
+        "SP2_HC_TIGHTEN_FLOOR_STRICT_D_LEX",
+        HC_TIGHTEN_FLOOR_STRICT_D_LEX_DEFAULT,
+    )
+}
+
+fn sp2_hc_tighten_floor_for_d(d_lex: usize) -> f64 {
+    // If the user explicitly sets SP2_HC_TIGHTEN_FLOOR, always respect it.
+    if std::env::var("SP2_HC_TIGHTEN_FLOOR").is_ok() {
+        return sp2_hc_tighten_floor();
+    }
+
+    let base = sp2_hc_tighten_floor();
+    let strict = sp2_hc_tighten_floor_strict().min(base);
+
+    // By default, apply the stricter floor only for a single chosen d/lex value.
+    // (Default: d/lex == 30). Can be adjusted via SP2_HC_TIGHTEN_FLOOR_STRICT_D_LEX.
+    if d_lex == sp2_hc_tighten_floor_strict_d_lex() && strict < base {
+        strict
+    } else {
+        base
+    }
 }
 
 fn sp2_grid_mode() -> String {
@@ -219,13 +269,23 @@ fn msum(field: &VectorField2D) -> f64 {
     m[0] + m[1] + m[2]
 }
 
-fn env_bool_default_true(name: &str) -> bool {
+// fn env_bool_default_true(name: &str) -> bool {
+//     match std::env::var(name) {
+//         Ok(v) => {
+//             let v = v.trim().to_lowercase();
+//             !(v == "0" || v == "false" || v == "off")
+//         }
+//         Err(_) => true,
+//     }
+// }
+
+fn env_bool_default_false(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => {
             let v = v.trim().to_lowercase();
             !(v == "0" || v == "false" || v == "off")
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -443,7 +503,7 @@ fn relax_remanence(
 
     let mut settings = RelaxSettings {
         // Keep MuMax-ish defaults but CPU-feasible floor.
-        tighten_floor: if fast { 1e-5 } else { sp2_tighten_floor() },
+        tighten_floor: if fast { 1e-5 } else { sp2_rem_tighten_floor() },
         max_accepted_steps: if fast { 30_000 } else { MAX_ACCEPTED_STEPS_REMANENCE },
         ..Default::default()
     };
@@ -471,7 +531,6 @@ fn relax_remanence(
     relax_with_report(grid, m, params, material, rk23, FieldMask::Full, &mut settings)
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HcRelaxMode {
     /// Cheap settle used only for coarse bracketing (NOT for the final answer).
@@ -486,6 +545,7 @@ fn relax_coercivity_step(
     material: &Material,
     rk23: &mut RK23Scratch,
     mode: HcRelaxMode,
+    tighten_floor_fine: f64,
 ) -> RelaxReport {
     let fast = sp2_fast_enabled();
 
@@ -519,21 +579,21 @@ fn relax_coercivity_step(
             }
         }
         HcRelaxMode::Fine => {
-            // CPU-friendly MuMax analogue: plateau stopping on MEAN SQUARED torque + tightening.
+            // CPU-friendly MuMax analogue: plateau stopping on MAX torque + tightening.
             RelaxSettings {
                 phase1_enabled: false,
                 phase2_enabled: true,
 
-                torque_metric: TorqueMetric::MeanSq,
+                torque_metric: TorqueMetric::Max,
                 torque_threshold: None, // plateau mode
 
                 max_err: if fast { 2.0e-5 } else { 1.0e-5 },
-                tighten_floor: if fast { 1.0e-5 } else { sp2_tighten_floor() },
+                tighten_floor: if fast { 1.0e-5 } else { tighten_floor_fine },
                 tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
 
                 torque_check_stride: 1,
-                torque_plateau_checks: 1,
-                torque_plateau_min_checks: 1,
+                torque_plateau_checks: 3,
+                torque_plateau_min_checks: 5,
                 torque_plateau_rel: 0.0,
                 torque_plateau_abs: 0.0,
 
@@ -584,6 +644,7 @@ fn find_hc_over_ms_mumax_style(
     material: &Material,
     rk23: &mut RK23Scratch,
     ms: f64,
+    tighten_floor_fine: f64,
 ) -> f64 {
     // Start from the remanent state once.
     m_work.data.clone_from(&m_rem.data);
@@ -610,7 +671,7 @@ fn find_hc_over_ms_mumax_style(
     set_bext_from_bc(params, bc0);
     rk23.invalidate_last_b_eff();
 
-    let multiseed = env_bool_default_true("SP2_HC_MULTI_SEED"); // default ON; set SP2_HC_MULTI_SEED=0 to disable
+    let multiseed = env_bool_default_false("SP2_HC_MULTI_SEED"); // default OFF; set SP2_HC_MULTI_SEED=1 to enable
 
     let mut best_m: VectorField2D;
     let mut best_rep: RelaxReport;
@@ -628,7 +689,7 @@ fn find_hc_over_ms_mumax_style(
         params.dt = 1e-13;
         rk23.invalidate_last_b_eff();
 
-        let rep = relax_coercivity_step(grid, &mut m_cand, params, material, rk23, HcRelaxMode::Fine);
+        let rep = relax_coercivity_step(grid, &mut m_cand, params, material, rk23, HcRelaxMode::Fine, tighten_floor_fine);
         let e = compute_total_energy(grid, &m_cand, material, params.b_ext);
         (m_cand, rep, e)
     };
@@ -711,8 +772,28 @@ fn find_hc_over_ms_mumax_style(
         }
 
         let t0 = Instant::now();
-        let rep = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Bracket);
-        let ms_now = msum(m_work);
+        let mut rep = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Bracket, tighten_floor_fine);
+        let mut ms_now = msum(m_work);
+
+        // If we're effectively at (or near) the MuMax step size and the cheap bracket settle
+        // takes zero accepted steps, upgrade to the Fine criterion so we still follow the
+        // continuation branch near the switching region.
+        if rep.accepted_steps == 0 && step <= 4.0 * target_step {
+            let rep2 = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Fine, tighten_floor_fine);
+            rep = rep2;
+            ms_now = msum(m_work);
+            if sp2_timing_enabled() {
+                println!(
+                    "    [hc_bracket_upgrade] bc/Ms={:.6} step/Ms={:.6} msum={:.6} acc={} stop={:?} tau={:.3e}",
+                    bc_try / ms,
+                    step / ms,
+                    ms_now,
+                    rep.accepted_steps,
+                    rep.stop_reason,
+                    rep.final_torque.unwrap_or(f64::NAN),
+                );
+            }
+        }
 
         if sp2_timing_enabled() {
             println!(
@@ -786,7 +867,7 @@ fn find_hc_over_ms_mumax_style(
 
         loop {
             let t0 = Instant::now();
-            rep_fine = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Fine);
+        rep_fine = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Fine, tighten_floor_fine);
             ms_now = msum(m_work);
 
             if sp2_timing_enabled() {
@@ -840,6 +921,7 @@ pub fn run_sp2() -> std::io::Result<()> {
     let d_min = env_usize("SP2_D_MIN", 29);
     let d_max = env_usize("SP2_D_MAX", 29);
     let rem_only = env_flag("SP2_REM_ONLY");
+    let force = env_flag("SP2_FORCE");
 
     // Exchange length
     let lex: f64 = (2.0 * A_EX / (MU0 * MS * MS)).sqrt();
@@ -847,7 +929,7 @@ pub fn run_sp2() -> std::io::Result<()> {
     println!("SP2: d range = [{}..{}]", d_min, d_max);
     println!("SP2: Ms = {:.3e} A/m, Aex = {:.3e} J/m, Ku = {:.3e}", MS, A_EX, K_U);
     println!("SP2: lex = {:.3e} m", lex);
-    println!("SP2: tighten_floor = {:.1e}", RELAX_TIGHTEN_FLOOR);
+    println!("SP2: tighten_floor = {:.1e}", sp2_tighten_floor());
     println!(
         "SP2: grid_mode = {} (SP2_GRID_MODE), cell/lex = {:.3} (SP2_CELL_OVER_LEX), tighten_floor = {:.1e} (SP2_TIGHTEN_FLOOR)",
         sp2_grid_mode(),
@@ -890,9 +972,12 @@ pub fn run_sp2() -> std::io::Result<()> {
     }
 
     for d_lex in (d_min..=d_max).rev() {
-        if done.contains(&(d_lex as i32)) {
+        if !force && done.contains(&(d_lex as i32)) {
             println!("SP2 d/lex={:>2}: already done; skipping.", d_lex);
             continue;
+        }
+        if force && done.contains(&(d_lex as i32)) {
+            println!("SP2 d/lex={:>2}: already done but SP2_FORCE set; recomputing.", d_lex);
         }
 
         let grid = build_sp2_grid(d_lex, lex);
@@ -997,10 +1082,11 @@ pub fn run_sp2() -> std::io::Result<()> {
             let m_rem = VectorField2D { grid, data: m.data.clone() };
             let mut m_work = VectorField2D::new(grid);
 
+            let hc_floor = sp2_hc_tighten_floor_for_d(d_lex);
             println!("SP2 d/lex={:>2}: coercivity scan start", d_lex);
 
             let t_hc = Instant::now();
-            let hc = find_hc_over_ms_mumax_style(&grid, &mut m_work, &m_rem, &mut params, &material, &mut rk23, MS);
+            let hc = find_hc_over_ms_mumax_style(&grid, &mut m_work, &m_rem, &mut params, &material, &mut rk23, MS, hc_floor);
             println!(
                 "SP2 d/lex={:>2}: coercivity done in {:.1}s  hc/Ms={:.6}",
                 d_lex,
@@ -1027,4 +1113,4 @@ pub fn run_sp2() -> std::io::Result<()> {
 
     println!("\nSP2 complete. Output: {}", table_path.display());
     Ok(())
-}
+}         

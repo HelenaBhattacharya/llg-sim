@@ -66,42 +66,161 @@ def find_rust_table_from_root(root: Path) -> Path:
     return hits[0]
 
 
-def compute_metrics(d_m, mx_m, my_m, hc_m, d_r, mx_r, my_r, hc_r) -> str:
-    # Compare on overlapping d values by nearest-match on integer d/lex
-    dm_int = d_m.astype(int)
-    dr_int = d_r.astype(int)
+def _sanitize_xy(x: Array, y: Array) -> Tuple[Array, Array]:
+    """Remove NaN/inf, sort by x, and drop duplicate x entries."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    x2 = np.asarray(x[mask], dtype=float)
+    y2 = np.asarray(y[mask], dtype=float)
+
+    if x2.size < 2:
+        return x2, y2
+
+    order = np.argsort(x2)
+    x2 = x2[order]
+    y2 = y2[order]
+
+    # Drop duplicate x (keep first occurrence)
+    _, idx = np.unique(x2, return_index=True)
+    idx.sort()
+    return x2[idx], y2[idx]
+
+
+def match_on_common_d_lex(
+    d_m: Array,
+    mx_m: Array,
+    my_m: Array,
+    hc_m: Array,
+    d_r: Array,
+    mx_r: Array,
+    my_r: Array,
+    hc_r: Array,
+) -> Tuple[Array, Array, Array, Array]:
+    """
+    Match MuMax and Rust results on common d/lex values.
+
+    The SP2 tables usually report integer d/lex values. We match using rounded integers
+    and return residuals (Rust - MuMax) on the common d/lex grid.
+    """
+    dm_int = np.rint(d_m).astype(int)
+    dr_int = np.rint(d_r).astype(int)
 
     common = np.intersect1d(dm_int, dr_int)
     if common.size == 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    # Build maps: d_int -> value (take first occurrence)
+    mumax_map = {}
+    for dval in common:
+        idx = np.where(dm_int == dval)[0]
+        if idx.size:
+            i = int(idx[0])
+            mumax_map[int(dval)] = (float(mx_m[i]), float(my_m[i]), float(hc_m[i]))
+
+    rust_map = {}
+    for dval in common:
+        idx = np.where(dr_int == dval)[0]
+        if idx.size:
+            i = int(idx[0])
+            rust_map[int(dval)] = (float(mx_r[i]), float(my_r[i]), float(hc_r[i]))
+
+    # Only keep d where both exist
+    d_common = []
+    dmx = []
+    dmy = []
+    dhc = []
+
+    for dval in sorted(set(mumax_map.keys()) & set(rust_map.keys())):
+        mxm, mym, hcm = mumax_map[dval]
+        mxr, myr, hcr = rust_map[dval]
+        d_common.append(float(dval))
+        dmx.append(mxr - mxm)
+        dmy.append(myr - mym)
+        dhc.append(hcr - hcm)
+
+    return np.array(d_common), np.array(dmx), np.array(dmy), np.array(dhc)
+
+
+def compute_metrics_text(d_common: Array, dmx: Array, dmy: Array, dhc: Array) -> str:
+    """Format terminal metrics for SP2 residuals on the common d/lex grid."""
+    if d_common.size == 0:
         return "No overlapping d/lex values found for metrics."
 
-    def pick(arr_d_int, arr_y, dval):
-        idx = np.where(arr_d_int == dval)[0]
-        return arr_y[idx[0]]
-
-    mx_err = []
-    my_err = []
-    hc_err = []
-
-    for dval in common:
-        mx_err.append(pick(dr_int, mx_r, dval) - pick(dm_int, mx_m, dval))
-        my_err.append(pick(dr_int, my_r, dval) - pick(dm_int, my_m, dval))
-        hc_err.append(pick(dr_int, hc_r, dval) - pick(dm_int, hc_m, dval))
-
-    mx_err = np.array(mx_err)
-    my_err = np.array(my_err)
-    hc_err = np.array(hc_err)
-
-    def rms(x):  # noqa: E741
+    def rmse(x: Array) -> float:
         return float(np.sqrt(np.mean(x * x)))
 
+    def p95(x: Array) -> float:
+        return float(np.quantile(np.abs(x), 0.95))
+
+    def max_abs(x: Array) -> Tuple[float, float]:
+        i = int(np.argmax(np.abs(x)))
+        return float(np.abs(x[i])), float(d_common[i])
+
+    mx_max, mx_at = max_abs(dmx)
+    my_max, my_at = max_abs(dmy)
+    hc_max, hc_at = max_abs(dhc)
+
     lines = [
-        f"Metrics over {common.size} overlapping d/lex values (Rust - MuMax):",
-        f"  mx:  RMS={rms(mx_err):.3e},  max|err|={float(np.max(np.abs(mx_err))):.3e}",
-        f"  my:  RMS={rms(my_err):.3e},  max|err|={float(np.max(np.abs(my_err))):.3e}",
-        f"  hc:  RMS={rms(hc_err):.3e},  max|err|={float(np.max(np.abs(hc_err))):.3e}",
+        f"[metrics] SP2  points matched: {d_common.size}  (residual = Rust − MuMax)",
+        f"  mx_rem: RMSE={rmse(dmx):.3e}  max|Δ|={mx_max:.3e}  p95|Δ|={p95(dmx):.3e}  d/lex@max={mx_at:.0f}",
+        f"  my_rem: RMSE={rmse(dmy):.3e}  max|Δ|={my_max:.3e}  p95|Δ|={p95(dmy):.3e}  d/lex@max={my_at:.0f}",
+        f"  hc/Ms : RMSE={rmse(dhc):.3e}  max|Δ|={hc_max:.3e}  p95|Δ|={p95(dhc):.3e}  d/lex@max={hc_at:.0f}",
     ]
     return "\n".join(lines)
+
+
+def save_residuals_figure(
+    out_path: Path,
+    d_common: Array,
+    dmx: Array,
+    dmy: Array,
+    dhc: Array,
+    *,
+    dpi: int = 250,
+) -> None:
+    """Save residuals plot for SP2 on common d/lex grid (Rust − MuMax)."""
+    if d_common.size == 0:
+        print("[residuals] No overlapping d/lex values; skipping residual plot.")
+        return
+
+    # Sanitize for plotting
+    d_common, dmx = _sanitize_xy(d_common, dmx)
+    d_common2, dmy = _sanitize_xy(d_common, dmy)
+    d_common3, dhc = _sanitize_xy(d_common, dhc)
+
+    # Use the intersection of sanitized d arrays (should be identical, but be safe)
+    # If they differ due to filtering, fall back to the smallest set.
+    n = min(d_common.size, d_common2.size, d_common3.size)
+    d_plot = d_common[:n]
+    dmx = dmx[:n]
+    dmy = dmy[:n]
+    dhc = dhc[:n]
+
+    fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(7.2, 7.6))
+
+    # Top residuals: remanence components
+    ax_top.axhline(0.0, linewidth=0.8)
+    ax_top.plot(d_plot, dmx, "-o", color="red", markersize=3, linewidth=1.2, label="Δmx_rem")
+    ax_top.plot(d_plot, dmy, "-o", color="limegreen", markersize=3, linewidth=1.2, label="Δmy_rem")
+    ax_top.set_xlabel(r"$d/\ell_{ex}$")
+    ax_top.set_ylabel(r"Residual (Rust − MuMax)")
+    ax_top.set_title("SP2 residuals: remanence")
+    ax_top.legend(loc="best", frameon=True)
+    ax_top.grid(False)
+
+    # Bottom residuals: coercivity
+    ax_bot.axhline(0.0, linewidth=0.8)
+    ax_bot.plot(d_plot, dhc, "-o", color="black", markersize=3, linewidth=1.2, label="Δ(Hc/Ms)")
+    ax_bot.set_xlabel(r"$d/\ell_{ex}$")
+    ax_bot.set_ylabel(r"Residual (Rust − MuMax)")
+    ax_bot.set_title("SP2 residuals: coercivity")
+    ax_bot.legend(loc="best", frameon=True)
+    ax_bot.grid(False)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
 
 
 def main() -> None:
@@ -118,7 +237,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("out/st_problems/sp2/sp2_overlay.png"),
                     help="Output PNG path for combined two-panel figure.")
     ap.add_argument("--paper-style", action="store_true", help="Match MuMax3 paper axis limits/ticks.")
-    ap.add_argument("--metrics", action="store_true", help="Print basic error metrics (Rust vs MuMax).")
+    ap.add_argument("--metrics", action="store_true", help="Print metrics on the matched d/lex grid (RMSE, max|Δ|, p95|Δ|).")
     ap.add_argument("--show", action="store_true", help="Show interactive window (also saves PNG).")
     ap.add_argument("--dpi", type=int, default=250, help="PNG DPI.")
     args = ap.parse_args()
@@ -141,8 +260,11 @@ def main() -> None:
     d_m, mx_m, my_m, hc_m = sort_by_d(d_m, mx_m, my_m, hc_m)
     d_r, mx_r, my_r, hc_r = sort_by_d(d_r, mx_r, my_r, hc_r)
 
+    # Residuals on matched d/lex grid (Rust − MuMax)
+    d_common, dmx, dmy, dhc = match_on_common_d_lex(d_m, mx_m, my_m, hc_m, d_r, mx_r, my_r, hc_r)
+
     if args.metrics:
-        print(compute_metrics(d_m, mx_m, my_m, hc_m, d_r, mx_r, my_r, hc_r))
+        print(compute_metrics_text(d_common, dmx, dmy, dhc))
 
     # ---------------------------
     # Combined figure (two panels)
@@ -201,6 +323,10 @@ def main() -> None:
     print(f"Wrote: {args.out}")
     print(f"Using MuMax table: {mumax_table}")
     print(f"Using Rust table:  {rust_table}")
+
+    # Save residuals plot next to overlay
+    residual_path = args.out.parent / f"{args.out.stem}_residuals{args.out.suffix}"
+    save_residuals_figure(residual_path, d_common, dmx, dmy, dhc, dpi=args.dpi)
 
     if args.show:
         plt.show()

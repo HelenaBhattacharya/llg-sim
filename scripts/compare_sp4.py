@@ -98,8 +98,9 @@ def plot_triplet(
     ax.plot(t_ns, mz, label=f"{prefix}mz", marker=marker, linestyle=linestyle, markersize=ms, linewidth=lw)
 
 
+
 # ----------------------------
-# Metrics helpers (NEW)
+# Metrics helpers
 # ----------------------------
 
 def overlap_window(
@@ -127,13 +128,24 @@ def clip_time(t: Array, *ys: Array, lo: float, hi: float) -> Tuple[Array, ...]:
     return out
 
 
-def rmse(a: Array, b: Array) -> float:
-    d = a - b
-    return float(np.sqrt(np.mean(d * d)))
+# New metrics helpers
+def _sanitize_xy(t: Array, y: Array) -> Tuple[Array, Array]:
+    """Remove NaN/inf, sort by time, and drop duplicate time entries."""
+    mask = np.isfinite(t) & np.isfinite(y)
+    t2 = np.asarray(t[mask], dtype=float)
+    y2 = np.asarray(y[mask], dtype=float)
 
+    if t2.size < 2:
+        return t2, y2
 
-def max_abs_err(a: Array, b: Array) -> float:
-    return float(np.max(np.abs(a - b)))
+    order = np.argsort(t2)
+    t2 = t2[order]
+    y2 = y2[order]
+
+    # Drop duplicate times (keep first occurrence)
+    _, idx = np.unique(t2, return_index=True)
+    idx.sort()
+    return t2[idx], y2[idx]
 
 
 def metrics_on_grid(
@@ -141,13 +153,38 @@ def metrics_on_grid(
     y_ref: Array,
     t_other: Array,
     y_other: Array,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float]:
     """
-    Interpolate y_other(t_other) onto t_ref and compute (rmse, max_abs_err).
-    Uses numpy.interp (1D linear interpolation; assumes monotonic t).   [oai_citation:2‡numpy.org](https://numpy.org/devdocs/reference/generated/numpy.interp.html?utm_source=chatgpt.com)
+    Interpolate y_other(t_other) onto t_ref and compute:
+      - RMSE
+      - max |Δm|
+      - p95 |Δm|
+      - t_at_max (seconds)
+
+    This is robust to NaNs/inf and non-monotonic/duplicate time stamps.
     """
-    y_other_i = np.interp(t_ref, t_other, y_other)
-    return rmse(y_ref, y_other_i), max_abs_err(y_ref, y_other_i)
+    t_ref2, y_ref2 = _sanitize_xy(t_ref, y_ref)
+    t_oth2, y_oth2 = _sanitize_xy(t_other, y_other)
+
+    if t_ref2.size < 2 or t_oth2.size < 2:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+
+    y_oth_i = np.interp(t_ref2, t_oth2, y_oth2)
+    res = y_oth_i - y_ref2
+
+    rmse_val = float(np.sqrt(np.mean(res * res)))
+    abs_res = np.abs(res)
+    max_abs = float(np.max(abs_res))
+    p95_abs = float(np.quantile(abs_res, 0.95))
+    i_max = int(np.argmax(abs_res))
+    t_at_max = float(t_ref2[i_max])
+
+    return rmse_val, max_abs, p95_abs, t_at_max
+
+
+def _pct_full_scale(x: float) -> float:
+    """Convert an absolute magnetisation error (|Δm|) to percent of full-scale (FS=1)."""
+    return 100.0 * float(x)
 
 
 def print_metrics_block(
@@ -172,19 +209,126 @@ def print_metrics_block(
     # choose reference grid
     if interp_to == "rust":
         tref = t_r2
-        rm_mx, ma_mx = metrics_on_grid(tref, mx_r2, t_m2, mx_m2)
-        rm_my, ma_my = metrics_on_grid(tref, my_r2, t_m2, my_m2)
-        rm_mz, ma_mz = metrics_on_grid(tref, mz_r2, t_m2, mz_m2)
+        rm_mx, ma_mx, p95_mx, tmx = metrics_on_grid(tref, mx_r2, t_m2, mx_m2)
+        rm_my, ma_my, p95_my, tmy = metrics_on_grid(tref, my_r2, t_m2, my_m2)
+        rm_mz, ma_mz, p95_mz, tmz = metrics_on_grid(tref, mz_r2, t_m2, mz_m2)
     else:
         tref = t_m2
-        rm_mx, ma_mx = metrics_on_grid(tref, mx_m2, t_r2, mx_r2)
-        rm_my, ma_my = metrics_on_grid(tref, my_m2, t_r2, my_r2)
-        rm_mz, ma_mz = metrics_on_grid(tref, mz_m2, t_r2, mz_r2)
+        rm_mx, ma_mx, p95_mx, tmx = metrics_on_grid(tref, mx_m2, t_r2, mx_r2)
+        rm_my, ma_my, p95_my, tmy = metrics_on_grid(tref, my_m2, t_r2, my_r2)
+        rm_mz, ma_mz, p95_mz, tmz = metrics_on_grid(tref, mz_m2, t_r2, mz_r2)
 
     print(f"\n[metrics] {label}  window: t in [{lo:.3e}, {hi:.3e}] s  (interp_to={interp_to})")
-    print(f"  mx: RMSE = {rm_mx:.6e}   max|err| = {ma_mx:.6e}")
-    print(f"  my: RMSE = {rm_my:.6e}   max|err| = {ma_my:.6e}")
-    print(f"  mz: RMSE = {rm_mz:.6e}   max|err| = {ma_mz:.6e}")
+    print(
+        f"  mx: RMSE={rm_mx:.6e}  max|Δm|={ma_mx:.3e} ({_pct_full_scale(ma_mx):.2f}%FS)  "
+        f"p95|Δm|={p95_mx:.3e} ({_pct_full_scale(p95_mx):.2f}%FS)  t@max={tmx:.3e}s"
+    )
+    print(
+        f"  my: RMSE={rm_my:.6e}  max|Δm|={ma_my:.3e} ({_pct_full_scale(ma_my):.2f}%FS)  "
+        f"p95|Δm|={p95_my:.3e} ({_pct_full_scale(p95_my):.2f}%FS)  t@max={tmy:.3e}s"
+    )
+    print(
+        f"  mz: RMSE={rm_mz:.6e}  max|Δm|={ma_mz:.3e} ({_pct_full_scale(ma_mz):.2f}%FS)  "
+        f"p95|Δm|={p95_mz:.3e} ({_pct_full_scale(p95_mz):.2f}%FS)  t@max={tmz:.3e}s"
+    )
+
+
+# ----------------------------
+# Residuals plot helpers (NEW)
+# ----------------------------
+
+def residual_on_grid(
+    t_ref: Array,
+    y_ref: Array,
+    t_other: Array,
+    y_other: Array,
+    *,
+    sign: str = "rust-minus-mumax",
+) -> Array:
+    """
+    Return residuals on t_ref grid, using linear interpolation of y_other onto t_ref.
+
+    sign:
+      - "rust-minus-mumax": residual = y_other_interp - y_ref   (when ref is MuMax)
+      - "mumax-minus-rust": residual = y_ref - y_other_interp
+    """
+    t_ref2, y_ref2 = _sanitize_xy(t_ref, y_ref)
+    t_oth2, y_oth2 = _sanitize_xy(t_other, y_other)
+    y_other_i = np.interp(t_ref2, t_oth2, y_oth2)
+    if sign == "rust-minus-mumax":
+        return y_other_i - y_ref2
+    if sign == "mumax-minus-rust":
+        return y_ref2 - y_other_i
+    raise ValueError(f"Unknown sign='{sign}'")
+
+
+def save_residuals_figure(
+    out_path: Path,
+    # SP4a
+    t_a: Array, mx_a: Array, my_a: Array, mz_a: Array,
+    t_ra: Array, mx_ra: Array, my_ra: Array, mz_ra: Array,
+    # SP4b
+    t_b: Array, mx_b: Array, my_b: Array, mz_b: Array,
+    t_rb: Array, mx_rb: Array, my_rb: Array, mz_rb: Array,
+    *,
+    dpi: int = 200,
+) -> None:
+    """
+    Save a 2-panel residual plot: Δm(t) = Rust(t) - MuMax(t) on the MuMax time grid.
+    """
+    # Overlap windows
+    lo_a, hi_a = overlap_window(t_a, t_ra)
+    lo_b, hi_b = overlap_window(t_b, t_rb)
+
+    # Clip to overlap
+    t_a2, mx_a2, my_a2, mz_a2 = clip_time(t_a, mx_a, my_a, mz_a, lo=lo_a, hi=hi_a)
+    t_ra2, mx_ra2, my_ra2, mz_ra2 = clip_time(t_ra, mx_ra, my_ra, mz_ra, lo=lo_a, hi=hi_a)
+
+    t_b2, mx_b2, my_b2, mz_b2 = clip_time(t_b, mx_b, my_b, mz_b, lo=lo_b, hi=hi_b)
+    t_rb2, mx_rb2, my_rb2, mz_rb2 = clip_time(t_rb, mx_rb, my_rb, mz_rb, lo=lo_b, hi=hi_b)
+
+    # Sanitize time and magnetisation arrays for plotting
+    t_a2s, _ = _sanitize_xy(t_a2, mx_a2)
+    t_b2s, _ = _sanitize_xy(t_b2, mx_b2)
+    t_a_ns = t_a2s * 1e9
+    t_b_ns = t_b2s * 1e9
+
+    # Residuals on sanitized MuMax grids
+    res_a_mx = residual_on_grid(t_a2s, mx_a2, t_ra2, mx_ra2, sign="rust-minus-mumax")
+    res_a_my = residual_on_grid(t_a2s, my_a2, t_ra2, my_ra2, sign="rust-minus-mumax")
+    res_a_mz = residual_on_grid(t_a2s, mz_a2, t_ra2, mz_ra2, sign="rust-minus-mumax")
+
+    res_b_mx = residual_on_grid(t_b2s, mx_b2, t_rb2, mx_rb2, sign="rust-minus-mumax")
+    res_b_my = residual_on_grid(t_b2s, my_b2, t_rb2, my_rb2, sign="rust-minus-mumax")
+    res_b_mz = residual_on_grid(t_b2s, mz_b2, t_rb2, mz_rb2, sign="rust-minus-mumax")
+
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(6, 6))
+    ax1, ax2 = axes
+
+    # SP4a residuals
+    ax1.plot(t_a_ns, res_a_mx, label="Δmx", linewidth=RUST_LW)
+    ax1.plot(t_a_ns, res_a_my, label="Δmy", linewidth=RUST_LW)
+    ax1.plot(t_a_ns, res_a_mz, label="Δmz", linewidth=RUST_LW)
+    ax1.axhline(0.0, linewidth=0.8)
+    ax1.set_title("SP4a residuals (Rust − MuMax)")
+    ax1.set_ylabel("Δm")
+    ax1.legend(fontsize=7, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3)
+
+    # SP4b residuals
+    ax2.plot(t_b_ns, res_b_mx, label="Δmx", linewidth=RUST_LW)
+    ax2.plot(t_b_ns, res_b_my, label="Δmy", linewidth=RUST_LW)
+    ax2.plot(t_b_ns, res_b_mz, label="Δmz", linewidth=RUST_LW)
+    ax2.axhline(0.0, linewidth=0.8)
+    ax2.set_title("SP4b residuals (Rust − MuMax)")
+    ax2.set_xlabel("t (ns)")
+    ax2.set_ylabel("Δm")
+    ax2.legend(fontsize=7, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3)
+
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Wrote {out_path}")
 
 
 def main():
@@ -215,15 +359,14 @@ def main():
         help="Mark the first <mx>=0 crossing time for MuMax and Rust (if present).",
     )
 
-    # NEW: metrics
+    # metrics
     ap.add_argument(
         "--metrics",
         action="store_true",
-        help="Print quantitative comparison metrics (RMSE, max|err|) for mx/my/mz (requires Rust outputs).",
+        help="Print comparison metrics (RMSE, max|Δm|, p95|Δm|, t@max) for mx/my/mz (requires Rust outputs).",
     )
     ap.add_argument(
         "--metrics-tmin",
-        type=float,
         default=None,
         help="Optional metrics window start time in seconds (e.g. 3e-9).",
     )
@@ -264,7 +407,7 @@ def main():
         else:
             print(f"[warn] Rust tables not found at:\n  {ra}\n  {rb}\nContinuing with MuMax only.")
 
-    # --- NEW: metrics printout ---
+    # --- metrics printout ---
     if args.metrics:
         if rust_a is None or rust_b is None:
             print("[metrics] Rust outputs not available; metrics require --rust-root with sp4a_rust/table.csv and sp4b_rust/table.csv")
@@ -289,7 +432,7 @@ def main():
                 interp_to=args.metrics_interp,
             )
 
-    # --- Plot layout ---
+    # --- Plot layout (UNCHANGED) ---
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(6, 6))
     ax_a, ax_b = axes
 
@@ -347,7 +490,28 @@ def main():
         args.out.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(args.out, dpi=200)
         print(f"Wrote {args.out}")
+
+        # --- NEW: residuals plot saved next to overlay ---
+        if rust_a is not None and rust_b is not None:
+            t_ra, mx_ra, my_ra, mz_ra = rust_a
+            t_rb, mx_rb, my_rb, mz_rb = rust_b
+
+            residual_path = args.out.parent / f"{args.out.stem}_residuals{args.out.suffix}"
+            save_residuals_figure(
+                residual_path,
+                # SP4a
+                t_a, mx_a, my_a, mz_a,
+                t_ra, mx_ra, my_ra, mz_ra,
+                # SP4b
+                t_b, mx_b, my_b, mz_b,
+                t_rb, mx_rb, my_rb, mz_rb,
+                dpi=200,
+            )
+        else:
+            print("[residuals] Rust outputs not available; residual plot requires --rust-root.")
+        plt.close(fig)
     else:
+        # Interactive mode unchanged: only show the overlay window
         plt.show()
 
 
