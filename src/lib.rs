@@ -12,3 +12,4 @@ pub mod vec3;
 pub mod vector_field;
 pub mod visualisation;
 pub mod equilibrate;
+pub mod grid_sp2;

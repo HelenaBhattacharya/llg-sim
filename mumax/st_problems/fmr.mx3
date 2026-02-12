@@ -1,0 +1,57 @@
+// mumax/st_problems/fmr.mx3  (cleaner + closer to Rust controls)
+
+lx := 120e-9
+ly := 120e-9
+lz := 10e-9
+
+Nx := 24
+Ny := 24
+Nz := 1
+
+SetGridSize(Nx, Ny, Nz)
+SetCellSize(lx/Nx, ly/Ny, lz/Nz)
+
+// Material
+Msat = 8e5
+Aex  = 1.3e-11
+Ku1  = 0.0
+anisU = vector(0, 0, 1)
+
+// Solver controls (match Rust-style tolerances as closely as MuMax allows)
+MaxErr = 1e-5
+MaxDt  = 5e-12
+MinDt  = 5e-20
+
+// Field magnitude: H=8e4 A/m -> B = mu0 * H
+Hmag := 8e4
+Bmag := mu0 * Hmag
+
+// Directions from Ubermag spec, normalized INSIDE MuMax (no hardcoded components)  [oai_citation:6‡Ubermag](https://ubermag.github.io/examples/notebooks/10-tutorial-standard-problem-fmr.html?utm_source=chatgpt.com)
+e1 := vector(1, 0.715, 0)
+e1 = e1.Div(e1.Len())
+
+e2 := vector(1, 0.7, 0)
+e2 = e2.Div(e2.Len())
+
+// Initial state
+m = uniform(0, 0, 1)
+SaveAs(m, "m_initial")
+
+// Relax stage: alpha=1, 5 ns, B along e1
+alpha = 1.0
+B_ext = e1.Mul(Bmag)
+Run(5e-9)
+SaveAs(m, "m_relaxed")
+
+// Dynamic stage: alpha=0.008, 20 ns, B along e2, record every 5 ps  
+alpha = 0.008
+B_ext = e2.Mul(Bmag)
+
+TableAdd(m)
+TableAutoSave(5e-12)
+
+SaveAs(m, "m_dyn0")
+Run(1e-9)
+SaveAs(m, "m_dyn_1ns")
+Run(19e-9)
+SaveAs(m, "m_final")

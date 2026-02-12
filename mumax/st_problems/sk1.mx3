@@ -1,0 +1,68 @@
+// mumax/sk1.mx3 — Skyrmion in a disk (Ubermag-style)
+// Outputs:
+//   m000000.ovf : initial
+//   m000001.ovf : relaxed
+//   table.txt   : energies + topological charge
+//
+// Geometry: disk diameter 100 nm, thickness 10 nm
+// Params (Ubermag tutorial):
+//   Ms=1.1e6 A/m, A=1.6e-11 J/m, Dind=4e-3 J/m^2, Ku=0.51e6 J/m^3, H=2e5 A/m
+
+Nx := 128
+Ny := 128
+Nz := 1
+
+dx := 100e-9 / Nx
+dy := 100e-9 / Ny
+dz := 10e-9
+
+SetGridSize(Nx, Ny, Nz)
+SetCellSize(dx, dy, dz)
+SetPBC(0, 0, 0)
+
+// Disk geometry
+EdgeSmooth = 8
+SetGeom(Cylinder(100e-9, 10e-9))
+
+// Material
+Msat  = 1.1e6
+Aex   = 1.6e-11
+Dind  = 4e-3
+
+Ku1   = 0.51e6
+anisU = vector(0, 0, 1)
+
+// Ubermag uses H=(0,0,2e5) A/m => B = mu0*H
+Bz := 4*pi*1e-7 * 2e5
+B_ext = vector(0, 0, Bz)
+
+// Relax damping
+alpha = 0.3
+
+// Initial state: +z everywhere, flip core r<10 nm to -z, tiny +y tilt breaks symmetry
+m = uniform(0, 0.02, 1)
+m.SetInShape(circle(20e-9), uniform(0, 0.02, -1))
+
+// Diagnostics
+TableAdd(B_ext)
+TableAdd(E_total)
+TableAdd(E_exch)
+TableAdd(E_anis)
+TableAdd(E_demag)
+TableAdd(E_Zeeman)
+TableAdd(ext_topologicalcharge)
+TableAutoSave(0)
+
+// Save initial
+save(m)
+TableSave()
+
+// Relax
+relax()
+
+// Save relaxed
+save(m)
+TableSave()
+
+// Optional
+saveas(ext_topologicalchargedensity, "qdens_relaxed")

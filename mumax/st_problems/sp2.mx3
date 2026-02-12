@@ -1,38 +1,56 @@
+// mumax/st_problems/sp2.mx3
+//
+// Standard Problem #2 (MuMax3 reference style)
+// Minimal OVF saving:
+//   - remanent state (after relax at B_ext=0)
+//   - coercivity state (state at the step where the scan first reaches msum <= 0)
+//
 // Msat and Aex should not matter
 Msat = 1000e3
-Aex = 10e-12
+Aex  = 10e-12
 
 // exchange length
-lex := sqrt(Aex.GetRegion(0) / (0.5 * mu0 * pow(Msat.GetRegion(0),2)))
-mx := m.comp(0)
-my := m.comp(1)
-mz := m.comp(2)
+lex := sqrt(Aex.GetRegion(0) / (0.5 * mu0 * pow(Msat.GetRegion(0), 2)))
+mx  := m.comp(0)
+my  := m.comp(1)
+mz  := m.comp(2)
 
 // scan magnet size d
-for d := 30; d >= 1; d--{
-Sizex := 5*lex*d
-Sizey := 1*lex*d
-Sizez := 0.1*lex*d
-alpha = 0.5
+for d := 30; d >= 1; d-- {
 
-// choose cells no larger than 0.5*lex
-nx := pow(2, ilogb(Sizex / (5*0.5*lex))) * 5
-ny := nx / 5
-SetGridSize(nx, ny, 1)
-SetCellSize(Sizex/nx, Sizey/ny, Sizez)
+    Sizex := 5 * lex * d
+    Sizey := 1 * lex * d
+    Sizez := 0.1 * lex * d
+    alpha = 0.5
 
-// find remanence
-m = uniform(1, 0.3, 0)
-relax()
-remanence := m.average()
+    // choose cells no larger than 0.5*lex
+    nx := pow(2, ilogb(Sizex/(5*0.5*lex))) * 5
+    ny := nx / 5
+    SetGridSize(nx, ny, 1)
+    SetCellSize(Sizex/nx, Sizey/ny, Sizez)
 
-// find coercivity by scanning applied field
-bc := 0.0
-Ms := Msat.GetRegion(0)
-for bc = 0.0445*Ms; (mx.average()+my.average()+mz.average()) > 0; bc += 0.00005*Ms{
-B_ext = vector(-bc*mu0/sqrt(3), -bc*mu0/sqrt(3), -bc*mu0/sqrt(3))
-relax()
-}
-B_ext = vector(0, 0, 0)
-fprintln("table.txt", d, remanence.x(), remanence.y(), bc/Ms)
+    // find remanence
+    B_ext = vector(0, 0, 0)
+    m = uniform(1, 0.3, 0)
+    relax()
+    remanence := m.average()
+
+    // OVF: remanent relaxed state (one per d)
+    SaveAs(m, sprintf("m_d%02d_rem", d))
+
+    // find coercivity by scanning applied field
+    bc := 0.0
+    Ms := Msat.GetRegion(0)
+
+    for bc = 0.0445*Ms; (mx.average()+my.average()+mz.average()) > 0; bc += 0.00005*Ms {
+        B_ext = vector(-bc*mu0/sqrt(3), -bc*mu0/sqrt(3), -bc*mu0/sqrt(3))
+        relax()
+    }
+
+    // OVF: coercivity (first state at which the loop condition is no longer > 0)
+    // (Saved BEFORE resetting B_ext to zero.)
+    SaveAs(m, sprintf("m_d%02d_hc", d))
+
+    B_ext = vector(0, 0, 0)
+    fprintln("table.txt", d, remanence.x(), remanence.y(), bc/Ms)
 }

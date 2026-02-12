@@ -2,12 +2,16 @@
 
 mod sp2;
 mod sp4;
+mod fmr;
+// mod sk1;
 
 fn usage() -> ! {
     eprintln!(
         "Usage:
   cargo run --release --bin st_problems -- sp2
   cargo run --release --bin st_problems -- sp4 <a|b>
+  cargo run --release --bin st_problems -- fmr
+//   cargo run --release --bin st_problems -- sk1
 "
     );
     std::process::exit(2);
@@ -27,6 +31,14 @@ fn main() -> std::io::Result<()> {
             let c = case.chars().next().unwrap_or('a');
             sp4::run_sp4(c)
         }
+        "fmr" => {
+            // No extra args needed
+            fmr::run_fmr()
+        }
+        // "sk1" => {
+        //     // No extra args needed
+        //     sk1::run_sk1()
+        // }
         _ => usage(),
     }
 }

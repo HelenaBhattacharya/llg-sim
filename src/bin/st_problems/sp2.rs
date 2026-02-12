@@ -1,4 +1,3 @@
-
 // ===============================
 // src/bin/st_problems/sp2.rs (FULL FILE)
 // ===============================
@@ -6,45 +5,43 @@
 // Standard Problem #2 (MuMag): remanence and coercivity vs d/lex.
 //
 // Reference: MuMax3 paper, Appendix A script “Standard Problem 2 (Figs. 13 and 14)”.
-// Key requirement for accuracy: coercivity is obtained from a *path-dependent* hysteresis scan
-// where the system is relaxed at *every* field step using the previous relaxed state as the seed.
 //
-// This rewrite makes SP2 behave much closer to MuMax:
+// MuMax coercivity logic (core truth):
+//   bc := 0.0445*Ms
+//   for (mx+my+mz) > 0 {
+//       B_ext = -bc*mu0*(1,1,1)/sqrt(3)
+//       Relax()
+//       bc += 0.00005*Ms
+//   }
 //
-//   1) Remanence:
-//        m = uniform(1, 0.3, 0);  B_ext = 0;  Relax()
-//   2) Coercivity scan:
-//        for bc = 0.0445*Ms; (mx+my+mz) > 0; bc += 0.00005*Ms { Relax() }
+// Important: MuMax does NOT bail out if a step is “hard”.
+// It keeps relaxing/tightening until it settles (MaxErr -> 1e-9).
 //
-// CPU considerations / knobs:
-//   - Each d/lex point is independent -> best run each d on a separate SCARF node.
-//   - We keep a remanence cache (optional, but huge practical win).
-//   - We avoid using Minimize() as the main driver of the hysteresis branch (that biases Hc).
-//     Minimizer is only used as an optional *fallback* or tiny preconditioner.
+// This Rust driver matches that philosophy:
+//  - Pure MuMax-like scan (no bracketing by default).
+//  - If a relax “gate” fails, we DO MORE WORK at the same field point:
+//      - more accepted steps
+//      - tighter floor (towards 1e-9)
+//      - optional tiny minimizer preconditioner
+//    and retry until it passes.
+//
+// Grid policy + remanence cache are kept (your existing setup).
 //
 // Run:
 //   cargo run --release --bin st_problems -- sp2
 //
-// Optional:
-//   SP2_TIMING=1                         -> extra per-step diagnostics
-//   SP2_FAST=1                           -> looser settings for profiling (NOT for accuracy)
-//   SP2_REM_ONLY=1                       -> only compute remanence rows (hc_over_ms = NaN)
-//   SP2_D_MIN=29 SP2_D_MAX=29            -> override d-range without editing code
-//   SP2_STEP_MULT=1                      -> bc step multiplier (1 = MuMax step; >1 is profiling only)
-//   SP2_HC_START_MULT=20                -> starting *bracket* step multiplier for coercivity scan (relative to SP2_STEP_MULT)
-//   SP2_PREMIN=1                         -> enable tiny pre-minimize per coercivity step
-//   SP2_SYM_BREAK=1                      -> tiny deterministic perturbation of one cell at start of hc scan
+// Env (optional, not required for correctness):
+//   SP2_D_MIN / SP2_D_MAX
+//   SP2_FORCE=1
+//   SP2_REM_ONLY=1
+//   SP2_GRID_MODE=mumax|legacy
+//   SP2_CELL_OVER_LEX=0.75
+//   SP2_TIMING=1
+//   SP2_HC_MULTI_SEED=0|1
+//   SP2_HC_MULTI_SEED_AUTO=0|1
+//   SP2_HC_MULTI_SEED_N=2
+//   SP2_HC_MULTI_SEED_STRENGTH=1e-4
 //
-// Output:
-//   runs/st_problems/sp2/table.csv
-//
-// Post-process overlay (your existing script):
-// python3 scripts/compare_sp2.py \
-//   --mumax-root mumax_outputs/st_problems/sp2 \
-//   --rust-root runs/st_problems/sp2 \
-//   --metrics \
-//   --out runs/st_problems/sp2/sp2_overlay.png
-
 
 use std::collections::HashSet;
 use std::fs::{create_dir_all, File, OpenOptions};
@@ -53,51 +50,36 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use llg_sim::effective_field::FieldMask;
+use llg_sim::equilibrate::{
+    equilibrate_remanence, hysteresis_step, HysteresisPolicy, HysteresisStepReport, RemanencePolicy,
+};
 use llg_sim::grid::Grid2D;
+use llg_sim::grid_sp2::{
+    build_sp2_grid, maybe_refine_after_remanence, resample_remanence_to_policy_grid, Sp2GridMode,
+    Sp2GridPolicy,
+};
 use llg_sim::llg::RK23Scratch;
-use llg_sim::minimize::{minimize_damping_only, MinimizeSettings};
 use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, MU0, Material};
-use llg_sim::energy::compute_total_energy;
-use llg_sim::relax::{relax_with_report, RelaxReport, RelaxSettings, RelaxStopReason, TorqueMetric};
 use llg_sim::vec3::normalize;
 use llg_sim::vector_field::VectorField2D;
+use llg_sim::energy::compute_total_energy;
 
 // -------------------------
 // Constants (MuMax SP2)
 // -------------------------
 
-const MS: f64 = 1000e3;      // A/m
-const A_EX: f64 = 10e-12;    // J/m
-const K_U: f64 = 0.0;        // J/m^3 (SP2 uses 0)
+const MS: f64 = 1000e3; // A/m
+const A_EX: f64 = 10e-12; // J/m
+const K_U: f64 = 0.0; // J/m^3
 
-// MuMax SP2 coercivity scan parameters
-const BC0_MULT: f64 = 0.0445;     // start at 0.0445 * Ms
-const BC_STEP_MULT: f64 = 0.00005; // step = 0.00005 * Ms
+const BC0_MULT: f64 = 0.0445;
+const BC_STEP_MULT: f64 = 0.00005;
 
-// Relax caps (safety; prevents infinite loops on CPU)
+const HC_BC_CAP_OVER_MS: f64 = 0.2;
+
 const MAX_ACCEPTED_STEPS_REMANENCE: usize = 120_000;
 
-// Default relax tightening floor (CPU-feasible). MuMax uses ~1e-9; on CPU this is often too expensive.
-const RELAX_TIGHTEN_FLOOR: f64 = 1e-6;
-
-// Stricter coercivity floor used only for (by default) the largest SP2 d/lex point.
-// This fixes the d/lex=30 coercivity match without globally tightening all d.
-const HC_TIGHTEN_FLOOR_STRICT_DEFAULT: f64 = 3e-7;
-const HC_TIGHTEN_FLOOR_STRICT_D_LEX_DEFAULT: usize = 30;
-
-// Remanence cache location
 const REM_CACHE_DIR: &str = "runs/st_problems/sp2/cache";
-
-// Coercivity scan behaviour (CPU-friendly but path-faithful)
-//
-// Strategy:
-//   1) Bracket quickly with a large bc step.
-//   2) Re-scan within the bracket at the MuMax step size, using a MuMax-like Relax() criterion.
-const HC_BC_CAP_OVER_MS: f64 = 0.2;          // safety cap (matches earlier logic)
-const HC_START_MULT_DEFAULT: usize = 20;     // starting bracket step multiplier
-
-// Fine scan settings (MuMax step size) – bounded retries if Relax hits MaxAcceptedSteps.
-const HC_FINE_RETRIES: usize = 2;
 
 // -------------------------
 // Env helpers
@@ -114,10 +96,23 @@ fn env_usize(name: &str, default: usize) -> usize {
     }
 }
 
-#[allow(dead_code)]
 fn env_f64(name: &str, default: f64) -> f64 {
     match std::env::var(name) {
         Ok(s) => s.trim().parse::<f64>().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "1" | "true" | "yes" | "y" | "on" => true,
+                "0" | "false" | "no" | "n" | "off" => false,
+                _ => default,
+            }
+        }
         Err(_) => default,
     }
 }
@@ -126,124 +121,24 @@ fn sp2_timing_enabled() -> bool {
     env_flag("SP2_TIMING")
 }
 
-fn sp2_fast_enabled() -> bool {
-    env_flag("SP2_FAST")
-}
-
-fn step_mult() -> usize {
+fn sp2_step_mult() -> usize {
     env_usize("SP2_STEP_MULT", 1).max(1)
 }
 
-fn hc_start_mult() -> usize {
-    env_usize("SP2_HC_START_MULT", HC_START_MULT_DEFAULT).max(1)
-}
+fn sp2_grid_policy_from_env() -> Sp2GridPolicy {
+    let mut p = Sp2GridPolicy::default();
+    let mode = std::env::var("SP2_GRID_MODE").unwrap_or_else(|_| "mumax".to_string());
+    p.mode = Sp2GridMode::from_str(&mode);
 
-fn sp2_tighten_floor() -> f64 {
-    // Allow tightening floor override without editing code.
-    // Smaller = stricter relax (more tightening stages / more steps); larger = faster but less accurate.
-    env_f64("SP2_TIGHTEN_FLOOR", RELAX_TIGHTEN_FLOOR)
-}
+    p.cell_over_lex = env_f64("SP2_CELL_OVER_LEX", p.cell_over_lex);
+    p.refine_factor = env_f64("SP2_REFINE_FACTOR", p.refine_factor);
+    p.max_refinements = env_usize("SP2_MAX_REFINEMENTS", p.max_refinements);
 
-fn sp2_rem_tighten_floor() -> f64 {
-    // Optional: override remanence relaxation floor without affecting coercivity.
-    env_f64("SP2_REM_TIGHTEN_FLOOR", sp2_tighten_floor())
-}
+    p.nn_angle_rms_threshold = env_f64("SP2_REFINE_NN_RMS", p.nn_angle_rms_threshold);
+    p.nn_angle_max_threshold = env_f64("SP2_REFINE_NN_MAX", p.nn_angle_max_threshold);
+    p.remanence_steps_threshold = env_usize("SP2_REFINE_REM_STEPS", p.remanence_steps_threshold);
 
-fn sp2_hc_tighten_floor() -> f64 {
-    // Optional: override coercivity relaxation floor without affecting remanence.
-    env_f64("SP2_HC_TIGHTEN_FLOOR", sp2_tighten_floor())
-}
-
-fn sp2_hc_tighten_floor_strict() -> f64 {
-    env_f64("SP2_HC_TIGHTEN_FLOOR_STRICT", HC_TIGHTEN_FLOOR_STRICT_DEFAULT)
-}
-
-fn sp2_hc_tighten_floor_strict_d_lex() -> usize {
-    env_usize(
-        "SP2_HC_TIGHTEN_FLOOR_STRICT_D_LEX",
-        HC_TIGHTEN_FLOOR_STRICT_D_LEX_DEFAULT,
-    )
-}
-
-fn sp2_hc_tighten_floor_for_d(d_lex: usize) -> f64 {
-    // If the user explicitly sets SP2_HC_TIGHTEN_FLOOR, always respect it.
-    if std::env::var("SP2_HC_TIGHTEN_FLOOR").is_ok() {
-        return sp2_hc_tighten_floor();
-    }
-
-    let base = sp2_hc_tighten_floor();
-    let strict = sp2_hc_tighten_floor_strict().min(base);
-
-    // By default, apply the stricter floor only for a single chosen d/lex value.
-    // (Default: d/lex == 30). Can be adjusted via SP2_HC_TIGHTEN_FLOOR_STRICT_D_LEX.
-    if d_lex == sp2_hc_tighten_floor_strict_d_lex() && strict < base {
-        strict
-    } else {
-        base
-    }
-}
-
-fn sp2_grid_mode() -> String {
-    std::env::var("SP2_GRID_MODE").unwrap_or_else(|_| "mumax".to_string()).to_lowercase()
-}
-
-fn sp2_cell_over_lex() -> f64 {
-    // MuMax/NIST SP2 commonly targets cellsize ~ 0.75 * lex.
-    // Override if you want to sweep discretisation sensitivity.
-    env_f64("SP2_CELL_OVER_LEX", 0.75)
-}
-
-// -------------------------
-// Geometry helpers
-// -------------------------
-
-fn ilogb_sp2(x: f64) -> i32 {
-    if x <= 0.0 {
-        return 0;
-    }
-    (x.log2().floor() as i32) + 1
-}
-
-fn build_sp2_grid(d_lex: usize, lex: f64) -> Grid2D {
-    let d = d_lex as f64;
-
-    // MuMax SP2 physical sizes
-    let sizex = 5.0 * lex * d;
-    let sizey = 1.0 * lex * d;
-    let sizez = 0.1 * lex * d;
-
-    let mode = sp2_grid_mode();
-
-    if mode == "legacy" {
-        // Legacy rule (kept for backwards-compat comparisons):
-        // x = sizex / (5 * 0.5 * lex) = 2d, choose p so that 2^p >= x, then nx = 5 * 2^p, ny=nx/5.
-        let x = sizex / (5.0 * 0.5 * lex);
-        let p = ilogb_sp2(x);
-        let nx: usize = (2usize.pow(p as u32)) * 5;
-        let ny: usize = nx / 5;
-
-        let dx = sizex / (nx as f64);
-        let dy = sizey / (ny as f64);
-        let dz = sizez;
-
-        return Grid2D::new(nx, ny, dx, dy, dz);
-    }
-
-    // MuMax-style SP2 discretisation: target cellsize ≈ (cell_over_lex * lex) and use pow2 grid dims.
-    // This is the closest practical CPU analogue to the common SP2 reference meshes.
-    let cell = sp2_cell_over_lex().max(0.05) * lex;
-
-    let nx_req = (sizex / cell).ceil().max(1.0) as usize;
-    let ny_req = (sizey / cell).ceil().max(1.0) as usize;
-
-    let nx = nx_req.next_power_of_two();
-    let ny = ny_req.next_power_of_two();
-
-    let dx = sizex / (nx as f64);
-    let dy = sizey / (ny as f64);
-    let dz = sizez;
-
-    Grid2D::new(nx, ny, dx, dy, dz)
+    p
 }
 
 // -------------------------
@@ -261,7 +156,7 @@ fn avg_m(field: &VectorField2D) -> [f64; 3] {
         sy += v[1];
         sz += v[2];
     }
-    [sx / n, sy / n, sz / n]
+    [sx / n.max(1.0), sy / n.max(1.0), sz / n.max(1.0)]
 }
 
 fn msum(field: &VectorField2D) -> f64 {
@@ -269,76 +164,18 @@ fn msum(field: &VectorField2D) -> f64 {
     m[0] + m[1] + m[2]
 }
 
-// fn env_bool_default_true(name: &str) -> bool {
-//     match std::env::var(name) {
-//         Ok(v) => {
-//             let v = v.trim().to_lowercase();
-//             !(v == "0" || v == "false" || v == "off")
-//         }
-//         Err(_) => true,
-//     }
-// }
-
-fn env_bool_default_false(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim().to_lowercase();
-            !(v == "0" || v == "false" || v == "off")
-        }
-        Err(_) => false,
-    }
-}
-
+// -------------------------
+// Small deterministic perturbation (optional multi-seed at bc0)
+// -------------------------
 fn apply_micro_perturb(m: &mut VectorField2D, strength: f64, seed: u32) {
-    if m.data.is_empty() {
-        return;
-    }
+    if m.data.is_empty() { return; }
     let n = m.data.len();
-    let idx = match seed % 3 {
-        0 => 0,
-        1 => n / 2,
-        _ => n - 1,
-    };
+    let idx = match seed % 3 { 0 => 0, 1 => n / 2, _ => n - 1 };
 
     let mut v = m.data[idx];
     v[1] += strength;
     v[2] -= 0.5 * strength;
     m.data[idx] = normalize(v);
-}
-
-// -------------------------
-// Resume support
-// -------------------------
-
-fn read_done_d_values(table_path: &Path) -> std::io::Result<HashSet<i32>> {
-    let mut done = HashSet::new();
-    if !table_path.exists() {
-        return Ok(done);
-    }
-
-    let f = File::open(table_path)?;
-    let mut r = BufReader::new(f);
-    let mut line = String::new();
-
-    // header
-    let _ = r.read_line(&mut line)?;
-    line.clear();
-
-    while r.read_line(&mut line)? > 0 {
-        let s = line.trim();
-        if s.is_empty() {
-            line.clear();
-            continue;
-        }
-        if let Some(first) = s.split(',').next() {
-            if let Ok(dv) = first.trim().parse::<i32>() {
-                done.insert(dv);
-            }
-        }
-        line.clear();
-    }
-
-    Ok(done)
 }
 
 // -------------------------
@@ -489,467 +326,466 @@ fn set_bext_from_bc(params: &mut LLGParams, bc_amps_per_m: f64) {
 }
 
 // -------------------------
-// Relax wrappers (MuMax-like settings)
+// OVF writer (OOMMF OVF 2.0, Data Binary 4)
 // -------------------------
 
-fn relax_remanence(
+fn write_ovf_binary4(
+    path: &Path,
     grid: &Grid2D,
-    m: &mut VectorField2D,
-    params: &mut LLGParams,
-    material: &Material,
-    rk23: &mut RK23Scratch,
-) -> RelaxReport {
-    let fast = sp2_fast_enabled();
-
-    let mut settings = RelaxSettings {
-        // Keep MuMax-ish defaults but CPU-feasible floor.
-        tighten_floor: if fast { 1e-5 } else { sp2_rem_tighten_floor() },
-        max_accepted_steps: if fast { 30_000 } else { MAX_ACCEPTED_STEPS_REMANENCE },
-        ..Default::default()
-    };
-
-    // Remanence: allow energy phase (MuMax style), and use plateau mode on mean torque.
-    // NOTE: compute_total_energy currently recomputes demag; this is expensive but closer to MuMax.
-    // If needed, you can disable Phase 1 via SP2_FAST or by flipping this default later.
-    settings.phase1_enabled = !fast;
-    settings.phase2_enabled = true;
-
-    settings.torque_metric = TorqueMetric::Mean;
-    settings.torque_threshold = None; // plateau mode
-    settings.torque_check_stride = 1;
-    settings.torque_plateau_checks = if fast { 4 } else { 8 };
-    settings.torque_plateau_min_checks = if fast { 4 } else { 8 };
-
-    // Strict MuMax plateau semantics: stop when steady or increasing.
-    // Small abs floor can help deterministic CPU runs avoid chasing numerical noise forever.
-    settings.torque_plateau_rel = 0.0;
-    settings.torque_plateau_abs = if fast { 5e-7 } else { 1e-7 };
-
-    // Reset dt guess for one-off remanence relax.
-    params.dt = 1e-13;
-
-    relax_with_report(grid, m, params, material, rk23, FieldMask::Full, &mut settings)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HcRelaxMode {
-    /// Cheap settle used only for coarse bracketing (NOT for the final answer).
-    Bracket,
-    /// MuMax-like settle used for the fine scan at MuMax step size.
-    Fine,
-}
-fn relax_coercivity_step(
-    grid: &Grid2D,
-    m: &mut VectorField2D,
-    params: &mut LLGParams,
-    material: &Material,
-    rk23: &mut RK23Scratch,
-    mode: HcRelaxMode,
-    tighten_floor_fine: f64,
-) -> RelaxReport {
-    let fast = sp2_fast_enabled();
-
-    // Bracket mode: cheap and bounded.
-    // Fine mode: MuMax-like (plateau on mean torque + tightening).
-    let mut settings = match mode {
-        HcRelaxMode::Bracket => {
-            let max_err = if fast { 2.0e-4 } else { 2.0e-4 };
-            RelaxSettings {
-                phase1_enabled: false,
-                phase2_enabled: true,
-
-                // Loose max-torque threshold so we stop quickly.
-                torque_metric: TorqueMetric::Max,
-                torque_threshold: Some(if fast { 5.0e-3 } else { 5.0e-3 }),
-
-                max_err,
-                tighten_floor: max_err, // single stage
-                tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
-
-                torque_check_stride: if fast { 100 } else { 100 },
-
-                // Plateau unused in threshold mode.
-                torque_plateau_rel: 0.0,
-                torque_plateau_abs: 0.0,
-                torque_plateau_checks: 0,
-                torque_plateau_min_checks: 5,
-
-                max_accepted_steps: if fast { 800 } else { 1200 },
-                ..Default::default()
-            }
-        }
-        HcRelaxMode::Fine => {
-            // CPU-friendly MuMax analogue: plateau stopping on MAX torque + tightening.
-            RelaxSettings {
-                phase1_enabled: false,
-                phase2_enabled: true,
-
-                torque_metric: TorqueMetric::Max,
-                torque_threshold: None, // plateau mode
-
-                max_err: if fast { 2.0e-5 } else { 1.0e-5 },
-                tighten_floor: if fast { 1.0e-5 } else { tighten_floor_fine },
-                tighten_factor: std::f64::consts::FRAC_1_SQRT_2,
-
-                torque_check_stride: 1,
-                torque_plateau_checks: 3,
-                torque_plateau_min_checks: 5,
-                torque_plateau_rel: 0.0,
-                torque_plateau_abs: 0.0,
-
-                max_accepted_steps: if fast { 25_000 } else { 80_000 },
-                ..Default::default()
-            }
-        }
-    };
-
-    // Keep dt warm-start across coercivity steps (important for continuation).
-    // Do NOT reset params.dt here.
-
-    // Defensive: ensure max_err is not below the floor.
-    if settings.max_err < settings.tighten_floor {
-        settings.max_err = settings.tighten_floor;
+    m: &VectorField2D,
+    desc: &str,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
     }
 
-    relax_with_report(grid, m, params, material, rk23, FieldMask::Full, &mut settings)
+    let mut f = BufWriter::new(File::create(path)?);
+
+    // OVF 2.0 header (MuMax/OOMMF compatible)
+    writeln!(f, "# OOMMF OVF 2.0")?;
+    writeln!(f, "# Segment count: 1")?;
+    writeln!(f, "# Begin: Segment")?;
+    writeln!(f, "# Begin: Header")?;
+    writeln!(f, "# Title: m")?;
+    writeln!(f, "# Desc: {}", desc)?;
+    writeln!(f, "# meshunit: m")?;
+    writeln!(f, "# meshtype: rectangular")?;
+
+    // OVF uses cell-centered bases
+    let dx = grid.dx;
+    let dy = grid.dy;
+    let dz = grid.dz;
+    writeln!(f, "# xbase: {:.17e}", 0.5 * dx)?;
+    writeln!(f, "# ybase: {:.17e}", 0.5 * dy)?;
+    writeln!(f, "# zbase: {:.17e}", 0.5 * dz)?;
+
+    writeln!(f, "# xstepsize: {:.17e}", dx)?;
+    writeln!(f, "# ystepsize: {:.17e}", dy)?;
+    writeln!(f, "# zstepsize: {:.17e}", dz)?;
+
+    writeln!(f, "# xnodes: {}", grid.nx)?;
+    writeln!(f, "# ynodes: {}", grid.ny)?;
+    writeln!(f, "# znodes: 1")?;
+
+    writeln!(f, "# xmin: 0")?;
+    writeln!(f, "# xmax: {:.17e}", (grid.nx as f64) * dx)?;
+    writeln!(f, "# ymin: 0")?;
+    writeln!(f, "# ymax: {:.17e}", (grid.ny as f64) * dy)?;
+    writeln!(f, "# zmin: 0")?;
+    writeln!(f, "# zmax: {:.17e}", dz)?;
+
+    writeln!(f, "# valueunit: 1")?;
+    writeln!(f, "# valuemultiplier: 1")?;
+    writeln!(f, "# End: Header")?;
+    writeln!(f, "# Begin: Data Binary 4")?;
+
+    // Binary4 endian check value
+    let check: f32 = 1234567.0;
+    f.write_all(&check.to_le_bytes())?;
+
+    // Data: mx,my,mz per cell (row-major; x fastest)
+    for v in &m.data {
+        let x = v[0] as f32;
+        let y = v[1] as f32;
+        let z = v[2] as f32;
+        f.write_all(&x.to_le_bytes())?;
+        f.write_all(&y.to_le_bytes())?;
+        f.write_all(&z.to_le_bytes())?;
+    }
+
+    writeln!(f)?;
+    writeln!(f, "# End: Data Binary 4")?;
+    writeln!(f, "# End: Segment")?;
+    writeln!(f, "# End: File")?;
+
+    f.flush()?;
+    Ok(())
 }
 
-// Optional tiny pre-minimize: only as a preconditioner (not the main solver).
-fn sp2_preminimize(
+// -------------------------
+// MuMax-like "do not bail" settle helper
+// -------------------------
+
+fn settle_hysteresis_until_gate_passes(
     grid: &Grid2D,
     m: &mut VectorField2D,
-    params: &LLGParams,
+    params: &mut LLGParams,
     material: &Material,
-) {
-    let mut s = MinimizeSettings {
-        torque_threshold: if sp2_fast_enabled() { 2e-3 } else { 8e-4 },
-        max_iters: if sp2_fast_enabled() { 50 } else { 100 },
-        ..Default::default()
-    };
-
-    // Keep it “tiny” by design: this is only to help occasional sticking on CPU.
-    s.parallel = env_flag("LLG_MINIMIZE_PAR");
-    let _ = minimize_damping_only(grid, m, params, material, FieldMask::Full, &s);
+    rk23: &mut RK23Scratch,
+    mask: FieldMask,
+    base_policy: &HysteresisPolicy,
+    is_first: bool,
+) -> HysteresisStepReport {
+    // MuMax SP2: one Relax() per field step. No extra gate-driven escalation loop here.
+    // Gate is kept as a diagnostic (printed), not enforced by doing tons more work.
+    hysteresis_step(grid, m, params, material, rk23, mask, base_policy, is_first)
 }
 
 // -------------------------
-// Coercivity scan (MuMax-like)
+// Coercivity scan (MuMax-like, no bracketing)
 // -------------------------
 
-fn find_hc_over_ms_mumax_style(
+fn find_hc_over_ms_mumax_scan(
     grid: &Grid2D,
     m_work: &mut VectorField2D,
-    m_rem: &VectorField2D,
+    m_seed: &VectorField2D,
     params: &mut LLGParams,
     material: &Material,
     rk23: &mut RK23Scratch,
-    ms: f64,
-    tighten_floor_fine: f64,
+    policy: &HysteresisPolicy,
 ) -> f64 {
-    // Start from the remanent state once.
-    m_work.data.clone_from(&m_rem.data);
+    let ms = material.ms;
 
-    // Optional symmetry breaker (OFF by default): tiny deterministic perturbation of one cell.
-    if env_flag("SP2_SYM_BREAK") && !m_work.data.is_empty() {
-        let i = 0usize;
-        let mut v = m_work.data[i];
-        v[1] += 1e-6;
-        m_work.data[i] = normalize(v);
-    }
+    // Middle-ground accuracy: if the diagnostic gate fails at a field step,
+    // do ONE extra Relax() at the *same* bc with a slightly tighter floor and a modest step-budget bump.
+    // This is still MuMax-like (more Relax at same field), but avoids the unbounded [hc_escalate] loop.
+    let strict_retry_enabled: bool = env_bool("SP2_HC_STRICT_RETRY", true);
+    // Only pay extra work near the switching bifurcation (reduces runtime + avoids unnecessary retries).
+    let crit_window: f64 = env_f64("SP2_HC_CRIT_WINDOW", 0.20);
+    // Optionally enable Phase 1 (energy descent) on the one-shot retry (can help snap into basin near switching).
+    let strict_phase1: bool = env_bool("SP2_HC_STRICT_PHASE1", false);
 
-    let bc0 = BC0_MULT * ms;
-    let target_step = (BC_STEP_MULT * step_mult() as f64) * ms;
-    let bracket_step = (hc_start_mult() as f64) * target_step;
+    let strict_floor: f64 = env_f64("SP2_HC_STRICT_FLOOR", 1e-8);
+    let strict_steps_mult: f64 = env_f64("SP2_HC_STRICT_STEPS_MULT", 2.0);
+    let strict_steps_cap: usize = env_usize("SP2_HC_STRICT_MAX_STEPS", 80_000);
 
-    params.dt = params.dt.clamp(1e-18, 1e-11);
+    // Start from remanence seed.
+    m_work.data.clone_from(&m_seed.data);
 
-    // --- Step 0: settle at bc0 using the *fine* criterion (MuMax scan starts here).
-    //
-    // CPU analogue of MuMax GPU numerical noise:
-    // try a couple of tiny deterministic perturbations at bc0, relax each, and choose
-    // the lowest-energy relaxed state as the continuation seed.
-    set_bext_from_bc(params, bc0);
+    // MuMax step
+    let step = (BC_STEP_MULT * sp2_step_mult() as f64) * ms;
+
+    // Start bc
+    let mut bc = BC0_MULT * ms;
+
+    // Initial point
+    set_bext_from_bc(params, bc);
     rk23.invalidate_last_b_eff();
 
-    let multiseed = env_bool_default_false("SP2_HC_MULTI_SEED"); // default OFF; set SP2_HC_MULTI_SEED=1 to enable
+    let mut rep0 = settle_hysteresis_until_gate_passes(
+        grid,
+        m_work,
+        params,
+        material,
+        rk23,
+        FieldMask::Full,
+        policy,
+        true,
+    );
 
-    let mut best_m: VectorField2D;
-    let mut best_rep: RelaxReport;
-    let mut best_e: f64;
+    // Optional multi-seed at bc0: try small perturbations and pick lowest-energy relaxed state.
+    let multiseed_force = env_bool("SP2_HC_MULTI_SEED", false);
+    let multiseed_auto = env_bool("SP2_HC_MULTI_SEED_AUTO", true);
+    let multiseed_n = env_usize("SP2_HC_MULTI_SEED_N", 2).min(8);
+    let multiseed_strength = env_f64("SP2_HC_MULTI_SEED_STRENGTH", 1e-4);
 
-    let mut try_seed = |seed_id: u32, perturb: bool| -> (VectorField2D, RelaxReport, f64) {
-        // Fresh candidate from the same remanent state each time.
-        let mut m_cand = VectorField2D { grid: *grid, data: m_rem.data.clone() };
+    // State-based trigger: only auto-run if bc0 gate fails (keeps low d/lex untouched).
+    let do_multiseed = multiseed_force || (multiseed_auto && !rep0.relax.gate_passed);
 
-        if perturb {
-            apply_micro_perturb(&mut m_cand, 1e-4, seed_id);
-        }
+    if do_multiseed && multiseed_n > 0 {
+        // Candidate 0 = unperturbed bc0 relaxed state
+        let mut best_ok = rep0.relax.gate_passed;
+        let mut best_e = compute_total_energy(grid, m_work, material, params.b_ext);
+        let mut best_dt = params.dt;
+        let mut best_data = m_work.data.clone();
+        let mut best_rep = rep0.clone();
 
-        // Make seed runs comparable.
-        params.dt = 1e-13;
-        rk23.invalidate_last_b_eff();
+        for sid in 1..=multiseed_n {
+            let mut m_cand = VectorField2D::new(*grid);
+            m_cand.data.clone_from(&m_seed.data);
+            apply_micro_perturb(&mut m_cand, multiseed_strength, sid as u32);
 
-        let rep = relax_coercivity_step(grid, &mut m_cand, params, material, rk23, HcRelaxMode::Fine, tighten_floor_fine);
-        let e = compute_total_energy(grid, &m_cand, material, params.b_ext);
-        (m_cand, rep, e)
-    };
+            // Make seeds comparable
+            params.dt = 1e-13;
+            set_bext_from_bc(params, bc);
+            rk23.invalidate_last_b_eff();
 
-    // Seed 0: unperturbed
-    {
-        let (m_cand, rep, e) = try_seed(0, false);
-        best_m = m_cand;
-        best_rep = rep;
-        best_e = e;
-    }
+            let rep_cand = settle_hysteresis_until_gate_passes(
+                grid,
+                &mut m_cand,
+                params,
+                material,
+                rk23,
+                FieldMask::Full,
+                policy,
+                true,
+            );
 
-    // Seeds 1..2: micro-perturbed (optional)
-    if multiseed {
-        for sid in 1..=2u32 {
-            let (m_cand, rep, e) = try_seed(sid, true);
-            if e < best_e {
-                best_m = m_cand;
-                best_rep = rep;
-                best_e = e;
+            let cand_ok = rep_cand.relax.gate_passed;
+            let cand_e = compute_total_energy(grid, &m_cand, material, params.b_ext);
+            let cand_dt = params.dt;
+
+            // Prefer gate-passed; within that choose lowest energy
+            let better = if cand_ok && !best_ok {
+                true
+            } else if cand_ok == best_ok {
+                cand_e < best_e
+            } else {
+                false
+            };
+
+            if better {
+                best_ok = cand_ok;
+                best_e = cand_e;
+                best_dt = cand_dt;
+                best_data = m_cand.data.clone();
+                best_rep = rep_cand;
             }
         }
+
+        m_work.data.clone_from(&best_data);
+        params.dt = best_dt;
+        rep0 = best_rep;
+
+        if sp2_timing_enabled() {
+            let last = rep0.relax.relax_passes.last();
+            println!(
+                "    [hc_multiseed_bc0] mode={} n={} strength={:.1e} chosen_gate_passed={} E={:.6e} dt={:.3e} torque_mean={:.3e} torque_max={:.3e}",
+                if multiseed_force { "FORCE" } else { "AUTO" },
+                multiseed_n,
+                multiseed_strength,
+                rep0.relax.gate_passed,
+                best_e,
+                params.dt,
+                last.and_then(|r| r.final_torque).unwrap_or(f64::NAN),
+                last.and_then(|r| r.final_torque_max).unwrap_or(f64::NAN),
+            );
+        }
     }
 
-    // Use the best candidate as the bc0 state
-    m_work.data.clone_from(&best_m.data);
-    let rep0 = best_rep;
-    let msum0 = msum(m_work);
+    // One extra Relax at the same bc if the diagnostic gate fails.
+    // We keep the gate diagnostic-only (no extra passes/minimizer), but we tighten the relax floor a bit.
+    if strict_retry_enabled && !rep0.relax.gate_passed && msum(m_work).abs() < crit_window {
+        let mut pol2 = policy.clone();
+
+        // Tighten only a bit (towards MuMax 1e-9), and bump step budget modestly.
+        pol2.relax.tighten_floor = pol2.relax.tighten_floor.min(strict_floor);
+
+        let mut steps = ((pol2.relax.max_accepted_steps as f64) * strict_steps_mult) as usize;
+        if steps < pol2.relax.max_accepted_steps {
+            steps = pol2.relax.max_accepted_steps;
+        }
+        if steps > strict_steps_cap {
+            steps = strict_steps_cap;
+        }
+        pol2.relax.max_accepted_steps = steps;
+
+        // Keep gate diagnostic-only during the retry.
+        pol2.gate.extra_passes = 0;
+        pol2.gate.extra_pass_max_steps_mult = 1.0;
+        pol2.gate.fallback_to_minimize = false;
+
+        // Keep the retry MuMax-like: same field, a bit more work. Optionally add Phase 1.
+        pol2.relax.phase2_enabled = true;
+        if strict_phase1 {
+            pol2.relax.phase1_enabled = true;
+        }
+
+        rk23.invalidate_last_b_eff();
+        rep0 = hysteresis_step(grid, m_work, params, material, rk23, FieldMask::Full, &pol2, false);
+
+        if sp2_timing_enabled() {
+            let last = rep0.relax.relax_passes.last();
+            println!(
+                "    [hc_strict_retry] bc/Ms={:.6} msum={:.6} |msum|<={:.3} gate_passed={} floor={:.1e} steps={} phase1={} torque_mean={:.3e} torque_max={:.3e}",
+                bc / ms,
+                msum(m_work),
+                crit_window,
+                rep0.relax.gate_passed,
+                pol2.relax.tighten_floor,
+                pol2.relax.max_accepted_steps,
+                strict_phase1,
+                last.and_then(|r| r.final_torque).unwrap_or(f64::NAN),
+                last.and_then(|r| r.final_torque_max).unwrap_or(f64::NAN),
+            );
+        }
+    }
 
     if sp2_timing_enabled() {
+        let last = rep0.relax.relax_passes.last();
         println!(
-            "    [hc0/fine]  bc/Ms={:.6} msum={:.6} acc={} rej={} stop={:?} stage={:?} tau={:.3e} dt={:.3e}  (multi_seed={}, E={:.6e})",
-            bc0 / ms,
-            msum0,
-            rep0.accepted_steps,
-            rep0.rejected_steps,
-            rep0.stop_reason,
-            rep0.last_stage_stop,
-            rep0.final_torque.unwrap_or(f64::NAN),
-            rep0.final_dt,
-            if multiseed { "ON" } else { "OFF" },
-            best_e,
+            "    [hc] bc/Ms={:.6} msum={:.6} gate_passed={} dt={:.3e} torque_mean={:.3e} torque_max={:.3e}",
+            bc / ms,
+            msum(m_work),
+            rep0.relax.gate_passed,
+            params.dt,
+            last.and_then(|r| r.final_torque).unwrap_or(f64::NAN),
+            last.and_then(|r| r.final_torque_max).unwrap_or(f64::NAN),
         );
     }
 
-    if msum0 <= 0.0 {
-        return bc0 / ms;
+    if sp2_timing_enabled() && !rep0.relax.gate_passed {
+        println!(
+            "    [hc_gate_warn] gate failed at bc/Ms={:.6} (continuing; MuMax-like single Relax/step)",
+            bc / ms
+        );
     }
 
-    // --- Step 1: bracket quickly with a coarse step.
-    // Important: do NOT let the bracket phase "accept" under-relaxed states.
-    // If a trial point takes 0 accepted steps (no-op) or hits MaxAcceptedSteps,
-    // we shrink the bracket step and retry from the last good (bc_low, m_low).
-    let mut bc_low = bc0;
-    let mut m_low = m_work.data.clone();
+    if msum(m_work) <= 0.0 {
+        return bc / ms;
+    }
 
-    let mut k_bracket: usize = 0;
-    let mut step = bracket_step;
+    // Strict MuMax-style scan: advance by fixed step and Relax each time.
+    while bc + step <= HC_BC_CAP_OVER_MS * ms {
+        bc += step;
 
-    let bc_high: f64 = loop {
-        k_bracket += 1;
-
-        let bc_try = bc_low + step;
-
-        if bc_try >= HC_BC_CAP_OVER_MS * ms {
-            println!(
-                "    WARNING: hc_bracket reached bc cap without switching; returning bc/Ms at cap (bc/Ms={:.6}).",
-                (HC_BC_CAP_OVER_MS * ms) / ms
-            );
-            return (HC_BC_CAP_OVER_MS * ms) / ms;
-        }
-
-        // Always start attempt from last accepted unswitched state.
-        m_work.data.clone_from(&m_low);
-        set_bext_from_bc(params, bc_try);
+        set_bext_from_bc(params, bc);
         rk23.invalidate_last_b_eff();
 
-        if env_flag("SP2_PREMIN") {
-            sp2_preminimize(grid, m_work, params, material);
-        }
+        let mut rep = settle_hysteresis_until_gate_passes(
+            grid,
+            m_work,
+            params,
+            material,
+            rk23,
+            FieldMask::Full,
+            policy,
+            false,
+        );
 
-        let t0 = Instant::now();
-        let mut rep = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Bracket, tighten_floor_fine);
-        let mut ms_now = msum(m_work);
+        // One extra Relax at the same bc if the diagnostic gate fails.
+        if strict_retry_enabled && !rep.relax.gate_passed && msum(m_work).abs() < crit_window {
+            let mut pol2 = policy.clone();
 
-        // If we're effectively at (or near) the MuMax step size and the cheap bracket settle
-        // takes zero accepted steps, upgrade to the Fine criterion so we still follow the
-        // continuation branch near the switching region.
-        if rep.accepted_steps == 0 && step <= 4.0 * target_step {
-            let rep2 = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Fine, tighten_floor_fine);
-            rep = rep2;
-            ms_now = msum(m_work);
+            pol2.relax.tighten_floor = pol2.relax.tighten_floor.min(strict_floor);
+
+            let mut steps = ((pol2.relax.max_accepted_steps as f64) * strict_steps_mult) as usize;
+            if steps < pol2.relax.max_accepted_steps {
+                steps = pol2.relax.max_accepted_steps;
+            }
+            if steps > strict_steps_cap {
+                steps = strict_steps_cap;
+            }
+            pol2.relax.max_accepted_steps = steps;
+
+            pol2.gate.extra_passes = 0;
+            pol2.gate.extra_pass_max_steps_mult = 1.0;
+            pol2.gate.fallback_to_minimize = false;
+
+            // Keep the retry MuMax-like: same field, a bit more work. Optionally add Phase 1.
+            pol2.relax.phase2_enabled = true;
+            if strict_phase1 {
+                pol2.relax.phase1_enabled = true;
+            }
+
+            rk23.invalidate_last_b_eff();
+            rep = hysteresis_step(grid, m_work, params, material, rk23, FieldMask::Full, &pol2, false);
+
             if sp2_timing_enabled() {
+                let last = rep.relax.relax_passes.last();
                 println!(
-                    "    [hc_bracket_upgrade] bc/Ms={:.6} step/Ms={:.6} msum={:.6} acc={} stop={:?} tau={:.3e}",
-                    bc_try / ms,
-                    step / ms,
-                    ms_now,
-                    rep.accepted_steps,
-                    rep.stop_reason,
-                    rep.final_torque.unwrap_or(f64::NAN),
+                    "    [hc_strict_retry] bc/Ms={:.6} msum={:.6} |msum|<={:.3} gate_passed={} floor={:.1e} steps={} phase1={} torque_mean={:.3e} torque_max={:.3e}",
+                    bc / ms,
+                    msum(m_work),
+                    crit_window,
+                    rep.relax.gate_passed,
+                    pol2.relax.tighten_floor,
+                    pol2.relax.max_accepted_steps,
+                    strict_phase1,
+                    last.and_then(|r| r.final_torque).unwrap_or(f64::NAN),
+                    last.and_then(|r| r.final_torque_max).unwrap_or(f64::NAN),
                 );
             }
         }
 
         if sp2_timing_enabled() {
+            let last = rep.relax.relax_passes.last();
             println!(
-                "    [hc_bracket] k={:>3} bc/Ms={:.6} step/Ms={:.6} msum={:.6} acc={} stop={:?} tau={:.3e} ({:.3}s)",
-                k_bracket,
-                bc_try / ms,
-                step / ms,
-                ms_now,
-                rep.accepted_steps,
-                rep.stop_reason,
-                rep.final_torque.unwrap_or(f64::NAN),
-                t0.elapsed().as_secs_f64(),
+                "    [hc] bc/Ms={:.6} msum={:.6} gate_passed={} dt={:.3e} torque_mean={:.3e} torque_max={:.3e}",
+                bc / ms,
+                msum(m_work),
+                rep.relax.gate_passed,
+                params.dt,
+                last.and_then(|r| r.final_torque).unwrap_or(f64::NAN),
+                last.and_then(|r| r.final_torque_max).unwrap_or(f64::NAN),
             );
         }
 
-        // If the bracket relax couldn't do work (no-op) OR hit its step cap, don't accept it.
-        // Instead refine the step and retry from the same low state.
-        let bad_bracket_point = rep.accepted_steps == 0 || rep.stop_reason == RelaxStopReason::MaxAcceptedSteps;
-        if bad_bracket_point && step > target_step {
-            step *= 0.5;
-            if step < target_step {
-                step = target_step;
-            }
-            if sp2_timing_enabled() {
-                println!(
-                    "    [hc_bracket_refine] rejected bc/Ms={:.6} (acc={}, stop={:?}); shrinking step -> step/Ms={:.6}",
-                    bc_try / ms,
-                    rep.accepted_steps,
-                    rep.stop_reason,
-                    step / ms
-                );
-            }
-            continue;
-        }
-
-        // Switched?
-        if ms_now <= 0.0 {
-            break bc_try;
-        }
-
-        // Not switched and "good enough": accept as new low state.
-        bc_low = bc_try;
-        m_low.clone_from(&m_work.data);
-
-        if k_bracket > 800 {
+        if sp2_timing_enabled() && !rep.relax.gate_passed {
             println!(
-                "    WARNING: hc_bracket exceeded 800 iterations; returning current bc_low/Ms={:.6}.",
-                bc_low / ms
+                "    [hc_gate_warn] gate failed at bc/Ms={:.6} (continuing; MuMax-like single Relax/step)",
+                bc / ms
             );
-            return bc_low / ms;
-        }
-    };
-
-    // --- Step 2: fine scan within the bracket at MuMax step size.
-    m_work.data.clone_from(&m_low);
-
-    let n_steps = (((bc_high - bc_low) / target_step).ceil() as usize).max(1);
-
-    for i in 0..=n_steps {
-        let mut bc_fine = bc_low + (i as f64) * target_step;
-        if bc_fine > bc_high {
-            bc_fine = bc_high;
         }
 
-        set_bext_from_bc(params, bc_fine);
-        rk23.invalidate_last_b_eff();
-
-        let mut rep_fine;
-        let mut ms_now;
-        let mut tries = 0usize;
-
-        loop {
-            let t0 = Instant::now();
-        rep_fine = relax_coercivity_step(grid, m_work, params, material, rk23, HcRelaxMode::Fine, tighten_floor_fine);
-            ms_now = msum(m_work);
-
-            if sp2_timing_enabled() {
-                println!(
-                    "    [hc_fine] i={:>3}/{:>3} bc/Ms={:.6} msum={:.6} acc={} stop={:?} tau={:.3e} ({:.3}s)",
-                    i,
-                    n_steps,
-                    bc_fine / ms,
-                    ms_now,
-                    rep_fine.accepted_steps,
-                    rep_fine.stop_reason,
-                    rep_fine.final_torque.unwrap_or(f64::NAN),
-                    t0.elapsed().as_secs_f64(),
-                );
-            }
-
-            if rep_fine.stop_reason != RelaxStopReason::MaxAcceptedSteps {
-                break;
-            }
-            if tries >= HC_FINE_RETRIES {
-                break;
-            }
-
-            if env_flag("SP2_PREMIN") {
-                sp2_preminimize(grid, m_work, params, material);
-            }
-
-            tries += 1;
-        }
-
-        if ms_now <= 0.0 {
-            return bc_fine / ms;
-        }
-
-        if bc_fine >= bc_high {
-            break;
+        if msum(m_work) <= 0.0 {
+            return bc / ms;
         }
     }
 
-    println!(
-        "    WARNING: hc_fine did not detect switching within bracket; returning bc_high/Ms={:.6}",
-        bc_high / ms
-    );
-    bc_high / ms
+    // Hit cap without switching
+    HC_BC_CAP_OVER_MS
 }
+
+// -------------------------
+// Resume support
+// -------------------------
+
+fn read_done_d_values(table_path: &Path) -> std::io::Result<HashSet<i32>> {
+    let mut done = HashSet::new();
+    if !table_path.exists() {
+        return Ok(done);
+    }
+
+    let f = File::open(table_path)?;
+    let mut r = BufReader::new(f);
+    let mut line = String::new();
+
+    let _ = r.read_line(&mut line)?; // header
+    line.clear();
+
+    while r.read_line(&mut line)? > 0 {
+        let s = line.trim();
+        if s.is_empty() {
+            line.clear();
+            continue;
+        }
+        if let Some(first) = s.split(',').next() {
+            if let Ok(dv) = first.trim().parse::<i32>() {
+                done.insert(dv);
+            }
+        }
+        line.clear();
+    }
+
+    Ok(done)
+}
+
 // -------------------------
 // Entry point
 // -------------------------
 
 pub fn run_sp2() -> std::io::Result<()> {
-    let d_min = env_usize("SP2_D_MIN", 29);
-    let d_max = env_usize("SP2_D_MAX", 29);
+    let d_min = env_usize("SP2_D_MIN", 1);
+    let d_max = env_usize("SP2_D_MAX", 30);
     let rem_only = env_flag("SP2_REM_ONLY");
     let force = env_flag("SP2_FORCE");
 
     // Exchange length
     let lex: f64 = (2.0 * A_EX / (MU0 * MS * MS)).sqrt();
 
+    let grid_policy = sp2_grid_policy_from_env();
+
     println!("SP2: d range = [{}..{}]", d_min, d_max);
-    println!("SP2: Ms = {:.3e} A/m, Aex = {:.3e} J/m, Ku = {:.3e}", MS, A_EX, K_U);
     println!("SP2: lex = {:.3e} m", lex);
-    println!("SP2: tighten_floor = {:.1e}", sp2_tighten_floor());
     println!(
-        "SP2: grid_mode = {} (SP2_GRID_MODE), cell/lex = {:.3} (SP2_CELL_OVER_LEX), tighten_floor = {:.1e} (SP2_TIGHTEN_FLOOR)",
-        sp2_grid_mode(),
-        sp2_cell_over_lex(),
-        sp2_tighten_floor(),
+        "SP2: grid_mode = {:?}, cell/lex = {:.3}, max_refinements={}",
+        grid_policy.mode, grid_policy.cell_over_lex, grid_policy.max_refinements
     );
-    println!("SP2: hc bc0/Ms = {:.6}, step/Ms = {:.6} (mult={})", BC0_MULT, BC_STEP_MULT, step_mult());
     println!(
-        "SP2: hc bracket start mult = {} (env SP2_HC_START_MULT)",
-        hc_start_mult()
+        "SP2: hc start bc/Ms = {:.6}, step/Ms = {:.6} (mult={})",
+        BC0_MULT,
+        BC_STEP_MULT,
+        sp2_step_mult()
     );
-    println!("SP2: fast mode = {}", if sp2_fast_enabled() { "ON" } else { "OFF" });
     println!("SP2: rem_only = {}", if rem_only { "ON" } else { "OFF" });
-    println!("SP2: premin per hc step = {}", if env_flag("SP2_PREMIN") { "ON" } else { "OFF" });
 
     let out_dir = Path::new("runs").join("st_problems").join("sp2");
     create_dir_all(&out_dir)?;
+    let ovf_dir = out_dir.join("ovf");
+    create_dir_all(&ovf_dir)?;
     let table_path = out_dir.join("table.csv");
 
-    // Resume support
     let done = read_done_d_values(&table_path)?;
     if !done.is_empty() {
         println!(
@@ -959,7 +795,6 @@ pub fn run_sp2() -> std::io::Result<()> {
         );
     }
 
-    // Open output (append), write header if needed
     let file_exists = table_path.exists();
     let f = OpenOptions::new().create(true).append(true).open(&table_path)?;
     let mut w = BufWriter::new(f);
@@ -968,7 +803,6 @@ pub fn run_sp2() -> std::io::Result<()> {
     if need_header {
         writeln!(w, "d_lex,mx_rem,my_rem,hc_over_ms")?;
         w.flush()?;
-        println!("SP2: wrote header -> {}", table_path.display());
     }
 
     for d_lex in (d_min..=d_max).rev() {
@@ -976,22 +810,12 @@ pub fn run_sp2() -> std::io::Result<()> {
             println!("SP2 d/lex={:>2}: already done; skipping.", d_lex);
             continue;
         }
-        if force && done.contains(&(d_lex as i32)) {
-            println!("SP2 d/lex={:>2}: already done but SP2_FORCE set; recomputing.", d_lex);
-        }
 
-        let grid = build_sp2_grid(d_lex, lex);
+        // Build baseline grid
+        let policy_now = grid_policy.clone();
+        let mut grid = build_sp2_grid(d_lex, lex, &policy_now);
 
-        println!(
-            "\nSP2 d/lex={:>2}: start (nx={}, ny={}, dx/lex={:.3}, dy/lex={:.3}, dz/lex={:.3})",
-            d_lex,
-            grid.nx,
-            grid.ny,
-            grid.dx / lex,
-            grid.dy / lex,
-            grid.dz / lex
-        );
-
+        // Material + params
         let material = Material {
             ms: MS,
             a_ex: A_EX,
@@ -1003,108 +827,205 @@ pub fn run_sp2() -> std::io::Result<()> {
 
         let mut params = LLGParams {
             gamma: GAMMA_E_RAD_PER_S_T,
-            alpha: 0.5, // physical alpha for LLG; relax dynamics are precession-suppressed anyway
+            alpha: 0.5,
             dt: 1e-13,
             b_ext: [0.0, 0.0, 0.0],
         };
 
+        println!(
+            "\nSP2 d/lex={:>2}: start (nx={}, ny={}, dx/lex={:.3}, dy/lex={:.3}, dz/lex={:.3})",
+            d_lex,
+            grid.nx,
+            grid.ny,
+            grid.dx / lex,
+            grid.dy / lex,
+            grid.dz / lex
+        );
+
+        // Remanence: load cache or equilibrate
         let mut rk23 = RK23Scratch::new(grid);
 
-        // -------------------------
-        // Remanence (cacheable)
-        // -------------------------
-        let cache_path = rem_cache_path(d_lex, &grid);
+        let mut rem_report = None;
+        let mut m_rem = {
+            let cache_path = rem_cache_path(d_lex, &grid);
+            if let Some(m_cached) = read_rem_cache(&cache_path, d_lex, &grid)? {
+                println!("SP2 d/lex={:>2}: rem cache HIT -> {}", d_lex, cache_path.display());
+                m_cached
+            } else {
+                println!("SP2 d/lex={:>2}: rem cache MISS -> equilibrate", d_lex);
+                let mut m0 = VectorField2D::new(grid);
+                let u0 = normalize([1.0, 0.3, 0.0]);
+                m0.set_uniform(u0[0], u0[1], u0[2]);
 
-        let m = if let Some(m_cached) = read_rem_cache(&cache_path, d_lex, &grid)? {
-            println!("SP2 d/lex={:>2}: remanence cache HIT -> {}", d_lex, cache_path.display());
-            m_cached
-        } else {
-            println!("SP2 d/lex={:>2}: remanence cache MISS -> Relax()", d_lex);
+                params.b_ext = [0.0, 0.0, 0.0];
 
-            let mut m0 = VectorField2D::new(grid);
-            let u0 = normalize([1.0, 0.3, 0.0]);
-            m0.set_uniform(u0[0], u0[1], u0[2]);
+                let mut rem_pol = RemanencePolicy::default();
+                rem_pol.relax.tighten_floor = env_f64("SP2_REM_TIGHTEN_FLOOR", 1e-6);
+                rem_pol.relax.max_accepted_steps = MAX_ACCEPTED_STEPS_REMANENCE;
 
-            params.b_ext = [0.0, 0.0, 0.0];
-
-            let t_rem = Instant::now();
-            let rep = relax_remanence(&grid, &mut m0, &mut params, &material, &mut rk23);
-
-            if sp2_timing_enabled() {
-                println!(
-                    "  [rem] relax: acc={} rej={} stop={:?} stage={:?} tau={:.3e} dt={:.3e} ({:.2}s)",
-                    rep.accepted_steps,
-                    rep.rejected_steps,
-                    rep.stop_reason,
-                    rep.last_stage_stop,
-                    rep.final_torque.unwrap_or(f64::NAN),
-                    rep.final_dt,
-                    t_rem.elapsed().as_secs_f64(),
+                let t0 = Instant::now();
+                let rep = equilibrate_remanence(
+                    &grid,
+                    &mut m0,
+                    &mut params,
+                    &material,
+                    &mut rk23,
+                    FieldMask::Full,
+                    &rem_pol,
                 );
-                if rep.accepted_steps == 0 {
-                    println!("  WARNING: remanence relax accepted_steps==0 (no-op).");
+                rem_report = rep.relax_passes.last().cloned();
+
+                if sp2_timing_enabled() {
+                    println!(
+                        "  [rem] passes={} gate_passed={} ({:.2}s)",
+                        rep.relax_passes.len(),
+                        rep.gate_passed,
+                        t0.elapsed().as_secs_f64()
+                    );
+                } else {
+                    println!("  [rem] done in {:.2}s", t0.elapsed().as_secs_f64());
                 }
-            } else {
-                println!("  [rem] done in {:.2}s  stop={:?}", t_rem.elapsed().as_secs_f64(), rep.stop_reason);
-            }
 
-            // Cache only if we didn't hit the accepted-step cap.
-            if rep.stop_reason != RelaxStopReason::MaxAcceptedSteps {
-                let hdr = RemCacheHeader::new(d_lex, &grid);
-                write_rem_cache(&cache_path, hdr, &m0)?;
-                println!("SP2 d/lex={:>2}: cached remanence -> {}", d_lex, cache_path.display());
-            } else {
-                println!("SP2 d/lex={:>2}: WARNING: remanence relax hit MaxAcceptedSteps; NOT caching.", d_lex);
-            }
+                // Cache the final remanence state (even if gate didn’t pass; remanence is now good in your tests).
+                if let Some(r_last) = rep.relax_passes.last() {
+                    if r_last.accepted_steps < MAX_ACCEPTED_STEPS_REMANENCE {
+                        let hdr = RemCacheHeader::new(d_lex, &grid);
+                        write_rem_cache(&cache_path, hdr, &m0)?;
+                    }
+                }
 
-            m0
+                m0
+            }
         };
 
-        let rem = avg_m(&m);
-        let mx_rem = rem[0];
-        let my_rem = rem[1];
-        let mz_rem = rem[2];
+        // Optional one-shot refinement after remanence (state-based).
+        let refinements_done = 0usize;
+        if let Some(p_refined) =
+            maybe_refine_after_remanence(&m_rem, rem_report.as_ref(), &policy_now, refinements_done)
+        {
+            println!(
+                "SP2 d/lex={:>2}: grid refine triggered: cell/lex {:.3} -> {:.3}",
+                d_lex, policy_now.cell_over_lex, p_refined.cell_over_lex
+            );
+
+            let (g2, mut m2) = resample_remanence_to_policy_grid(d_lex, lex, &p_refined, &m_rem);
+            grid = g2;
+            rk23 = RK23Scratch::new(grid);
+
+            // Re-equilibrate remanence on refined grid
+            params.dt = 1e-13;
+            params.b_ext = [0.0, 0.0, 0.0];
+
+            let mut rem_pol = RemanencePolicy::default();
+            rem_pol.relax.tighten_floor = env_f64("SP2_REM_TIGHTEN_FLOOR", 1e-6);
+            rem_pol.relax.max_accepted_steps = MAX_ACCEPTED_STEPS_REMANENCE;
+
+            let _ = equilibrate_remanence(
+                &grid,
+                &mut m2,
+                &mut params,
+                &material,
+                &mut rk23,
+                FieldMask::Full,
+                &rem_pol,
+            );
+
+            // Cache refined remanence too
+            let cache_path2 = rem_cache_path(d_lex, &grid);
+            let hdr2 = RemCacheHeader::new(d_lex, &grid);
+            let _ = write_rem_cache(&cache_path2, hdr2, &m2);
+
+            m_rem = m2;
+        }
+
+        let rem = avg_m(&m_rem);
         println!(
             "SP2 d/lex={:>2}: rem(mx,my,mz,msum)=({:.6},{:.6},{:.6},{:.6})",
             d_lex,
-            mx_rem,
-            my_rem,
-            mz_rem,
-            mx_rem + my_rem + mz_rem
+            rem[0],
+            rem[1],
+            rem[2],
+            rem[0] + rem[1] + rem[2]
         );
 
-        // -------------------------
-        // Coercivity (MuMax-like scan)
-        // -------------------------
+        // Save remanence state (OVF)
+        let rem_ovf = ovf_dir.join(format!("m_d{}_rem.ovf", d_lex));
+        let rem_desc = format!("SP2 d/lex={} remanence", d_lex);
+        write_ovf_binary4(&rem_ovf, &grid, &m_rem, &rem_desc)?;
+
+        // Coercivity
         let hc_over_ms = if rem_only {
             f64::NAN
         } else {
-            let m_rem = VectorField2D { grid, data: m.data.clone() };
             let mut m_work = VectorField2D::new(grid);
 
-            let hc_floor = sp2_hc_tighten_floor_for_d(d_lex);
-            println!("SP2 d/lex={:>2}: coercivity scan start", d_lex);
+            let mut hpol = HysteresisPolicy::default();
 
-            let t_hc = Instant::now();
-            let hc = find_hc_over_ms_mumax_style(&grid, &mut m_work, &m_rem, &mut params, &material, &mut rk23, MS, hc_floor);
+            // Coercivity: MuMax-like Relax() behaviour
+            hpol.relax.phase1_enabled = false;
+            hpol.relax.phase2_enabled = true;
+            hpol.relax.tighten_factor = std::f64::consts::FRAC_1_SQRT_2;
+
+            // Start tolerance + tightening floor.
+            // Default: 1e-8 (try 1e-7 if you want it faster).
+            hpol.relax.max_err = 1e-5;
+            hpol.relax.tighten_floor = env_f64("SP2_HC_TIGHTEN_FLOOR", 1e-8);
+            hpol.relax.max_accepted_steps = env_usize("SP2_HC_MAX_STEPS", 80_000);
+
+            // Keep Mean torque metric for now (matches your existing gate threshold and printing)
+            hpol.relax.torque_metric = llg_sim::relax::TorqueMetric::Mean;
+            hpol.relax.torque_threshold = None;
+
+            // MuMax-style plateau semantics
+            hpol.relax.torque_plateau_checks = 1;
+            hpol.relax.torque_plateau_min_checks = 1;
+            hpol.relax.torque_plateau_rel = 0.0;
+            hpol.relax.torque_plateau_abs = 0.0;
+
+            // MuMax relaxSteps(N≈3) to reduce torque-check overhead
+            hpol.relax.torque_check_stride = 3;
+
+            // Gate = diagnostic only (don’t spend extra passes/time trying to satisfy it)
+            hpol.gate.torque_gate = Some(env_f64("SP2_HC_TORQUE_GATE", 8e-4));
+            hpol.gate.torque_gate_max = std::env::var("SP2_HC_TORQUE_GATE_MAX")
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok());
+            hpol.gate.extra_passes = 0;
+            hpol.gate.extra_pass_max_steps_mult = 1.0;
+            hpol.gate.fallback_to_minimize = false;
+
+
+            let t0 = Instant::now();
+            let hc = find_hc_over_ms_mumax_scan(
+                &grid,
+                &mut m_work,
+                &m_rem,
+                &mut params,
+                &material,
+                &mut rk23,
+                &hpol,
+            );
             println!(
                 "SP2 d/lex={:>2}: coercivity done in {:.1}s  hc/Ms={:.6}",
                 d_lex,
-                t_hc.elapsed().as_secs_f64(),
+                t0.elapsed().as_secs_f64(),
                 hc
             );
+
+            // Save coercivity final state (OVF)
+            let hc_ovf = ovf_dir.join(format!("m_d{}_hc.ovf", d_lex));
+            let hc_desc = format!("SP2 d/lex={} coercivity final state (hc/Ms={:.6})", d_lex, hc);
+            write_ovf_binary4(&hc_ovf, &grid, &m_work, &hc_desc)?;
+
             hc
         };
-
-        // Restore B_ext = 0 (matches MuMax script end-of-loop)
-        params.b_ext = [0.0, 0.0, 0.0];
 
         writeln!(
             w,
             "{:.0},{:.16e},{:.16e},{:.16e}",
             d_lex as f64,
-            mx_rem,
-            my_rem,
+            rem[0],
+            rem[1],
             hc_over_ms
         )?;
         w.flush()?;
@@ -1113,4 +1034,4 @@ pub fn run_sp2() -> std::io::Result<()> {
 
     println!("\nSP2 complete. Output: {}", table_path.display());
     Ok(())
-}         
+}

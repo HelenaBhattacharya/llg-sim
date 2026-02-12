@@ -119,6 +119,118 @@ fn out_dir_for_case(case: char) -> PathBuf {
     }
 }
 
+fn ovf_name(i: usize) -> String {
+    // Match MuMax naming: m0000000.ovf ... m0000010.ovf
+    format!("m{:07}.ovf", i)
+}
+
+/// Write an OVF 2.0 file that is as close as practical to MuMax output.
+///
+/// We write *text* data (not binary) for robustness and ease of parsing.
+/// This is fine for SP4 where we only store 11 snapshots.
+fn write_ovf2_text_mumax_like(
+    path: &Path,
+    t_s: f64,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    m: &VectorField2D,
+) -> std::io::Result<()> {
+    // MuMax-style rectangular mesh coordinates: xmin=0, xbase=dx/2, xmax=nx*dx, etc.
+    let xmin = 0.0;
+    let ymin = 0.0;
+    let zmin = 0.0;
+    let xmax = (nx as f64) * dx;
+    let ymax = (ny as f64) * dy;
+    let zmax = (nz as f64) * dz;
+
+    let xbase = 0.5 * dx;
+    let ybase = 0.5 * dy;
+    let zbase = 0.5 * dz;
+
+    // Safety check: in SP4 we expect nz=1 and a 2D field length nx*ny.
+    if m.data.len() != nx * ny {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "VectorField2D length mismatch: got {}, expected {} (nx*ny)",
+                m.data.len(),
+                nx * ny
+            ),
+        ));
+    }
+
+    let file = File::create(path)?;
+    let mut w = BufWriter::new(file);
+
+    writeln!(w, "# OOMMF OVF 2.0")?;
+    writeln!(w, "# Segment count: 1")?;
+    writeln!(w, "# Begin: Segment")?;
+    writeln!(w, "# Begin: Header")?;
+    writeln!(w, "# Title: m")?;
+    writeln!(w, "# meshtype: rectangular")?;
+    writeln!(w, "# meshunit: m")?;
+    writeln!(w, "# xmin: {:.16e}", xmin)?;
+    writeln!(w, "# ymin: {:.16e}", ymin)?;
+    writeln!(w, "# zmin: {:.16e}", zmin)?;
+    writeln!(w, "# xmax: {:.16e}", xmax)?;
+    writeln!(w, "# ymax: {:.16e}", ymax)?;
+    writeln!(w, "# zmax: {:.16e}", zmax)?;
+    writeln!(w, "# valuedim: 3")?;
+    writeln!(w, "# valuelabels: m_x m_y m_z")?;
+    writeln!(w, "# valueunits: 1 1 1")?;
+    // Match MuMax convention (double space before `s` is common in their files)
+    writeln!(w, "# Desc: Total simulation time:  {:.16e}  s", t_s)?;
+    writeln!(w, "# xbase: {:.16e}", xbase)?;
+    writeln!(w, "# ybase: {:.16e}", ybase)?;
+    writeln!(w, "# zbase: {:.16e}", zbase)?;
+    writeln!(w, "# xnodes: {}", nx)?;
+    writeln!(w, "# ynodes: {}", ny)?;
+    writeln!(w, "# znodes: {}", nz)?;
+    writeln!(w, "# xstepsize: {:.16e}", dx)?;
+    writeln!(w, "# ystepsize: {:.16e}", dy)?;
+    writeln!(w, "# zstepsize: {:.16e}", dz)?;
+    writeln!(w, "# End: Header")?;
+
+    // Text data block (x fastest, then y, then z)
+    writeln!(w, "# Begin: Data Text")?;
+
+    for k in 0..nz {
+        let _ = k; // nz=1 in SP4, but keep loop for format completeness.
+        for j in 0..ny {
+            for i in 0..nx {
+                // ASSUMPTION: VectorField2D is stored with x-fastest ordering.
+                let idx = j * nx + i;
+                let v = m.data[idx];
+                writeln!(w, "{:.10e} {:.10e} {:.10e}", v[0], v[1], v[2])?;
+            }
+        }
+    }
+
+    writeln!(w, "# End: Data Text")?;
+    writeln!(w, "# End: Segment")?;
+
+    Ok(())
+}
+
+fn write_sp4_ovf_snapshot(
+    out_dir: &Path,
+    snap_idx: usize,
+    t_s: f64,
+    nx: usize,
+    ny: usize,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    m: &VectorField2D,
+) -> std::io::Result<()> {
+    let path = out_dir.join(ovf_name(snap_idx));
+    write_ovf2_text_mumax_like(&path, t_s, nx, ny, 1, dx, dy, dz, m)
+}
+
 pub fn run_sp4(case: char) -> std::io::Result<()> {
     // --- match MuMax SP4 script (your working one) ---
     let nx: usize = 200;
@@ -136,7 +248,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
     let alpha_run: f64 = 0.02;
 
-    // Output times
+    // Output times 
     let dt_out: f64 = 10e-12; // 10 ps
     let t_total: f64 = 1e-9; // 1 ns
     let n_out: usize = (t_total / dt_out).round() as usize; // 100
@@ -245,7 +357,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
         params_relax.dt
     );
 
-    // --- RUN stage (reset time to 0, apply B_ext, write table.csv) ---
+    // --- RUN stage (reset time to 0, apply B_ext, write table.csv + OVF snapshots) ---
     let b_ext = field_for_case(case);
 
     let mut params = LLGParams {
@@ -269,6 +381,17 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
     let tol_time = 1e-18_f64;
     let mut t: f64 = 0.0;
+
+    // MuMax AutoSave(m, 100e-12) equivalent: write m0000000.ovf .. m0000010.ovf
+    // at t = 0, 0.1ns, 0.2ns, ..., 1.0ns (11 snapshots total).
+    let dt_ovf: f64 = 100e-12; // 100 ps
+    let ovf_stride: usize = (dt_ovf / dt_out).round() as usize; // 10
+    debug_assert!(ovf_stride > 0);
+
+    // Snapshot index 0 corresponds to t=0 (after relax, at start of Run)
+    let mut ovf_idx: usize = 0;
+    write_sp4_ovf_snapshot(&out_dir, ovf_idx, 0.0, nx, ny, dx, dy, dz, &m)?;
+    ovf_idx += 1;
 
     for k in 1..=n_out {
         let t_target = (k as f64) * dt_out;
@@ -300,12 +423,19 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
         t = t_target;
         let [mx, my, mz] = avg_vec(&m);
         writeln!(w, "{:.16e},{:.16e},{:.16e},{:.16e}", t, mx, my, mz)?;
+
+        // Write OVF snapshot every 100 ps (i.e. every 10 table samples)
+        if k % ovf_stride == 0 {
+            write_sp4_ovf_snapshot(&out_dir, ovf_idx, t, nx, ny, dx, dy, dz, &m)?;
+            ovf_idx += 1;
+        }
     }
 
     println!(
-        "SP4{} wrote {:?}",
+        "SP4{} wrote {:?} and {} OVF snapshots",
         case.to_ascii_uppercase(),
-        out_dir.join("table.csv")
+        out_dir.join("table.csv"),
+        ovf_idx
     );
     Ok(())
 }

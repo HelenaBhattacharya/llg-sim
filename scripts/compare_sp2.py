@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Generate output plots to compare MuMax3 vs Rust for Standard Problem #2 (SP2):
+# 1) Run MuMax3 visualisation:
+# python3 scripts/mag_visualisation.py \
+#   --input mumax_outputs/st_problems/sp2/sp2_out \
+#   --output plots/sp2_mumax
+
 from __future__ import annotations
 
 import argparse

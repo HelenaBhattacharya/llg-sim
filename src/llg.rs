@@ -123,6 +123,13 @@ pub struct RK45Scratch {
     k5: Vec<[f64; 3]>,
     k6: Vec<[f64; 3]>,
     k7: Vec<[f64; 3]>,
+
+    // FSAL cache: Dormand–Prince RK45 is FSAL, so the last stage derivative (k7) evaluated
+    // at the accepted end state can be reused as the next step's stage-1 (k1), provided
+    // inputs affecting B_eff are unchanged.
+    last_fsal_valid: bool,
+    last_mask: Option<FieldMask>,
+    last_b_ext: Option<[f64; 3]>,
 }
 
 impl RK45Scratch {
@@ -151,6 +158,9 @@ impl RK45Scratch {
             k5: vec![[0.0; 3]; n],
             k6: vec![[0.0; 3]; n],
             k7: vec![[0.0; 3]; n],
+            last_fsal_valid: false,
+            last_mask: None,
+            last_b_ext: None,
         }
     }
 }
@@ -181,6 +191,11 @@ pub struct RK23Scratch {
     // Whether `b4` currently corresponds to the accepted state stored in `m`.
     // This lets higher-level routines reuse the last computed field for torque checks.
     last_b_eff_valid: bool,
+
+    // FSAL safety: only reuse the last accepted stage-4 field/torque as the next step's stage-1
+    // if the field mask and external field are unchanged.
+    last_mask: Option<FieldMask>,
+    last_b_ext: Option<[f64; 3]>,
 }
 
 impl RK23Scratch {
@@ -201,6 +216,8 @@ impl RK23Scratch {
             k3: vec![[0.0; 3]; n],
             k4: vec![[0.0; 3]; n],
             last_b_eff_valid: false,
+            last_mask: None,
+            last_b_ext: None,
         }
     }
 
@@ -223,6 +240,8 @@ impl RK23Scratch {
     /// between relax calls. This prevents reusing a stale field in torque checks.
     pub fn invalidate_last_b_eff(&mut self) {
         self.last_b_eff_valid = false;
+        self.last_mask = None;
+        self.last_b_ext = None;
     }
 }
 
@@ -267,11 +286,24 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
     const BH4: f64 = 1.0 / 8.0;
 
     // -----------------------
-    // Stage 1: k1 at m
+    // Stage 1: k1 at m (FSAL-aware)
     // -----------------------
-    build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
-    for i in 0..n {
-        scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
+    // Bogacki–Shampine RK23 is FSAL: if the previous step was accepted, k4/b4 are
+    // evaluated at the accepted state and can be reused as the next step's k1/b1,
+    // provided nothing affecting B_eff changed.
+    let fsal_ok = scratch.last_b_eff_valid
+        && scratch.last_mask == Some(mask)
+        && scratch.last_b_ext == Some(params.b_ext);
+
+    if fsal_ok {
+        // Reuse last accepted stage-4 field/torque as current stage-1.
+        scratch.b1.data.clone_from(&scratch.b4.data);
+        scratch.k1.clone_from(&scratch.k4);
+    } else {
+        build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
+        for i in 0..n {
+            scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
+        }
     }
 
     // -----------------------
@@ -359,14 +391,22 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
     if accept {
         // Accept 3rd-order solution
         m.data.clone_from(&scratch.m4.data);
-        // `b4` is the field evaluated at `m4`, which is now the accepted state in `m`.
+
+        // `b4`/`k4` are evaluated at `m4`, which is now the accepted state in `m`.
+        // Mark them valid for torque checks *and* FSAL reuse on the next call.
         scratch.last_b_eff_valid = true;
+        scratch.last_mask = Some(mask);
+        scratch.last_b_ext = Some(params.b_ext);
+
         params.dt = dt_next;
         (eps, true, dt0)
     } else {
-        // Reject: keep m unchanged, just shrink dt
-        // `b4` corresponds to a trial state, so it is not valid for the current `m`.
+        // Reject: keep m unchanged, just shrink dt.
+        // `b4`/`k4` correspond to a trial state and must not be reused.
         scratch.last_b_eff_valid = false;
+        scratch.last_mask = None;
+        scratch.last_b_ext = None;
+
         params.dt = dt_next;
         (eps, false, dt0)
     }
@@ -540,10 +580,25 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
     const BH6: f64 = 187.0 / 2100.0;
     const BH7: f64 = 1.0 / 40.0;
 
-    // Stage 1: k1 at m
-    build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
-    for i in 0..n {
-        scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
+    // -----------------------
+    // Stage 1: k1 at m (FSAL-aware)
+    // -----------------------
+    // Dormand–Prince RK45 is FSAL: if the previous step was accepted, k7/b7 were evaluated
+    // at the accepted end state and can be reused as the next step's k1/b1, provided
+    // nothing affecting B_eff changed.
+    let fsal_ok = scratch.last_fsal_valid
+        && scratch.last_mask == Some(mask)
+        && scratch.last_b_ext == Some(params.b_ext);
+
+    if fsal_ok {
+        // Reuse last accepted stage-7 field/torque as current stage-1.
+        scratch.b1.data.clone_from(&scratch.b7.data);
+        scratch.k1.clone_from(&scratch.k7);
+    } else {
+        build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
+        for i in 0..n {
+            scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
+        }
     }
 
     // Stage 2: m2 = m + dt*a21*k1
@@ -689,9 +744,17 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
 
     if accept {
         m.data.clone_from(&scratch.m7.data);
+        // Mark FSAL cache valid for next step.
+        scratch.last_fsal_valid = true;
+        scratch.last_mask = Some(mask);
+        scratch.last_b_ext = Some(params.b_ext);
         params.dt = dt_next;
         (eps, true, dt0)
     } else {
+        // Reject: do not reuse trial-stage b7/k7.
+        scratch.last_fsal_valid = false;
+        scratch.last_mask = None;
+        scratch.last_b_ext = None;
         params.dt = dt_next;
         (eps, false, dt0)
     }

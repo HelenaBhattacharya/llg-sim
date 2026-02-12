@@ -45,6 +45,31 @@ fn demag_timing_enabled() -> bool {
     std::env::var("LLG_DEMAG_TIMING").is_ok()
 }
 
+// For small grids, the transpose+parallel-column FFT can be slower than the simple
+// gather-column approach due to extra memory traffic + rayon overhead.
+//
+// Use a hybrid: serial columns for small padded grids; transpose+parallel columns for larger ones.
+static FFT_PAR_THRESHOLD: OnceLock<usize> = OnceLock::new();
+const DEFAULT_FFT_PAR_THRESHOLD: usize = 32_768;
+
+fn demag_fft_par_threshold() -> usize {
+    *FFT_PAR_THRESHOLD.get_or_init(|| {
+        std::env::var("LLG_DEMAG_FFT_PAR_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_FFT_PAR_THRESHOLD)
+    })
+}
+
+#[inline]
+fn use_parallel_column_fft(nx: usize, ny: usize) -> bool {
+    // Avoid transpose path for tiny sizes.
+    if nx < 64 || ny < 32 {
+        return false;
+    }
+    nx.saturating_mul(ny) >= demag_fft_par_threshold()
+}
+
 /// Backwards-compatible: open boundaries in x/y (no PBC).
 pub fn add_demag_field(
     grid: &Grid2D,
@@ -383,7 +408,8 @@ struct Demag2D {
     fft_y_fwd: Arc<dyn Fft<f64>>,
     fft_y_inv: Arc<dyn Fft<f64>>,
 
-    col_buf: Vec<Complex<f64>>,
+    // Scratch buffer for parallel column FFTs via transpose (len = px*py)
+    fft_tmp: Vec<Complex<f64>>,
 }
 
 impl Demag2D {
@@ -445,7 +471,8 @@ impl Demag2D {
             );
         }
 
-        let mut col_buf = vec![zero; py];
+        // Scratch used by fft2_* to parallelise columns via transpose.
+        let mut fft_tmp = vec![zero; n_pad];
 
         if !loaded {
             println!(
@@ -489,10 +516,10 @@ impl Demag2D {
             }
             let t_fft = Instant::now();
             // FFT to k-space
-            fft2_forward_in_place(&mut kxx, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
-            fft2_forward_in_place(&mut kxy, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
-            fft2_forward_in_place(&mut kyy, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
-            fft2_forward_in_place(&mut kzz, px, py, &fft_x_fwd, &fft_y_fwd, &mut col_buf);
+            fft2_forward_in_place(&mut kxx, px, py, &fft_x_fwd, &fft_y_fwd, &mut fft_tmp);
+            fft2_forward_in_place(&mut kxy, px, py, &fft_x_fwd, &fft_y_fwd, &mut fft_tmp);
+            fft2_forward_in_place(&mut kyy, px, py, &fft_x_fwd, &fft_y_fwd, &mut fft_tmp);
+            fft2_forward_in_place(&mut kzz, px, py, &fft_x_fwd, &fft_y_fwd, &mut fft_tmp);
 
             if do_timing {
                 println!(
@@ -545,7 +572,7 @@ impl Demag2D {
             fft_y_fwd,
             fft_y_inv,
 
-            col_buf,
+            fft_tmp,
         }
     }
 
@@ -594,7 +621,7 @@ impl Demag2D {
             self.py,
             &self.fft_x_fwd,
             &self.fft_y_fwd,
-            &mut self.col_buf,
+            &mut self.fft_tmp,
         );
         fft2_forward_in_place(
             &mut self.my,
@@ -602,7 +629,7 @@ impl Demag2D {
             self.py,
             &self.fft_x_fwd,
             &self.fft_y_fwd,
-            &mut self.col_buf,
+            &mut self.fft_tmp,
         );
         fft2_forward_in_place(
             &mut self.mz,
@@ -610,7 +637,7 @@ impl Demag2D {
             self.py,
             &self.fft_x_fwd,
             &self.fft_y_fwd,
-            &mut self.col_buf,
+            &mut self.fft_tmp,
         );
 
         // k-space multiply (parallel per idx; deterministic)
@@ -645,7 +672,7 @@ impl Demag2D {
             self.py,
             &self.fft_x_inv,
             &self.fft_y_inv,
-            &mut self.col_buf,
+            &mut self.fft_tmp,
         );
         fft2_inverse_in_place(
             &mut self.by,
@@ -653,7 +680,7 @@ impl Demag2D {
             self.py,
             &self.fft_x_inv,
             &self.fft_y_inv,
-            &mut self.col_buf,
+            &mut self.fft_tmp,
         );
         fft2_inverse_in_place(
             &mut self.bz,
@@ -661,7 +688,7 @@ impl Demag2D {
             self.py,
             &self.fft_x_inv,
             &self.fft_y_inv,
-            &mut self.col_buf,
+            &mut self.fft_tmp,
         );
 
         // Add physical region back into b_eff (parallel over rows)
@@ -686,70 +713,159 @@ impl Demag2D {
 }
 
 /// 2D forward FFT (in-place), applying 1D FFTs over rows then columns.
+///
+/// Hybrid strategy:
+/// - For small padded grids: simple gather-column FFT (often faster).
+/// - For larger padded grids: transpose + parallel column FFT.
 fn fft2_forward_in_place(
     data: &mut [Complex<f64>],
     nx: usize,
     ny: usize,
     fft_x: &Arc<dyn Fft<f64>>,
     fft_y: &Arc<dyn Fft<f64>>,
-    col_buf: &mut Vec<Complex<f64>>,
+    tmp: &mut [Complex<f64>],
 ) {
-    if col_buf.len() != ny {
-        col_buf.resize(ny, Complex::new(0.0, 0.0));
-    }
+    let n = nx * ny;
+    assert!(
+        tmp.len() >= n,
+        "fft2_forward_in_place: tmp too small (have {}, need {})",
+        tmp.len(),
+        n
+    );
 
-    // Rows (parallel over independent rows)
+    // 1) Rows (parallel)
     data.par_chunks_mut(nx).for_each(|row| {
         fft_x.process(row);
     });
 
-    // Columns
-    for x in 0..nx {
-        for y in 0..ny {
-            col_buf[y] = data[y * nx + x];
+    // 2) Columns
+    if !use_parallel_column_fft(nx, ny) {
+        // Simple gather-column path.
+        let col_buf = &mut tmp[..ny];
+        for x in 0..nx {
+            for y in 0..ny {
+                col_buf[y] = data[y * nx + x];
+            }
+            fft_y.process(col_buf);
+            for y in 0..ny {
+                data[y * nx + x] = col_buf[y];
+            }
         }
-        fft_y.process(col_buf);
-        for y in 0..ny {
-            data[y * nx + x] = col_buf[y];
-        }
+        return;
     }
+
+    // Transpose path: tmp[x*ny + y] = data[y*nx + x]
+    {
+        let data_ro: &[Complex<f64>] = &*data;
+        tmp[..n]
+            .par_chunks_mut(ny)
+            .enumerate()
+            .for_each(|(x, col)| {
+                for y in 0..ny {
+                    col[y] = data_ro[y * nx + x];
+                }
+            });
+    }
+
+    // Columns become contiguous rows in tmp -> parallel FFT over length ny
+    tmp[..n].par_chunks_mut(ny).for_each(|col| {
+        fft_y.process(col);
+    });
+
+    // Transpose back into data (parallel over rows)
+    let tmp_ro: &[Complex<f64>] = &tmp[..n];
+    data.par_chunks_mut(nx)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..nx {
+                row[x] = tmp_ro[x * ny + y];
+            }
+        });
 }
 
 /// 2D inverse FFT (in-place), with standard 1/(nx*ny) scaling applied at end.
+///
+/// Hybrid strategy:
+/// - For small padded grids: simple gather-column FFT (often faster).
+/// - For larger padded grids: transpose + parallel column FFT.
 fn fft2_inverse_in_place(
     data: &mut [Complex<f64>],
     nx: usize,
     ny: usize,
     fft_x_inv: &Arc<dyn Fft<f64>>,
     fft_y_inv: &Arc<dyn Fft<f64>>,
-    col_buf: &mut Vec<Complex<f64>>,
+    tmp: &mut [Complex<f64>],
 ) {
-    if col_buf.len() != ny {
-        col_buf.resize(ny, Complex::new(0.0, 0.0));
-    }
+    let n = nx * ny;
+    assert!(
+        tmp.len() >= n,
+        "fft2_inverse_in_place: tmp too small (have {}, need {})",
+        tmp.len(),
+        n
+    );
 
-    // Rows (parallel over independent rows)
+    // 1) Rows (parallel)
     data.par_chunks_mut(nx).for_each(|row| {
         fft_x_inv.process(row);
     });
 
-    // Columns
-    for x in 0..nx {
-        for y in 0..ny {
-            col_buf[y] = data[y * nx + x];
+    // 2) Columns
+    if !use_parallel_column_fft(nx, ny) {
+        // Simple gather-column path.
+        let col_buf = &mut tmp[..ny];
+        for x in 0..nx {
+            for y in 0..ny {
+                col_buf[y] = data[y * nx + x];
+            }
+            fft_y_inv.process(col_buf);
+            for y in 0..ny {
+                data[y * nx + x] = col_buf[y];
+            }
         }
-        fft_y_inv.process(col_buf);
-        for y in 0..ny {
-            data[y * nx + x] = col_buf[y];
-        }
+
+        // rustfft is unnormalised -> scale (parallel)
+        let scale = 1.0 / (nx * ny) as f64;
+        data.par_iter_mut().for_each(|v| {
+            v.re *= scale;
+            v.im *= scale;
+        });
+        return;
     }
 
-    // rustfft is unnormalised -> scale
+    // Transpose path: tmp[x*ny + y] = data[y*nx + x]
+    {
+        let data_ro: &[Complex<f64>] = &*data;
+        tmp[..n]
+            .par_chunks_mut(ny)
+            .enumerate()
+            .for_each(|(x, col)| {
+                for y in 0..ny {
+                    col[y] = data_ro[y * nx + x];
+                }
+            });
+    }
+
+    // Column inverse FFTs (parallel)
+    tmp[..n].par_chunks_mut(ny).for_each(|col| {
+        fft_y_inv.process(col);
+    });
+
+    // Transpose back
+    let tmp_ro: &[Complex<f64>] = &tmp[..n];
+    data.par_chunks_mut(nx)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..nx {
+                row[x] = tmp_ro[x * ny + y];
+            }
+        });
+
+    // rustfft is unnormalised -> scale (parallel)
     let scale = 1.0 / (nx * ny) as f64;
-    for v in data.iter_mut() {
+    data.par_iter_mut().for_each(|v| {
         v.re *= scale;
         v.im *= scale;
-    }
+    });
 }
 
 /// Open-boundary kernel builder (keeps your existing parity-enforced behavior).
