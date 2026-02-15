@@ -285,3 +285,12 @@ pub fn resample_remanence_to_policy_grid(
     let m2 = m_rem.resample_to_grid(g2);
     (g2, m2)
 }
+
+/// Default SP2 grid policy.
+///
+/// The SP2 runner calls this as `default_sp2_grid_policy(lex)`.
+/// For now it returns `Sp2GridPolicy::default()`, but keeping it as a named helper
+/// lets us add env overrides later without touching the SP2 solver logic.
+pub fn default_sp2_grid_policy(_lex: f64) -> Sp2GridPolicy {
+    Sp2GridPolicy::default()
+}

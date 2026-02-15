@@ -58,6 +58,7 @@ use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::relax::{RelaxSettings, TorqueMetric, relax};
 use llg_sim::vec3::{cross, normalize};
 use llg_sim::vector_field::VectorField2D;
+use llg_sim::ovf::{OvfMeta, write_ovf2_rectangular_text};
 
 fn avg_vec(field: &VectorField2D) -> [f64; 3] {
     let mut sx = 0.0;
@@ -124,111 +125,16 @@ fn ovf_name(i: usize) -> String {
     format!("m{:07}.ovf", i)
 }
 
-/// Write an OVF 2.0 file that is as close as practical to MuMax output.
-///
-/// We write *text* data (not binary) for robustness and ease of parsing.
-/// This is fine for SP4 where we only store 11 snapshots.
-fn write_ovf2_text_mumax_like(
-    path: &Path,
-    t_s: f64,
-    nx: usize,
-    ny: usize,
-    nz: usize,
-    dx: f64,
-    dy: f64,
-    dz: f64,
-    m: &VectorField2D,
-) -> std::io::Result<()> {
-    // MuMax-style rectangular mesh coordinates: xmin=0, xbase=dx/2, xmax=nx*dx, etc.
-    let xmin = 0.0;
-    let ymin = 0.0;
-    let zmin = 0.0;
-    let xmax = (nx as f64) * dx;
-    let ymax = (ny as f64) * dy;
-    let zmax = (nz as f64) * dz;
-
-    let xbase = 0.5 * dx;
-    let ybase = 0.5 * dy;
-    let zbase = 0.5 * dz;
-
-    // Safety check: in SP4 we expect nz=1 and a 2D field length nx*ny.
-    if m.data.len() != nx * ny {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "VectorField2D length mismatch: got {}, expected {} (nx*ny)",
-                m.data.len(),
-                nx * ny
-            ),
-        ));
-    }
-
-    let file = File::create(path)?;
-    let mut w = BufWriter::new(file);
-
-    writeln!(w, "# OOMMF OVF 2.0")?;
-    writeln!(w, "# Segment count: 1")?;
-    writeln!(w, "# Begin: Segment")?;
-    writeln!(w, "# Begin: Header")?;
-    writeln!(w, "# Title: m")?;
-    writeln!(w, "# meshtype: rectangular")?;
-    writeln!(w, "# meshunit: m")?;
-    writeln!(w, "# xmin: {:.16e}", xmin)?;
-    writeln!(w, "# ymin: {:.16e}", ymin)?;
-    writeln!(w, "# zmin: {:.16e}", zmin)?;
-    writeln!(w, "# xmax: {:.16e}", xmax)?;
-    writeln!(w, "# ymax: {:.16e}", ymax)?;
-    writeln!(w, "# zmax: {:.16e}", zmax)?;
-    writeln!(w, "# valuedim: 3")?;
-    writeln!(w, "# valuelabels: m_x m_y m_z")?;
-    writeln!(w, "# valueunits: 1 1 1")?;
-    // Match MuMax convention (double space before `s` is common in their files)
-    writeln!(w, "# Desc: Total simulation time:  {:.16e}  s", t_s)?;
-    writeln!(w, "# xbase: {:.16e}", xbase)?;
-    writeln!(w, "# ybase: {:.16e}", ybase)?;
-    writeln!(w, "# zbase: {:.16e}", zbase)?;
-    writeln!(w, "# xnodes: {}", nx)?;
-    writeln!(w, "# ynodes: {}", ny)?;
-    writeln!(w, "# znodes: {}", nz)?;
-    writeln!(w, "# xstepsize: {:.16e}", dx)?;
-    writeln!(w, "# ystepsize: {:.16e}", dy)?;
-    writeln!(w, "# zstepsize: {:.16e}", dz)?;
-    writeln!(w, "# End: Header")?;
-
-    // Text data block (x fastest, then y, then z)
-    writeln!(w, "# Begin: Data Text")?;
-
-    for k in 0..nz {
-        let _ = k; // nz=1 in SP4, but keep loop for format completeness.
-        for j in 0..ny {
-            for i in 0..nx {
-                // ASSUMPTION: VectorField2D is stored with x-fastest ordering.
-                let idx = j * nx + i;
-                let v = m.data[idx];
-                writeln!(w, "{:.10e} {:.10e} {:.10e}", v[0], v[1], v[2])?;
-            }
-        }
-    }
-
-    writeln!(w, "# End: Data Text")?;
-    writeln!(w, "# End: Segment")?;
-
-    Ok(())
-}
-
 fn write_sp4_ovf_snapshot(
     out_dir: &Path,
     snap_idx: usize,
     t_s: f64,
-    nx: usize,
-    ny: usize,
-    dx: f64,
-    dy: f64,
-    dz: f64,
+    grid: &Grid2D,
     m: &VectorField2D,
 ) -> std::io::Result<()> {
     let path = out_dir.join(ovf_name(snap_idx));
-    write_ovf2_text_mumax_like(&path, t_s, nx, ny, 1, dx, dy, dz, m)
+    let meta = OvfMeta::magnetization().with_total_sim_time(t_s);
+    write_ovf2_rectangular_text(&path, grid, m, &meta)
 }
 
 pub fn run_sp4(case: char) -> std::io::Result<()> {
@@ -390,7 +296,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
     // Snapshot index 0 corresponds to t=0 (after relax, at start of Run)
     let mut ovf_idx: usize = 0;
-    write_sp4_ovf_snapshot(&out_dir, ovf_idx, 0.0, nx, ny, dx, dy, dz, &m)?;
+    write_sp4_ovf_snapshot(&out_dir, ovf_idx, 0.0, &grid, &m)?;
     ovf_idx += 1;
 
     for k in 1..=n_out {
@@ -426,7 +332,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
         // Write OVF snapshot every 100 ps (i.e. every 10 table samples)
         if k % ovf_stride == 0 {
-            write_sp4_ovf_snapshot(&out_dir, ovf_idx, t, nx, ny, dx, dy, dz, &m)?;
+            write_sp4_ovf_snapshot(&out_dir, ovf_idx, t, &grid, &m)?;
             ovf_idx += 1;
         }
     }

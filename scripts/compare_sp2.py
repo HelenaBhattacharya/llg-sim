@@ -308,7 +308,18 @@ def main() -> None:
 
     # ---- Bottom: Fig. 14 coercivity style ----
     ax_bot.plot(d_m, hc_m, "s", color="red", markersize=4, markeredgewidth=0.0, label="mumax")
-    ax_bot.plot(d_r, hc_r, "-", color="black", linewidth=1.2, label="rust")
+
+    # Plot Rust as marker-only (no connecting line) to match the paper/NIST-style comparison.
+    ax_bot.plot(
+        d_r,
+        hc_r,
+        linestyle="None",
+        marker="x",
+        color="black",
+        markersize=5,
+        markeredgewidth=1.0,
+        label="rust",
+    )
 
     ax_bot.set_xlabel(r"$d/\ell_{ex}$")
     ax_bot.set_ylabel(r"$Hc/Msat$")
