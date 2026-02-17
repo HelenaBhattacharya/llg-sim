@@ -1,56 +1,175 @@
 // mumax/st_problems/sp2.mx3
 //
-// Standard Problem #2 (MuMax3 reference style)
-// Minimal OVF saving:
-//   - remanent state (after relax at B_ext=0)
-//   - coercivity state (state at the step where the scan first reaches msum <= 0)
+// Standard Problem #2 (SP2) — MuMax3 sweep d/lex = 30..1
 //
-// Msat and Aex should not matter
+// Output layout (relative to -o output dir):
+//   table.csv
+//   ovf/d30/m_d30_rem.ovf
+//   ovf/d30/m_d30_hc.ovf
+//   ovf/d30/rem/m0000000.ovf ...
+//   ovf/d30/hc/m0000000.ovf ...
+//   ovf/d29/...
+//
+// Notes:
+// - Relax() does NOT advance time t, so we use Run() chunks for ~1 ns frame sequences.
+// - You MUST pre-create the ovf/dXX/rem and ovf/dXX/hc folders on SCARF.
+
 Msat = 1000e3
 Aex  = 10e-12
 
-// exchange length
+// Exchange length
 lex := sqrt(Aex.GetRegion(0) / (0.5 * mu0 * pow(Msat.GetRegion(0), 2)))
-mx  := m.comp(0)
-my  := m.comp(1)
-mz  := m.comp(2)
 
-// scan magnet size d
+// Component handles
+mx := m.comp(0)
+my := m.comp(1)
+mz := m.comp(2)
+
+sqrt3 := sqrt(3)
+
+// Frame output controls
+dtSnap   := 1e-9   // target snapshot spacing (s)
+tMinSnap := 6e-9   // ensure at least this much "movie time" (s)
+tMaxSnap := 60e-9  // hard cap (s)
+torqStop := 1e-4   // stop when maxTorque < torqStop (T)
+
+// Coercivity search controls (H in A/m)
+bc0OverMs := 0.0445
+dbcOverMs := 0.00005
+nBisect   := 14
+
+// Table header (delete output dir between runs to avoid duplicate headers)
+fprintln("table.csv", "d_lex,mx_rem,my_rem,hc_over_ms")
+
 for d := 30; d >= 1; d-- {
 
+    // -----------------------------
+    // Geometry + grid
+    // -----------------------------
     Sizex := 5 * lex * d
     Sizey := 1 * lex * d
     Sizez := 0.1 * lex * d
-    alpha = 0.5
 
-    // choose cells no larger than 0.5*lex
-    nx := pow(2, ilogb(Sizex/(5*0.5*lex))) * 5
-    ny := nx / 5
+    // Match Rust "Legacy" grid rule:
+    // Ny = smallest power of 2 with Ny >= 2*d
+    // Nx = 5*Ny
+    ny := 1
+    for ny < 2*d {
+        ny = ny * 2
+    }
+    nx := 5 * ny
+
     SetGridSize(nx, ny, 1)
     SetCellSize(Sizex/nx, Sizey/ny, Sizez)
 
-    // find remanence
+    // Use "relax-like" dynamics with time progression
+    DoPrecess = false
+    alpha = 0.5
+
+    // -----------------------------
+    // Remanence (H = 0)
+    // -----------------------------
     B_ext = vector(0, 0, 0)
     m = uniform(1, 0.3, 0)
-    relax()
-    remanence := m.average()
 
-    // OVF: remanent relaxed state (one per d)
-    SaveAs(m, sprintf("m_d%02d_rem", d))
+    remFolder := sprintf("ovf/d%02d/rem", d)
+    frame := 0
+    t_stage := 0.0
 
-    // find coercivity by scanning applied field
-    bc := 0.0
-    Ms := Msat.GetRegion(0)
+    SaveAs(m, sprintf("%s/m%07d", remFolder, frame))
+    frame += 1
 
-    for bc = 0.0445*Ms; (mx.average()+my.average()+mz.average()) > 0; bc += 0.00005*Ms {
-        B_ext = vector(-bc*mu0/sqrt(3), -bc*mu0/sqrt(3), -bc*mu0/sqrt(3))
-        relax()
+    for ((t_stage < tMinSnap) || (maxTorque.Get() > torqStop)) && (t_stage < tMaxSnap) {
+        Run(dtSnap)
+        t_stage += dtSnap
+        SaveAs(m, sprintf("%s/m%07d", remFolder, frame))
+        frame += 1
     }
 
-    // OVF: coercivity (first state at which the loop condition is no longer > 0)
-    // (Saved BEFORE resetting B_ext to zero.)
-    SaveAs(m, sprintf("m_d%02d_hc", d))
+    SaveAs(m, sprintf("ovf/d%02d/m_d%02d_rem", d, d))
+    rem := m.average()
 
+    // -----------------------------
+    // Coercivity: bracket + bisection on
+    // msum = <mx> + <my> + <mz>
+    // Define bc_high as smallest H where msum <= 0.
+    // -----------------------------
+    Ms := Msat.GetRegion(0)
+
+    bc_low := bc0OverMs * Ms
+    bc_high := bc_low
+
+    // Coarse scan upward until msum flips sign
+    B_ext = vector(-bc_low*mu0/sqrt3, -bc_low*mu0/sqrt3, -bc_low*mu0/sqrt3)
+    Run(2e-9)
+
+    msum := mx.average() + my.average() + mz.average()
+
+    for (msum > 0) && (bc_high <= 0.08*Ms) {
+        bc_high += dbcOverMs * Ms
+        B_ext = vector(-bc_high*mu0/sqrt3, -bc_high*mu0/sqrt3, -bc_high*mu0/sqrt3)
+        Run(2e-9)
+        msum = mx.average() + my.average() + mz.average()
+    }
+
+    // Back up one step for the low bracket
+    bc_low = bc_high - dbcOverMs*Ms
+    if bc_low < bc0OverMs*Ms {
+        bc_low = bc0OverMs * Ms
+    }
+
+    // Rebuild bracket seeds from saved rem state (branch-consistent)
+    m.LoadFile(sprintf("ovf/d%02d/m_d%02d_rem.ovf", d, d))
+    B_ext = vector(-bc_low*mu0/sqrt3, -bc_low*mu0/sqrt3, -bc_low*mu0/sqrt3)
+    Run(3e-9)
+    SaveAs(m, sprintf("ovf/d%02d/_seed_low", d))
+
+    m.LoadFile(sprintf("ovf/d%02d/m_d%02d_rem.ovf", d, d))
+    B_ext = vector(-bc_high*mu0/sqrt3, -bc_high*mu0/sqrt3, -bc_high*mu0/sqrt3)
+    Run(3e-9)
+    SaveAs(m, sprintf("ovf/d%02d/_seed_high", d))
+
+    // Bisection refinement (always seed from positive-side seed_low)
+    for i := 0; i < nBisect; i++ {
+        bc_mid := 0.5 * (bc_low + bc_high)
+
+        m.LoadFile(sprintf("ovf/d%02d/_seed_low.ovf", d))
+        B_ext = vector(-bc_mid*mu0/sqrt3, -bc_mid*mu0/sqrt3, -bc_mid*mu0/sqrt3)
+        Run(3e-9)
+
+        msum_mid := mx.average() + my.average() + mz.average()
+        if msum_mid <= 0 {
+            bc_high = bc_mid
+            SaveAs(m, sprintf("ovf/d%02d/_seed_high", d))
+        } else {
+            bc_low = bc_mid
+            SaveAs(m, sprintf("ovf/d%02d/_seed_low", d))
+        }
+    }
+
+    // HC frames at bc_high (start from negative-side seed_high)
+    hcFolder := sprintf("ovf/d%02d/hc", d)
+    m.LoadFile(sprintf("ovf/d%02d/_seed_high.ovf", d))
+    B_ext = vector(-bc_high*mu0/sqrt3, -bc_high*mu0/sqrt3, -bc_high*mu0/sqrt3)
+
+    frame = 0
+    t_stage = 0.0
+
+    SaveAs(m, sprintf("%s/m%07d", hcFolder, frame))
+    frame += 1
+
+    for ((t_stage < tMinSnap) || (maxTorque.Get() > torqStop)) && (t_stage < tMaxSnap) {
+        Run(dtSnap)
+        t_stage += dtSnap
+        SaveAs(m, sprintf("%s/m%07d", hcFolder, frame))
+        frame += 1
+    }
+
+    SaveAs(m, sprintf("ovf/d%02d/m_d%02d_hc", d, d))
+
+    // Reset field (tidy)
     B_ext = vector(0, 0, 0)
-    fprintln("table.txt", d, remanence.x(), remanence.y(), bc/Ms)
+
+    // Write summary row
+    fprintln("table.csv", d, rem.x(), rem.y(), bc_high/Ms)
 }

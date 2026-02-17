@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Tuple
+from io import StringIO
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,9 +20,60 @@ Array = np.ndarray
 
 
 def load_mumax_table(path: Path) -> Tuple[Array, Array, Array, Array]:
-    data = np.loadtxt(path)
+    """Load MuMax SP2 summary table.
+
+    Supports:
+      - New MuMax layout: <root>/table.csv
+        * first line is a header string (often comma-separated)
+        * data lines are typically whitespace-separated (MuMax fprintln)
+      - Legacy MuMax layout: table.txt with 4+ numeric columns
+
+    We parse by:
+      - dropping any header/comment lines
+      - replacing commas with spaces
+      - using np.loadtxt on the remaining numeric rows
+    """
+
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    rows = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        # Skip comment lines
+        if s.startswith("#"):
+            continue
+        # Skip header line(s)
+        if s.lower().startswith("d_lex"):
+            continue
+
+        # Normalise delimiters: treat commas as whitespace
+        s2 = s.replace(",", " ")
+        parts = s2.split()
+        if len(parts) < 4:
+            continue
+
+        # Keep only rows that look numeric (allow scientific notation with e/E).
+        try:
+            float(parts[0])
+            float(parts[1])
+            float(parts[2])
+            float(parts[3])
+        except Exception:
+            continue
+
+        rows.append(s2)
+
+    if not rows:
+        raise ValueError(f"No numeric rows found in {path}")
+
+    data = np.loadtxt(StringIO("\n".join(rows)))
+    if data.ndim == 1:
+        data = data[None, :]
+
     if data.ndim != 2 or data.shape[1] < 4:
-        raise ValueError(f"Expected >=4 columns in {path}, got shape {data.shape}")
+        raise ValueError(f"Expected >=4 numeric columns in {path}, got shape {data.shape}")
+
     d_lex = data[:, 0]
     mx = data[:, 1]
     my = data[:, 2]
@@ -45,20 +97,45 @@ def sort_by_d(d, *cols):
 
 
 def find_mumax_table_from_root(root: Path) -> Path:
-    # Preferred path used in your MuMax outputs:
+    """Locate the MuMax SP2 summary table under a root directory.
+
+    Preferred (new):
+      - <root>/table.csv
+
+    Legacy fallbacks:
+      - <root>/sp2_out/table.txt
+      - any table.csv / table.txt under <root>
+    """
+
+    # New preferred location
+    candidate = root / "table.csv"
+    if candidate.exists():
+        return candidate
+
+    # Legacy path used in older MuMax outputs
     candidate = root / "sp2_out" / "table.txt"
     if candidate.exists():
         return candidate
 
-    # Fallback: search for table.txt inside root
-    hits = list(root.rglob("table.txt"))
-    if not hits:
-        raise FileNotFoundError(f"No table.txt found under {root}")
+    # Fallback: search for table.csv first
+    hits_csv = list(root.rglob("table.csv"))
+    if hits_csv:
+        # Prefer one directly under root if present
+        for h in hits_csv:
+            if h.parent == root:
+                return h
+        return hits_csv[0]
+
+    # Then table.txt
+    hits_txt = list(root.rglob("table.txt"))
+    if not hits_txt:
+        raise FileNotFoundError(f"No table.csv or table.txt found under {root}")
+
     # Prefer one under sp2_out if present
-    for h in hits:
+    for h in hits_txt:
         if "sp2_out" in str(h).replace("\\", "/"):
             return h
-    return hits[0]
+    return hits_txt[0]
 
 
 def find_rust_table_from_root(root: Path) -> Path:
@@ -233,11 +310,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Compare MuMax vs Rust for Standard Problem #2 (SP2).")
 
     # Match SP4-style interface: root directories
-    ap.add_argument("--mumax-root", type=Path, help="MuMax SP2 root (expects sp2_out/table.txt inside)")
+    ap.add_argument("--mumax-root", type=Path, help="MuMax SP2 root (expects table.csv in root; legacy sp2_out/table.txt also supported)")
     ap.add_argument("--rust-root", type=Path, help="Rust SP2 root (expects table.csv inside)")
 
     # Backwards-compatible: direct tables
-    ap.add_argument("--mumax-table", type=Path, help="MuMax table.txt (d mx my Hc/Ms)")
+    ap.add_argument("--mumax-table", type=Path, help="MuMax summary table (new: table.csv with header; legacy: table.txt)")
     ap.add_argument("--rust-table", type=Path, help="Rust table.csv (headered)")
 
     ap.add_argument("--out", type=Path, default=Path("out/st_problems/sp2/sp2_overlay.png"),

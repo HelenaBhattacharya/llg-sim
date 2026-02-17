@@ -33,6 +33,7 @@
 //   SP2_D_MIN=1 SP2_D_MAX=30
 //   SP2_VERBOSE=1            (more prints)
 //   SP2_TIMING=1             (timings)
+// SP2_D_MIN=1 SP2_D_MAX=30 SP2_VERBOSE=1 SP2_TIMING=1 cargo run --release --bin st_problems -- sp2
 //
 //   # inner-solve thresholds
 //   SP2_TORQUE_REM=1e-4      (Tesla) stop for remanence minimiser/relax
@@ -783,6 +784,8 @@ fn find_hc_over_ms(
     ovf_dir: Option<&Path>,
     ovf_every_s: f64,
     mut m_hc_out: Option<&mut VectorField2D>,
+    mut m_hc_pos_out: Option<&mut VectorField2D>,
+    mut m_hc_best_out: Option<&mut VectorField2D>,
 ) -> f64 {
     let ms = material.ms;
 
@@ -829,12 +832,24 @@ fn find_hc_over_ms(
         if let Some(out) = m_hc_out.as_deref_mut() {
             out.data.clone_from(&m_work.data);
         }
+        if let Some(out) = m_hc_pos_out.as_deref_mut() {
+            out.data.clone_from(&m_work.data);
+        }
+        if let Some(out) = m_hc_best_out.as_deref_mut() {
+            out.data.clone_from(&m_work.data);
+        }
         return bc_low / ms;
     }
 
     // last strict-positive seed
     let mut m_low_state = VectorField2D::new(*grid);
     m_low_state.data.clone_from(&m_work.data);
+
+    // Track the strict-equilibrated state whose |m_sum| is smallest (diagnostic only).
+    let mut best_abs_msum: f64 = rep0.m_sum.abs();
+    let mut _best_bc: f64 = bc_low;
+    let mut m_best_state = VectorField2D::new(*grid);
+    m_best_state.data.clone_from(&m_work.data);
 
     // last strict-negative seed (filled when bracketing/bisecting finds negative)
     let mut m_high_state = VectorField2D::new(*grid);
@@ -908,6 +923,11 @@ fn find_hc_over_ms(
                 ovf_dir,
                 ovf_every_s,
             );
+            if rep_verify.m_sum.abs() < best_abs_msum {
+                best_abs_msum = rep_verify.m_sum.abs();
+                _best_bc = bc_high;
+                m_best_state.data.clone_from(&m_verify.data);
+            }
 
             if rep_verify.m_sum <= 0.0 {
                 // bracket found: [bc_low, bc_high]
@@ -943,6 +963,11 @@ fn find_hc_over_ms(
                 ovf_dir,
                 ovf_every_s,
             );
+            if rep_anchor.m_sum.abs() < best_abs_msum {
+                best_abs_msum = rep_anchor.m_sum.abs();
+                _best_bc = bc_high;
+                m_best_state.data.clone_from(&m_work.data);
+            }
 
             if rep_anchor.m_sum > 0.0 {
                 bc_low = bc_high;
@@ -995,6 +1020,11 @@ fn find_hc_over_ms(
             ovf_dir,
             ovf_every_s,
         );
+        if rep_mid.m_sum.abs() < best_abs_msum {
+            best_abs_msum = rep_mid.m_sum.abs();
+            _best_bc = bc_mid;
+            m_best_state.data.clone_from(&m_mid.data);
+        }
 
         if verbose {
             println!(
@@ -1019,7 +1049,14 @@ fn find_hc_over_ms(
     if let Some(out) = m_hc_out.as_deref_mut() {
         out.data.clone_from(&m_high_state.data);
     }
+    if let Some(out) = m_hc_pos_out.as_deref_mut() {
+        out.data.clone_from(&m_low_state.data);
+    }
+    if let Some(out) = m_hc_best_out.as_deref_mut() {
+        out.data.clone_from(&m_best_state.data);
+    }
 
+    // Diagnostic values best_abs_msum and best_bc are tracked but do not affect selection.
     bc_high / ms
 }
 
@@ -1125,7 +1162,7 @@ pub fn run_sp2() -> std::io::Result<()> {
 
     let need_header = !file_exists || std::fs::metadata(&table_path)?.len() == 0;
     if need_header {
-        writeln!(w, "d_lex,mx_rem,my_rem,hc_over_ms")?;
+        writeln!(w, "d_lex,mx_rem,my_rem,hc_over_ms,mx_hc,my_hc,mz_hc,msum_hc")?;
         w.flush()?;
         println!("SP2: wrote header -> {}", table_path.display());
     }
@@ -1185,7 +1222,7 @@ pub fn run_sp2() -> std::io::Result<()> {
         // Remanence (keep as-is)
         // -------------------------
         let mut m = VectorField2D::new(grid);
-        let m0 = normalize([1.0, 0.3, 0.0]);
+        let m0 = normalize([1.0, 0.3001, 0.0]);
         m.set_uniform(m0[0], m0[1], m0[2]);
 
         params.b_ext = [0.0, 0.0, 0.0];
@@ -1242,6 +1279,8 @@ pub fn run_sp2() -> std::io::Result<()> {
 
         // Capture the final (negative-branch) state at the returned Hc field.
         let mut m_hc_state = VectorField2D::new(grid);
+        let mut m_hc_pos_state = VectorField2D::new(grid);
+        let mut m_hc_best_state = VectorField2D::new(grid);
 
         let t_hc0 = Instant::now();
         let hc_over_ms = find_hc_over_ms(
@@ -1263,6 +1302,8 @@ pub fn run_sp2() -> std::io::Result<()> {
             ovf_d_dir.as_deref(),
             ovf_every_s,
             Some(&mut m_hc_state),
+            Some(&mut m_hc_pos_state),
+            Some(&mut m_hc_best_state),
         );
         let t_hc = t_hc0.elapsed().as_secs_f64();
 
@@ -1281,9 +1322,49 @@ pub fn run_sp2() -> std::io::Result<()> {
             }
         }
 
+        // Save last strict-positive state at the final bracket (diagnostic)
+        if let Some(d_dir) = ovf_d_dir.as_deref() {
+            let path_pos = d_dir.join(format!("m_d{:02}_hc_pos.ovf", d_lex));
+            let mut meta_pos = OvfMeta::magnetization();
+            meta_pos.push_desc_line(format!(
+                "SP2 d/lex={} hc_pos_strict hc/Ms={:.6}",
+                d_lex, hc_over_ms
+            ));
+            if let Err(e) = write_ovf2_rectangular_binary4(&path_pos, &grid, &m_hc_pos_state, &meta_pos) {
+                eprintln!("  [ovf] WARNING: failed to write hc_pos_strict: {}", e);
+            }
+        }
+
+        // Save closest-to-zero strict state encountered (diagnostic)
+        if let Some(d_dir) = ovf_d_dir.as_deref() {
+            let path_best = d_dir.join(format!("m_d{:02}_hc_best.ovf", d_lex));
+            let mut meta_best = OvfMeta::magnetization();
+            meta_best.push_desc_line(format!("SP2 d/lex={} hc_best_strict", d_lex));
+            if let Err(e) = write_ovf2_rectangular_binary4(&path_best, &grid, &m_hc_best_state, &meta_best) {
+                eprintln!("  [ovf] WARNING: failed to write hc_best_strict: {}", e);
+            }
+        }
+
         params.b_ext = [0.0, 0.0, 0.0];
 
-        writeln!(w, "{},{:.16e},{:.16e},{:.16e}", d_lex, mx_rem, my_rem, hc_over_ms)?;
+        let hc_avg = avg_m(&m_hc_state);
+        let mx_hc = hc_avg[0];
+        let my_hc = hc_avg[1];
+        let mz_hc = hc_avg[2];
+        let msum_hc = msum(hc_avg);
+
+        writeln!(
+            w,
+            "{},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
+            d_lex,
+            mx_rem,
+            my_rem,
+            hc_over_ms,
+            mx_hc,
+            my_hc,
+            mz_hc,
+            msum_hc
+        )?;
         w.flush()?;
         println!("SP2 d/lex={}: row written", d_lex);
     }
