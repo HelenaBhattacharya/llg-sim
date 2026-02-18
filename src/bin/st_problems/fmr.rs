@@ -14,13 +14,13 @@
 //   cargo run --release --bin st_problems -- fmr
 
 use std::f64::consts::PI;
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{RK45Scratch, step_llg_rk45_recompute_field_adaptive};
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn mu0() -> f64 {
@@ -28,7 +28,10 @@ fn mu0() -> f64 {
 }
 
 fn out_dir() -> PathBuf {
-    Path::new("runs").join("st_problems").join("fmr").join("fmr_rust")
+    Path::new("runs")
+        .join("st_problems")
+        .join("fmr")
+        .join("fmr_rust")
 }
 
 fn avg_vec(field: &VectorField2D) -> [f64; 3] {
@@ -69,7 +72,11 @@ fn write_ovf2_text_mumax_like(
     if m.data.len() != nx * ny {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("VectorField2D length mismatch: got {}, expected {}", m.data.len(), nx * ny),
+            format!(
+                "VectorField2D length mismatch: got {}, expected {}",
+                m.data.len(),
+                nx * ny
+            ),
         ));
     }
 
@@ -132,15 +139,14 @@ pub fn run_fmr() -> std::io::Result<()> {
     let nx: usize = (lx as f64 / dx as f64).round() as usize;
     let ny: usize = (ly as f64 / dy as f64).round() as usize;
 
-
     // --- material ---
     let ms: f64 = 8.0e5;
     let a_ex: f64 = 1.3e-11;
     let k_u: f64 = 0.0;
 
     // --- fields ---
-    let hmag: f64 = 8.0e4;          // A/m
-    let bmag: f64 = mu0() * hmag;   // Tesla
+    let hmag: f64 = 8.0e4; // A/m
+    let bmag: f64 = mu0() * hmag; // Tesla
 
     // Unit vectors as in Ubermag notebook
     let e1 = [0.81345856316858023, 0.58162287266553481, 0.0];
@@ -171,6 +177,7 @@ pub fn run_fmr() -> std::io::Result<()> {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // Initial magnetisation: uniform(0,0,1)
@@ -217,7 +224,17 @@ pub fn run_fmr() -> std::io::Result<()> {
     }
 
     // Save relaxed OVF at t=5 ns
-    write_ovf2_text_mumax_like(&out.join("m_relaxed.ovf"), t_relax, nx, ny, 1, dx, dy, dz, &m)?;
+    write_ovf2_text_mumax_like(
+        &out.join("m_relaxed.ovf"),
+        t_relax,
+        nx,
+        ny,
+        1,
+        dx,
+        dy,
+        dz,
+        &m,
+    )?;
 
     // --- Dynamic stage: alpha=0.008, B=b2, 20 ns ---
     params.alpha = 0.008;

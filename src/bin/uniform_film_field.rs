@@ -59,7 +59,7 @@ use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
 use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn main() -> std::io::Result<()> {
@@ -108,6 +108,7 @@ fn main() -> std::io::Result<()> {
         easy_axis,
         dmi: None,
         demag: enable_demag,
+        demag_method: DemagMethod::FftUniform,
     };
 
     let mut scratch = RK4Scratch::new(grid);

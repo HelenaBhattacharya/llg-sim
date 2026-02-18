@@ -34,7 +34,7 @@ use std::path::Path;
 use llg_sim::energy::{EnergyBreakdown, compute_energy};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field};
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
 use llg_sim::config::{
@@ -86,6 +86,7 @@ fn main() -> std::io::Result<()> {
         easy_axis,
         dmi: None,
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
 
     let mut scratch = RK4Scratch::new(grid);

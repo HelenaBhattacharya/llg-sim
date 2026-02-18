@@ -1,8 +1,8 @@
 // src/bin/st_problems/main.rs
 
+mod fmr;
 mod sp2;
 mod sp4;
-mod fmr;
 // mod sk1;
 
 fn usage() -> ! {

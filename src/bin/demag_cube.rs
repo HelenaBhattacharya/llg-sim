@@ -18,7 +18,7 @@
 
 use llg_sim::effective_field::demag::compute_demag_field;
 use llg_sim::grid::Grid2D;
-use llg_sim::params::{MU0, Material};
+use llg_sim::params::{DemagMethod, MU0, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn main() {
@@ -48,6 +48,7 @@ fn main() {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     let nxx = infer_nii(&grid, &mat, 0);

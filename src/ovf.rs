@@ -7,7 +7,7 @@
 //
 // Binary4 uses little-endian floats and starts with the OVF2 check value 1234567.0f.
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 

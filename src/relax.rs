@@ -20,10 +20,10 @@
 // - Threshold mode mimics MuMax’s RelaxTorqueThreshold>0 mode.
 // - `final_torque_max` is always computed (cheap if last_b_eff is valid).
 
-use crate::effective_field::{build_h_eff_masked, FieldMask};
+use crate::effective_field::{FieldMask, build_h_eff_masked};
 use crate::energy::compute_total_energy;
 use crate::grid::Grid2D;
-use crate::llg::{step_llg_rk23_recompute_field_masked_relax_adaptive, RK23Scratch};
+use crate::llg::{RK23Scratch, step_llg_rk23_recompute_field_masked_relax_adaptive};
 use crate::params::{LLGParams, Material};
 use crate::vec3::cross;
 use crate::vector_field::VectorField2D;
@@ -264,7 +264,9 @@ fn advance_accepted(
         if *accepted >= max_accepted_steps {
             return false;
         }
-        if rk23_step(m, params, material, scratch, mask, max_err, headroom, dt_min, dt_max) {
+        if rk23_step(
+            m, params, material, scratch, mask, max_err, headroom, dt_min, dt_max,
+        ) {
             *accepted += 1;
         } else {
             *rejected += 1;
@@ -289,7 +291,16 @@ fn gates_ok(
     torque_field_rebuilds: &mut usize,
 ) -> (bool, f64, f64) {
     let t_metric = torque_now(
-        grid, m, params, material, scratch, mask, metric, b_eff_scratch, torque_checks, torque_field_rebuilds,
+        grid,
+        m,
+        params,
+        material,
+        scratch,
+        mask,
+        metric,
+        b_eff_scratch,
+        torque_checks,
+        torque_field_rebuilds,
     );
 
     let need_max = gate_max.is_some() || matches!(metric, TorqueMetric::Max);
@@ -298,7 +309,16 @@ fn gates_ok(
             t_metric
         } else {
             torque_now(
-                grid, m, params, material, scratch, mask, TorqueMetric::Max, b_eff_scratch, torque_checks, torque_field_rebuilds,
+                grid,
+                m,
+                params,
+                material,
+                scratch,
+                mask,
+                TorqueMetric::Max,
+                b_eff_scratch,
+                torque_checks,
+                torque_field_rebuilds,
             )
         }
     } else {
@@ -376,11 +396,19 @@ pub fn relax_with_report(
 
         loop {
             if !advance_accepted(
-                m, params, material, scratch, mask,
-                max_err, headroom, dt_min, dt_max,
+                m,
+                params,
+                material,
+                scratch,
+                mask,
+                max_err,
+                headroom,
+                dt_min,
+                dt_max,
                 max_accepted_steps,
                 energy_stride,
-                &mut accepted, &mut rejected,
+                &mut accepted,
+                &mut rejected,
             ) {
                 settings.max_err = max_err;
                 return RelaxReport {
@@ -435,7 +463,12 @@ pub fn relax_with_report(
     loop {
         // -------- Stage at current max_err --------
         let mut t_prev = torque_now(
-            grid, m, params, material, scratch, mask,
+            grid,
+            m,
+            params,
+            material,
+            scratch,
+            mask,
             torque_metric,
             &mut b_eff_scratch,
             &mut torque_checks,
@@ -496,11 +529,19 @@ pub fn relax_with_report(
             }
 
             if !advance_accepted(
-                m, params, material, scratch, mask,
-                max_err, headroom, dt_min, dt_max,
+                m,
+                params,
+                material,
+                scratch,
+                mask,
+                max_err,
+                headroom,
+                dt_min,
+                dt_max,
                 max_accepted_steps,
                 torque_check_stride,
-                &mut accepted, &mut rejected,
+                &mut accepted,
+                &mut rejected,
             ) {
                 settings.max_err = max_err;
                 return RelaxReport {
@@ -518,7 +559,12 @@ pub fn relax_with_report(
             }
 
             let t_new = torque_now(
-                grid, m, params, material, scratch, mask,
+                grid,
+                m,
+                params,
+                material,
+                scratch,
+                mask,
                 torque_metric,
                 &mut b_eff_scratch,
                 &mut torque_checks,
@@ -576,7 +622,12 @@ pub fn relax_with_report(
     // Always compute final max torque (needed by equilibrate.rs max-torque gate)
     {
         let tmax = torque_now(
-            grid, m, params, material, scratch, mask,
+            grid,
+            m,
+            params,
+            material,
+            scratch,
+            mask,
             TorqueMetric::Max,
             &mut b_eff_scratch,
             &mut torque_checks,
@@ -597,7 +648,12 @@ pub fn relax_with_report(
 
         loop {
             let (ok, t_metric, t_max) = gates_ok(
-                grid, m, params, material, scratch, mask,
+                grid,
+                m,
+                params,
+                material,
+                scratch,
+                mask,
                 torque_metric,
                 gate_metric,
                 gate_max,
@@ -663,11 +719,19 @@ pub fn relax_with_report(
             }
 
             if !advance_accepted(
-                m, params, material, scratch, mask,
-                max_err, headroom, dt_min, dt_max,
+                m,
+                params,
+                material,
+                scratch,
+                mask,
+                max_err,
+                headroom,
+                dt_min,
+                dt_max,
                 max_accepted_steps,
                 torque_check_stride,
-                &mut accepted, &mut rejected,
+                &mut accepted,
+                &mut rejected,
             ) {
                 settings.max_err = max_err;
                 return RelaxReport {

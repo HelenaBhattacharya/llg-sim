@@ -18,13 +18,13 @@
 //
 // This gives you a state-based “hard vs easy regime” switch without hardcoding d/lex.
 
-use crate::effective_field::{build_h_eff_masked, FieldMask};
+use crate::effective_field::{FieldMask, build_h_eff_masked};
 use crate::grid::Grid2D;
 use crate::llg::RK23Scratch;
-use crate::minimize::{minimize_damping_only, MinimizeReport, MinimizeSettings};
+use crate::minimize::{MinimizeReport, MinimizeSettings, minimize_damping_only};
 use crate::params::{LLGParams, Material};
+use crate::relax::{RelaxReport, RelaxSettings, RelaxStopReason, TorqueMetric, relax_with_report};
 use crate::vec3::cross;
-use crate::relax::{relax_with_report, RelaxReport, RelaxSettings, RelaxStopReason, TorqueMetric};
 use crate::vector_field::VectorField2D;
 
 // -------------------------
@@ -246,13 +246,12 @@ pub fn relax_until_gate(
     }
 
     let gate_passed = gate_ok(relax_passes.last().unwrap(), gate);
-    
+
     RelaxWithGateReport {
         relax_passes,
         minimize_passes,
         gate_passed,
     }
-
 }
 
 // -------------------------
@@ -312,7 +311,16 @@ pub fn equilibrate_remanence(
     if policy.reset_dt {
         params.dt = 1e-13;
     }
-    relax_until_gate(grid, m, params, material, rk23, mask, &policy.relax, &policy.gate)
+    relax_until_gate(
+        grid,
+        m,
+        params,
+        material,
+        rk23,
+        mask,
+        &policy.relax,
+        &policy.gate,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -404,7 +412,16 @@ pub fn hysteresis_step(
         None
     };
 
-    let relax_rep = relax_until_gate(grid, m, params, material, rk23, mask, &policy.relax, &policy.gate);
+    let relax_rep = relax_until_gate(
+        grid,
+        m,
+        params,
+        material,
+        rk23,
+        mask,
+        &policy.relax,
+        &policy.gate,
+    );
 
     HysteresisStepReport {
         premin: premin_rep,

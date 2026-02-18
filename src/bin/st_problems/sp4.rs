@@ -54,11 +54,11 @@ use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::RK23Scratch;
 use llg_sim::llg::{RK45Scratch, step_llg_rk45_recompute_field_adaptive};
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::ovf::{OvfMeta, write_ovf2_rectangular_text};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::relax::{RelaxSettings, TorqueMetric, relax};
 use llg_sim::vec3::{cross, normalize};
 use llg_sim::vector_field::VectorField2D;
-use llg_sim::ovf::{OvfMeta, write_ovf2_rectangular_text};
 
 fn avg_vec(field: &VectorField2D) -> [f64; 3] {
     let mut sx = 0.0;
@@ -154,7 +154,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
 
     let alpha_run: f64 = 0.02;
 
-    // Output times 
+    // Output times
     let dt_out: f64 = 10e-12; // 10 ps
     let t_total: f64 = 1e-9; // 1 ns
     let n_out: usize = (t_total / dt_out).round() as usize; // 100
@@ -183,6 +183,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
         easy_axis,
         dmi: None,
         demag: true, // SP4 includes demag
+        demag_method: DemagMethod::FftUniform,
     };
 
     // Magnetisation: uniform(1,0.1,0) (normalized)

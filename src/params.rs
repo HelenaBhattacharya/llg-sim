@@ -64,13 +64,27 @@ impl Preset {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct LLGParams {
-    pub gamma: f64,
-    pub alpha: f64,
-    pub dt: f64,
-    /// Uniform external induction B_ext in Tesla.
-    pub b_ext: Vec3,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemagMethod {
+    FftUniform,
+    PoissonMG,
+}
+
+impl DemagMethod {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fft" | "fftuniform" | "uniform" => Some(Self::FftUniform),
+            "mg" | "multigrid" | "poissonmg" | "poisson_mg" => Some(Self::PoissonMG),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FftUniform => "fft",
+            Self::PoissonMG => "mg",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,9 +95,13 @@ pub struct Material {
     pub easy_axis: Vec3,
     pub dmi: Option<f64>, // J/m^2 (interfacial DMI), None = OFF
 
-    /// Include magnetostatic (demag) field via FFT convolution.
+    /// Include magnetostatic (demag) field.
+    /// Use `demag_method` to select the implementation.
     /// Default: false to preserve previous benchmarks.
     pub demag: bool,
+
+    /// Demag backend implementation.
+    pub demag_method: DemagMethod,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +128,15 @@ pub struct RunSpec {
     pub save_every: usize,
     pub fps: u32,
     pub zoom_t_max: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LLGParams {
+    pub gamma: f64,
+    pub alpha: f64,
+    pub dt: f64,
+    /// Uniform external induction B_ext in Tesla.
+    pub b_ext: Vec3,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +187,7 @@ impl SimConfig {
             easy_axis: normalise3([0.0, 0.0, 1.0]),
             dmi: None,
             demag: false,
+            demag_method: DemagMethod::FftUniform,
         };
 
         let run = RunSpec {
@@ -208,6 +236,7 @@ impl SimConfig {
             easy_axis: normalise3([0.0, 0.0, 1.0]),
             dmi: None,
             demag: false,
+            demag_method: DemagMethod::FftUniform,
         };
 
         let run = RunSpec {

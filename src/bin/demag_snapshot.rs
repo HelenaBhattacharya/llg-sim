@@ -31,7 +31,7 @@
 use llg_sim::effective_field::demag::compute_demag_field;
 use llg_sim::effective_field::{FieldMask, build_h_eff_masked};
 use llg_sim::grid::Grid2D;
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 use std::fs::File;
 use std::fs::create_dir_all;
@@ -105,6 +105,7 @@ fn main() -> std::io::Result<()> {
         easy_axis,
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // Buffers

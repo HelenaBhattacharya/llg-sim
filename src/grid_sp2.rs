@@ -219,7 +219,11 @@ fn nn_angle_stats(m: &VectorField2D) -> (f64, f64) {
         }
     }
 
-    let rms = if count > 0.0 { (sum2 / count).sqrt() } else { 0.0 };
+    let rms = if count > 0.0 {
+        (sum2 / count).sqrt()
+    } else {
+        0.0
+    };
     (rms, max_a)
 }
 

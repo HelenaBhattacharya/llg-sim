@@ -3,6 +3,8 @@
 /// consistent with the global convention used throughout the solver.
 pub mod anisotropy;
 pub mod demag;
+pub mod demag_fft_uniform;
+pub mod demag_poisson_mg;
 pub mod dmi;
 pub mod exchange;
 pub mod zeeman;

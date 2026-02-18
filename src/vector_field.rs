@@ -329,7 +329,6 @@ impl VectorField2D {
 
                 let out_idx = out.idx(i, j);
                 out.data[out_idx] = normalize(vv);
-
             }
         }
 

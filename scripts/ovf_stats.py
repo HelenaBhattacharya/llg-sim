@@ -17,8 +17,8 @@ basic, *ground-truth* stats:
   - optional residual metrics between two OVFs
 
 It supports:
-  - OVF2 "Data Binary 4" (float32)  ✅ (Rust output)
-  - OVF2 "Data Text"               ✅ (common in some toolchains)
+  - OVF2 "Data Binary 4" (float32)
+  - OVF2 "Data Text"
 
 Examples
 --------

@@ -44,7 +44,7 @@ use llg_sim::effective_field::FieldMask;
 use llg_sim::effective_field::build_h_eff_masked;
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::RK23Scratch;
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::relax::{RelaxSettings, relax};
 use llg_sim::vec3::cross;
 use llg_sim::vector_field::VectorField2D;
@@ -103,6 +103,7 @@ fn main() -> std::io::Result<()> {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // ---------------- Initial condition ----------------

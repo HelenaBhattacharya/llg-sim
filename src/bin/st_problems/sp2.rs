@@ -64,21 +64,21 @@
 //   runs/st_problems/sp2/ovf/...
 
 use std::collections::HashSet;
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use llg_sim::effective_field::FieldMask;
 use llg_sim::grid::Grid2D;
-use llg_sim::grid_sp2::{build_sp2_grid, Sp2GridPolicy};
+use llg_sim::grid_sp2::{Sp2GridPolicy, build_sp2_grid};
 use llg_sim::llg::RK23Scratch;
-use llg_sim::minimize::{minimize_damping_only, MinimizeReport, MinimizeSettings};
-use llg_sim::params::{GAMMA_E_RAD_PER_S_T, LLGParams, Material, MU0};
-use llg_sim::relax::{relax_with_report, RelaxReport, RelaxSettings, TorqueMetric};
+use llg_sim::minimize::{MinimizeReport, MinimizeSettings, minimize_damping_only};
+use llg_sim::ovf::{OvfMeta, write_ovf2_rectangular_binary4};
+use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, MU0, Material};
+use llg_sim::relax::{RelaxReport, RelaxSettings, TorqueMetric, relax_with_report};
 use llg_sim::vec3::normalize;
 use llg_sim::vector_field::VectorField2D;
-use llg_sim::ovf::{OvfMeta, write_ovf2_rectangular_binary4};
 
 // -------------------------
 // Heuristics (few + meaningful)
@@ -88,7 +88,7 @@ use llg_sim::ovf::{OvfMeta, write_ovf2_rectangular_binary4};
 const COARSE_TORQUE_MULT: f64 = 5.0;
 
 /// When continuation gets close-ish to switching, do a strict re-anchor at same bc.
-const MSUM_ANCHOR_THRESHOLD: f64 = 0.10;
+const MSUM_ANCHOR_THRESHOLD: f64 = 0.12;
 
 /// Plateau detection in coercivity relax: require small improvement for N chunks.
 const HC_PLATEAU_CHUNKS: usize = 6;
@@ -153,7 +153,6 @@ fn d_min_max_from_env() -> (usize, usize) {
     let d_max = env_usize("SP2_D_MAX", 30);
     (d_min.min(d_max), d_min.max(d_max))
 }
-
 
 // -------------------------
 // OVF naming mode (legacy vs MuMax-compatible)
@@ -245,7 +244,12 @@ impl OvfSeries {
         Ok(())
     }
 
-    fn maybe_dump_due(&mut self, grid: &Grid2D, m: &VectorField2D, t_approx: f64) -> std::io::Result<()> {
+    fn maybe_dump_due(
+        &mut self,
+        grid: &Grid2D,
+        m: &VectorField2D,
+        t_approx: f64,
+    ) -> std::io::Result<()> {
         if self.every <= 0.0 {
             return Ok(());
         }
@@ -544,7 +548,9 @@ fn relax_in_chunks(
                 fmt_opt_e(rep.final_torque_max),
                 dm_between,
                 m_sum,
-                m_avg[0], m_avg[1], m_avg[2],
+                m_avg[0],
+                m_avg[1],
+                m_avg[2],
             );
         }
 
@@ -645,7 +651,9 @@ fn inner_equilibrate(
             min_rep.final_tmean,
             min_rep.final_max_dm,
             min_rep.final_lambda,
-            m_avg_min[0], m_avg_min[1], m_avg_min[2],
+            m_avg_min[0],
+            m_avg_min[1],
+            m_avg_min[2],
             m_sum_min
         );
     }
@@ -742,11 +750,16 @@ fn inner_equilibrate(
         println!(
             "      [inner_end] bc/Ms={:.6} <m>=({:.6},{:.6},{:.6}) m_sum={:.6}",
             bc_amps_per_m / material.ms,
-            m_avg[0], m_avg[1], m_avg[2],
+            m_avg[0],
+            m_avg[1],
+            m_avg[2],
             m_sum
         );
     } else if timing {
-        println!("      [sp2 timing] {:?} {} took {:.2}s", kind, label, took_s);
+        println!(
+            "      [sp2 timing] {:?} {} took {:.2}s",
+            kind, label, took_s
+        );
     }
 
     InnerDiag {
@@ -797,7 +810,10 @@ fn find_hc_over_ms(
 
     // Coarse uses looser minimiser target, and fewer relax steps.
     let torque_thr_coarse = (COARSE_TORQUE_MULT * torque_thr_hc).max(torque_thr_hc);
-    let relax_steps_coarse = (relax_steps_hc / 6).max(relax_chunk).max(800).min(relax_steps_hc);
+    let relax_steps_coarse = (relax_steps_hc / 6)
+        .max(relax_chunk)
+        .max(800)
+        .min(relax_steps_hc);
 
     // Continuation buffer
     let mut m_work = VectorField2D::new(*grid);
@@ -1080,7 +1096,11 @@ pub fn run_sp2() -> std::io::Result<()> {
     let torque_hc = env_f64_any(&["SP2_TORQUE_HC", "SP2_HC_TORQUE_STOP"], 1e-4);
 
     let dm_stop_v = env_f64("SP2_DM_STOP", 5e-7);
-    let dm_stop = if dm_stop_v > 0.0 { Some(dm_stop_v) } else { None };
+    let dm_stop = if dm_stop_v > 0.0 {
+        Some(dm_stop_v)
+    } else {
+        None
+    };
 
     let min_iters_rem = env_usize("SP2_MIN_ITERS_REM", 30_000);
     let min_iters_hc = env_usize("SP2_MIN_ITERS_HC", 20_000);
@@ -1157,12 +1177,18 @@ pub fn run_sp2() -> std::io::Result<()> {
     }
 
     let file_exists = table_path.exists();
-    let f = OpenOptions::new().create(true).append(true).open(&table_path)?;
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&table_path)?;
     let mut w = BufWriter::new(f);
 
     let need_header = !file_exists || std::fs::metadata(&table_path)?.len() == 0;
     if need_header {
-        writeln!(w, "d_lex,mx_rem,my_rem,hc_over_ms,mx_hc,my_hc,mz_hc,msum_hc")?;
+        writeln!(
+            w,
+            "d_lex,mx_rem,my_rem,hc_over_ms,mx_hc,my_hc,mz_hc,msum_hc"
+        )?;
         w.flush()?;
         println!("SP2: wrote header -> {}", table_path.display());
     }
@@ -1175,6 +1201,7 @@ pub fn run_sp2() -> std::io::Result<()> {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // Grid policy
@@ -1316,7 +1343,10 @@ pub fn run_sp2() -> std::io::Result<()> {
         if let Some(d_dir) = ovf_d_dir.as_deref() {
             let path = d_dir.join(format!("m_d{:02}_hc.ovf", d_lex));
             let mut meta = OvfMeta::magnetization();
-            meta.push_desc_line(format!("SP2 d/lex={} hc_final hc/Ms={:.6}", d_lex, hc_over_ms));
+            meta.push_desc_line(format!(
+                "SP2 d/lex={} hc_final hc/Ms={:.6}",
+                d_lex, hc_over_ms
+            ));
             if let Err(e) = write_ovf2_rectangular_binary4(&path, &grid, &m_hc_state, &meta) {
                 eprintln!("  [ovf] WARNING: failed to write hc_final: {}", e);
             }
@@ -1330,7 +1360,9 @@ pub fn run_sp2() -> std::io::Result<()> {
                 "SP2 d/lex={} hc_pos_strict hc/Ms={:.6}",
                 d_lex, hc_over_ms
             ));
-            if let Err(e) = write_ovf2_rectangular_binary4(&path_pos, &grid, &m_hc_pos_state, &meta_pos) {
+            if let Err(e) =
+                write_ovf2_rectangular_binary4(&path_pos, &grid, &m_hc_pos_state, &meta_pos)
+            {
                 eprintln!("  [ovf] WARNING: failed to write hc_pos_strict: {}", e);
             }
         }
@@ -1340,7 +1372,9 @@ pub fn run_sp2() -> std::io::Result<()> {
             let path_best = d_dir.join(format!("m_d{:02}_hc_best.ovf", d_lex));
             let mut meta_best = OvfMeta::magnetization();
             meta_best.push_desc_line(format!("SP2 d/lex={} hc_best_strict", d_lex));
-            if let Err(e) = write_ovf2_rectangular_binary4(&path_best, &grid, &m_hc_best_state, &meta_best) {
+            if let Err(e) =
+                write_ovf2_rectangular_binary4(&path_best, &grid, &m_hc_best_state, &meta_best)
+            {
                 eprintln!("  [ovf] WARNING: failed to write hc_best_strict: {}", e);
             }
         }
@@ -1356,14 +1390,7 @@ pub fn run_sp2() -> std::io::Result<()> {
         writeln!(
             w,
             "{},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
-            d_lex,
-            mx_rem,
-            my_rem,
-            hc_over_ms,
-            mx_hc,
-            my_hc,
-            mz_hc,
-            msum_hc
+            d_lex, mx_rem, my_rem, hc_over_ms, mx_hc, my_hc, mz_hc, msum_hc
         )?;
         w.flush()?;
         println!("SP2 d/lex={}: row written", d_lex);

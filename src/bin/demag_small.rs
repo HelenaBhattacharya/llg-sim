@@ -20,7 +20,7 @@ use std::path::Path;
 
 use llg_sim::effective_field::demag::compute_demag_field;
 use llg_sim::grid::Grid2D;
-use llg_sim::params::{MU0, Material};
+use llg_sim::params::{DemagMethod, MU0, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn avg_vec(field: &VectorField2D) -> [f64; 3] {
@@ -56,6 +56,7 @@ fn main() -> std::io::Result<()> {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     let mut m = VectorField2D::new(grid);

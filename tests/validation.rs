@@ -9,7 +9,7 @@ use llg_sim::effective_field::build_h_eff;
 use llg_sim::energy::compute_total_energy;
 use llg_sim::grid::Grid2D;
 use llg_sim::llg::step_llg_with_field;
-use llg_sim::params::{LLGParams, Material};
+use llg_sim::params::{DemagMethod, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
 fn unit(v: [f64; 3]) -> [f64; 3] {
@@ -53,6 +53,7 @@ fn macrospin_precession_quarter_turn_about_bz() {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // Target time: quarter period, t = (pi/2)/(gamma B)
@@ -108,6 +109,7 @@ fn macrospin_anisotropy_relaxes_toward_easy_axis() {
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: None,
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
 
     let mz0 = m.data[0][2];
@@ -246,6 +248,7 @@ fn energy_gradient_consistency_exchange_anisotropy() {
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: None,
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // Build B_eff for the current state
@@ -433,6 +436,7 @@ fn dmi_field_flips_sign_with_d() {
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: Some(1e-4),
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
     let mut b_plus = VectorField2D::new(grid);
     build_h_eff(&grid, &m, &mut b_plus, &params, &mat_plus);
@@ -445,6 +449,7 @@ fn dmi_field_flips_sign_with_d() {
         easy_axis: unit([0.0, 0.0, 1.0]),
         dmi: Some(-1e-4),
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
     let mut b_minus = VectorField2D::new(grid);
     build_h_eff(&grid, &m, &mut b_minus, &params, &mat_minus);
@@ -497,6 +502,7 @@ fn demag_uniform_2x2_cube_cells_has_symmetry_and_reasonable_factor() {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     add_demag_field(&grid, &m, &mut b_eff, &mat);
@@ -566,6 +572,7 @@ fn demag_uniform_2x2_prints_nxx_nyy_nzz() {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     fn infer_nii(component: usize, grid: Grid2D, ms: f64, mat: &Material) -> f64 {
@@ -624,6 +631,7 @@ fn demag_energy_is_nonnegative_for_uniform_state() {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: true,
+        demag_method: DemagMethod::FftUniform,
     };
 
     let mut m = VectorField2D::new(grid);
@@ -666,6 +674,7 @@ fn macrospin_precession_quarter_turn_rk45_adaptive() {
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
         demag: false,
+        demag_method: DemagMethod::FftUniform,
     };
 
     // RK45 adaptive controls (MuMax-like)
