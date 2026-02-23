@@ -16,6 +16,38 @@ use crate::grid::Grid2D;
 /// Boolean geometry mask for a 2D grid (length = nx*ny).
 pub type Mask2D = Vec<bool>;
 
+/// Return true if `mask.len()` matches `grid.n_cells()`.
+#[inline]
+pub fn mask_len_ok(mask: &[bool], grid: &Grid2D) -> bool {
+    mask.len() == grid.n_cells()
+}
+
+/// Assert that `mask.len()` matches `grid.n_cells()`.
+#[inline]
+pub fn assert_mask_len(mask: &[bool], grid: &Grid2D) {
+    assert_eq!(
+        mask.len(),
+        grid.n_cells(),
+        "mask length mismatch: mask.len()={} but grid.n_cells()={} (nx={}, ny={})",
+        mask.len(),
+        grid.n_cells(),
+        grid.nx,
+        grid.ny
+    );
+}
+
+/// Assert that two masks refer to the same grid size.
+#[inline]
+pub fn assert_same_len(a: &[bool], b: &[bool]) {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "mask length mismatch: a.len()={} vs b.len()={}",
+        a.len(),
+        b.len()
+    );
+}
+
 #[inline]
 fn idx(i: usize, j: usize, nx: usize) -> usize {
     j * nx + i
@@ -53,8 +85,8 @@ pub fn mask_full(grid: &Grid2D) -> Mask2D {
     vec![true; grid.n_cells()]
 }
 
-/// Disk mask: (x-cx)^2 + (y-cy)^2 <= radius^2.
-pub fn mask_disk(grid: &Grid2D, radius: f64, center: (f64, f64)) -> Mask2D {
+/// Disk mask (preferred argument order): center then radius.
+pub fn mask_disk_at(grid: &Grid2D, center: (f64, f64), radius: f64) -> Mask2D {
     let (cx, cy) = center;
     let r2 = radius * radius;
     mask_from_fn(grid, move |x, y| {
@@ -64,29 +96,29 @@ pub fn mask_disk(grid: &Grid2D, radius: f64, center: (f64, f64)) -> Mask2D {
     })
 }
 
-/// Ring mask: inner <= r <= outer.
-pub fn mask_ring(grid: &Grid2D, r_outer: f64, r_inner: f64, center: (f64, f64)) -> Mask2D {
+/// Ring mask (preferred argument order): center then inner/outer radii.
+pub fn mask_ring_at(grid: &Grid2D, center: (f64, f64), r_inner: f64, r_outer: f64) -> Mask2D {
     let (cx, cy) = center;
-    let ro2 = r_outer * r_outer;
     let ri2 = r_inner * r_inner;
+    let ro2 = r_outer * r_outer;
     mask_from_fn(grid, move |x, y| {
         let dx = x - cx;
         let dy = y - cy;
         let rr2 = dx * dx + dy * dy;
-        rr2 <= ro2 && rr2 >= ri2
+        rr2 >= ri2 && rr2 <= ro2
     })
 }
 
-/// Axis-aligned rectangle: |x-cx|<=hx and |y-cy|<=hy.
-pub fn mask_rect(grid: &Grid2D, hx: f64, hy: f64, center: (f64, f64)) -> Mask2D {
+/// Axis-aligned rectangle (preferred argument order): center then half-widths.
+pub fn mask_rect_at(grid: &Grid2D, center: (f64, f64), hx: f64, hy: f64) -> Mask2D {
     let (cx, cy) = center;
     mask_from_fn(grid, move |x, y| {
         (x - cx).abs() <= hx && (y - cy).abs() <= hy
     })
 }
 
-/// Ellipse: (x/a)^2 + (y/b)^2 <= 1 (with optional center).
-pub fn mask_ellipse(grid: &Grid2D, a: f64, b: f64, center: (f64, f64)) -> Mask2D {
+/// Ellipse (preferred argument order): center then semi-axes.
+pub fn mask_ellipse_at(grid: &Grid2D, center: (f64, f64), a: f64, b: f64) -> Mask2D {
     let (cx, cy) = center;
     let inv_a2 = 1.0 / (a * a);
     let inv_b2 = 1.0 / (b * b);
@@ -97,27 +129,47 @@ pub fn mask_ellipse(grid: &Grid2D, a: f64, b: f64, center: (f64, f64)) -> Mask2D
     })
 }
 
+/// Disk mask: (x-cx)^2 + (y-cy)^2 <= radius^2.
+pub fn mask_disk(grid: &Grid2D, radius: f64, center: (f64, f64)) -> Mask2D {
+    mask_disk_at(grid, center, radius)
+}
+
+/// Ring mask: inner <= r <= outer.
+pub fn mask_ring(grid: &Grid2D, r_outer: f64, r_inner: f64, center: (f64, f64)) -> Mask2D {
+    mask_ring_at(grid, center, r_inner, r_outer)
+}
+
+/// Axis-aligned rectangle: |x-cx|<=hx and |y-cy|<=hy.
+pub fn mask_rect(grid: &Grid2D, hx: f64, hy: f64, center: (f64, f64)) -> Mask2D {
+    mask_rect_at(grid, center, hx, hy)
+}
+
+/// Ellipse: (x/a)^2 + (y/b)^2 <= 1 (with optional center).
+pub fn mask_ellipse(grid: &Grid2D, a: f64, b: f64, center: (f64, f64)) -> Mask2D {
+    mask_ellipse_at(grid, center, a, b)
+}
+
 /// Union (A ∪ B).
 pub fn mask_union(a: &[bool], b: &[bool]) -> Mask2D {
-    assert_eq!(a.len(), b.len());
+    assert_same_len(a, b);
     a.iter().zip(b.iter()).map(|(&aa, &bb)| aa || bb).collect()
 }
 
 /// Intersection (A ∩ B).
 pub fn mask_intersection(a: &[bool], b: &[bool]) -> Mask2D {
-    assert_eq!(a.len(), b.len());
+    assert_same_len(a, b);
     a.iter().zip(b.iter()).map(|(&aa, &bb)| aa && bb).collect()
 }
 
 /// Difference (A \ B).
 pub fn mask_difference(a: &[bool], b: &[bool]) -> Mask2D {
-    assert_eq!(a.len(), b.len());
+    assert_same_len(a, b);
     a.iter().zip(b.iter()).map(|(&aa, &bb)| aa && !bb).collect()
 }
 
 /// XOR (A ⊕ B).
 pub fn mask_xor(a: &[bool], b: &[bool]) -> Mask2D {
-    assert_eq!(a.len(), b.len());
+    assert_same_len(a, b);
     a.iter().zip(b.iter()).map(|(&aa, &bb)| aa ^ bb).collect()
 }
 
@@ -129,6 +181,11 @@ pub fn mask_invert(a: &[bool]) -> Mask2D {
 /// Count "true" cells (useful for quick sanity checks).
 pub fn mask_count(mask: &[bool]) -> usize {
     mask.iter().filter(|&&v| v).count()
+}
+
+/// Bounding box of the mask using grid dimensions.
+pub fn mask_bbox_grid(mask: &[bool], grid: &Grid2D) -> Option<(usize, usize, usize, usize)> {
+    mask_bbox(mask, grid.nx, grid.ny)
 }
 
 /// Bounding box of the mask in (i_min, i_max, j_min, j_max) inclusive indices.

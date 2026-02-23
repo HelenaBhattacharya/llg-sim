@@ -13,6 +13,7 @@
 // so that relaxation dynamics with damping is energy-monotone and comparisons are consistent.
 
 use crate::effective_field::demag;
+use crate::geometry_mask::assert_mask_len;
 use crate::grid::Grid2D;
 use crate::params::Material;
 use crate::vector_field::VectorField2D;
@@ -68,6 +69,25 @@ pub fn compute_energy(
     material: &Material,
     b_ext: [f64; 3],
 ) -> EnergyBreakdown {
+    compute_energy_geom(grid, m, material, b_ext, None)
+}
+
+/// Compute energy breakdown with an optional geometry mask.
+///
+/// If `geom_mask` is provided, only cells with geom_mask[idx]==true contribute to the
+/// energy sums. Neighbour-based terms (exchange, DMI) treat missing neighbours (outside
+/// the mask) as a free boundary (Neumann) by skipping pair contributions / using ghosts.
+pub fn compute_energy_geom(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    material: &Material,
+    b_ext: [f64; 3],
+    geom_mask: Option<&[bool]>,
+) -> EnergyBreakdown {
+    if let Some(msk) = geom_mask {
+        assert_mask_len(msk, grid);
+    }
+
     let nx = grid.nx;
     let ny = grid.ny;
     let dx = grid.dx;
@@ -92,42 +112,63 @@ pub fn compute_energy(
         _ => (None, None),
     };
 
-    // If demag enabled, compute B_demag on the whole grid once, then accumulate energy.
+    // If demag enabled, compute B_demag on the whole grid once.
+    // NOTE: demag with masked geometries is handled separately (Stage 3).
     let mut b_demag = VectorField2D::new(*grid);
     if material.demag {
         b_demag.set_uniform(0.0, 0.0, 0.0);
         demag::add_demag_field(grid, m, &mut b_demag, material);
     }
 
+    #[inline]
+    fn inside(geom_mask: Option<&[bool]>, idx: usize) -> bool {
+        match geom_mask {
+            Some(msk) => msk[idx],
+            None => true,
+        }
+    }
+
     for j in 0..ny {
         for i in 0..nx {
             let idx = grid.idx(i, j);
+
+            // Skip vacuum cells.
+            if !inside(geom_mask, idx) {
+                continue;
+            }
+
             let mij = m.data[idx];
             let (mx, my, mz) = (mij[0], mij[1], mij[2]);
 
-            // Exchange (forward differences)
+            // Exchange energy (forward differences): only count pairs fully inside the mask.
             if aex != 0.0 {
                 if i + 1 < nx {
-                    let mip = m.data[grid.idx(i + 1, j)];
-                    let dxm = [mip[0] - mx, mip[1] - my, mip[2] - mz];
-                    let sq = dxm[0] * dxm[0] + dxm[1] * dxm[1] + dxm[2] * dxm[2];
-                    e_ex += aex * (sq / (dx * dx)) * v;
+                    let idx_r = grid.idx(i + 1, j);
+                    if inside(geom_mask, idx_r) {
+                        let mip = m.data[idx_r];
+                        let dxm = [mip[0] - mx, mip[1] - my, mip[2] - mz];
+                        let sq = dxm[0] * dxm[0] + dxm[1] * dxm[1] + dxm[2] * dxm[2];
+                        e_ex += aex * (sq / (dx * dx)) * v;
+                    }
                 }
                 if j + 1 < ny {
-                    let mjp = m.data[grid.idx(i, j + 1)];
-                    let dym = [mjp[0] - mx, mjp[1] - my, mjp[2] - mz];
-                    let sq = dym[0] * dym[0] + dym[1] * dym[1] + dym[2] * dym[2];
-                    e_ex += aex * (sq / (dy * dy)) * v;
+                    let idx_u = grid.idx(i, j + 1);
+                    if inside(geom_mask, idx_u) {
+                        let mjp = m.data[idx_u];
+                        let dym = [mjp[0] - mx, mjp[1] - my, mjp[2] - mz];
+                        let sq = dym[0] * dym[0] + dym[1] * dym[1] + dym[2] * dym[2];
+                        e_ex += aex * (sq / (dy * dy)) * v;
+                    }
                 }
             }
 
-            // Uniaxial anisotropy
+            // Uniaxial anisotropy (local)
             if ku != 0.0 {
                 let mdotu = mx * u[0] + my * u[1] + mz * u[2];
                 e_an += ku * (1.0 - mdotu * mdotu) * v;
             }
 
-            // Zeeman
+            // Zeeman (local)
             if ms != 0.0 {
                 let mdotb = mx * bx + my * by + mz * bz;
                 e_zee -= ms * mdotb * v;
@@ -138,24 +179,61 @@ pub fn compute_energy(
                 if ms != 0.0 {
                     let pref = 2.0 * d / ms;
 
+                    // Neighbours with mask-aware ghosting:
                     let (m_im, m_ip) = if nx == 1 {
                         (mij, mij)
-                    } else if i == 0 {
-                        (ghost_x(mij, -1.0, eta, dx), m.data[grid.idx(i + 1, j)])
-                    } else if i == nx - 1 {
-                        (m.data[grid.idx(i - 1, j)], ghost_x(mij, 1.0, eta, dx))
                     } else {
-                        (m.data[grid.idx(i - 1, j)], m.data[grid.idx(i + 1, j)])
+                        // left
+                        let m_im = if i == 0 {
+                            ghost_x(mij, -1.0, eta, dx)
+                        } else {
+                            let idx_l = grid.idx(i - 1, j);
+                            if inside(geom_mask, idx_l) {
+                                m.data[idx_l]
+                            } else {
+                                ghost_x(mij, -1.0, eta, dx)
+                            }
+                        };
+                        // right
+                        let m_ip = if i == nx - 1 {
+                            ghost_x(mij, 1.0, eta, dx)
+                        } else {
+                            let idx_r = grid.idx(i + 1, j);
+                            if inside(geom_mask, idx_r) {
+                                m.data[idx_r]
+                            } else {
+                                ghost_x(mij, 1.0, eta, dx)
+                            }
+                        };
+                        (m_im, m_ip)
                     };
 
                     let (m_jm, m_jp) = if ny == 1 {
                         (mij, mij)
-                    } else if j == 0 {
-                        (ghost_y(mij, -1.0, eta, dy), m.data[grid.idx(i, j + 1)])
-                    } else if j == ny - 1 {
-                        (m.data[grid.idx(i, j - 1)], ghost_y(mij, 1.0, eta, dy))
                     } else {
-                        (m.data[grid.idx(i, j - 1)], m.data[grid.idx(i, j + 1)])
+                        // down
+                        let m_jm = if j == 0 {
+                            ghost_y(mij, -1.0, eta, dy)
+                        } else {
+                            let idx_d = grid.idx(i, j - 1);
+                            if inside(geom_mask, idx_d) {
+                                m.data[idx_d]
+                            } else {
+                                ghost_y(mij, -1.0, eta, dy)
+                            }
+                        };
+                        // up
+                        let m_jp = if j == ny - 1 {
+                            ghost_y(mij, 1.0, eta, dy)
+                        } else {
+                            let idx_u = grid.idx(i, j + 1);
+                            if inside(geom_mask, idx_u) {
+                                m.data[idx_u]
+                            } else {
+                                ghost_y(mij, 1.0, eta, dy)
+                            }
+                        };
+                        (m_jm, m_jp)
                     };
 
                     let dmz_dx = if nx > 1 {
@@ -212,5 +290,16 @@ pub fn compute_total_energy(
     material: &Material,
     b_ext: [f64; 3],
 ) -> f64 {
-    compute_energy(grid, m, material, b_ext).total()
+    compute_total_energy_geom(grid, m, material, b_ext, None)
+}
+
+/// Compute total energy with an optional geometry mask.
+pub fn compute_total_energy_geom(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    material: &Material,
+    b_ext: [f64; 3],
+    geom_mask: Option<&[bool]>,
+) -> f64 {
+    compute_energy_geom(grid, m, material, b_ext, geom_mask).total()
 }

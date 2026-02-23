@@ -1,6 +1,8 @@
 // src/llg.rs
 
-use crate::effective_field::{FieldMask, build_h_eff_masked, zeeman::add_zeeman_field};
+use crate::effective_field::{
+    FieldMask, build_h_eff_masked, build_h_eff_masked_geom, zeeman::add_zeeman_field,
+};
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
 use crate::vec3::{cross, normalize};
@@ -520,6 +522,93 @@ pub fn step_llg_rk4_recompute_field_masked(
     }
 }
 
+/// Fixed-step RK4 where the effective field B_eff(m) is recomputed at each RK substage,
+/// with an optional geometry mask.
+///
+/// If `geom_mask` is provided, exchange (and any other mask-aware terms) should treat
+/// cells with geom_mask[idx]==false as vacuum.
+pub fn step_llg_rk4_recompute_field_masked_geom(
+    m: &mut VectorField2D,
+    params: &LLGParams,
+    material: &Material,
+    scratch: &mut RK4Scratch,
+    mask: FieldMask,
+    geom_mask: Option<&[bool]>,
+) {
+    let grid = &m.grid;
+    let gamma = params.gamma;
+    let alpha = params.alpha;
+    let dt = params.dt;
+    let n = m.data.len();
+
+    // Stage 1
+    build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
+    for i in 0..n {
+        scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
+    }
+
+    // Stage 2
+    for i in 0..n {
+        let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
+        scratch.m1.data[i] = normalize(m1);
+    }
+    build_h_eff_masked_geom(
+        grid,
+        &scratch.m1,
+        &mut scratch.b2,
+        params,
+        material,
+        mask,
+        geom_mask,
+    );
+    for i in 0..n {
+        scratch.k2[i] = llg_rhs(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
+    }
+
+    // Stage 3
+    for i in 0..n {
+        let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
+        scratch.m2.data[i] = normalize(m2);
+    }
+    build_h_eff_masked_geom(
+        grid,
+        &scratch.m2,
+        &mut scratch.b3,
+        params,
+        material,
+        mask,
+        geom_mask,
+    );
+    for i in 0..n {
+        scratch.k3[i] = llg_rhs(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
+    }
+
+    // Stage 4
+    for i in 0..n {
+        let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
+        scratch.m3.data[i] = normalize(m3);
+    }
+    build_h_eff_masked_geom(
+        grid,
+        &scratch.m3,
+        &mut scratch.b4,
+        params,
+        material,
+        mask,
+        geom_mask,
+    );
+    for i in 0..n {
+        scratch.k4[i] = llg_rhs(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
+    }
+
+    // Combine
+    for i in 0..n {
+        let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
+        let m_new = add_scaled(m.data[i], dt, incr);
+        m.data[i] = normalize(m_new);
+    }
+}
+
 /// Adaptive Dormand–Prince RK45 (5(4)) with recompute-field at each substage.
 ///
 /// MuMax-like controller:
@@ -842,6 +931,89 @@ pub fn step_llg_rk4_recompute_field_masked_relax(
     }
 }
 
+/// Fixed-step RK4 recompute-field, damping-only (precession suppressed), with an optional geometry mask.
+pub fn step_llg_rk4_recompute_field_masked_relax_geom(
+    m: &mut VectorField2D,
+    params: &LLGParams,
+    material: &Material,
+    scratch: &mut RK4Scratch,
+    mask: FieldMask,
+    geom_mask: Option<&[bool]>,
+) {
+    let grid = &m.grid;
+    let gamma = params.gamma;
+    let alpha = params.alpha;
+    let dt = params.dt;
+    let n = m.data.len();
+
+    // Stage 1
+    build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
+    for i in 0..n {
+        scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
+    }
+
+    // Stage 2
+    for i in 0..n {
+        let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
+        scratch.m1.data[i] = normalize(m1);
+    }
+    build_h_eff_masked_geom(
+        grid,
+        &scratch.m1,
+        &mut scratch.b2,
+        params,
+        material,
+        mask,
+        geom_mask,
+    );
+    for i in 0..n {
+        scratch.k2[i] = llg_rhs_relax(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
+    }
+
+    // Stage 3
+    for i in 0..n {
+        let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
+        scratch.m2.data[i] = normalize(m2);
+    }
+    build_h_eff_masked_geom(
+        grid,
+        &scratch.m2,
+        &mut scratch.b3,
+        params,
+        material,
+        mask,
+        geom_mask,
+    );
+    for i in 0..n {
+        scratch.k3[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
+    }
+
+    // Stage 4
+    for i in 0..n {
+        let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
+        scratch.m3.data[i] = normalize(m3);
+    }
+    build_h_eff_masked_geom(
+        grid,
+        &scratch.m3,
+        &mut scratch.b4,
+        params,
+        material,
+        mask,
+        geom_mask,
+    );
+    for i in 0..n {
+        scratch.k4[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
+    }
+
+    // Combine
+    for i in 0..n {
+        let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
+        let m_new = add_scaled(m.data[i], dt, incr);
+        m.data[i] = normalize(m_new);
+    }
+}
+
 /// Adaptive timestep wrapper for the relax-mode masked RK4 stepper (step-doubling).
 pub fn step_llg_rk4_recompute_field_masked_relax_adaptive(
     m: &mut VectorField2D,
@@ -868,6 +1040,82 @@ pub fn step_llg_rk4_recompute_field_masked_relax_adaptive(
     params.dt = 0.5 * dt0;
     step_llg_rk4_recompute_field_masked_relax(&mut m_small, params, material, scratch, mask);
     step_llg_rk4_recompute_field_masked_relax(&mut m_small, params, material, scratch, mask);
+
+    params.dt = dt0;
+
+    let mut err: f64 = 0.0;
+    for (vb, vs) in m_big.data.iter().zip(m_small.data.iter()) {
+        err = err.max((vs[0] - vb[0]).abs());
+        err = err.max((vs[1] - vb[1]).abs());
+        err = err.max((vs[2] - vb[2]).abs());
+    }
+
+    if err <= tol {
+        m.data.clone_from(&m_small.data);
+
+        let safety = 0.9;
+        let grow = if err == 0.0 {
+            2.0
+        } else {
+            (tol / err).powf(0.2)
+        };
+        let dt_new = (dt0 * safety * grow).min(dt_max);
+        params.dt = dt_new.max(dt_min);
+
+        (err, true)
+    } else {
+        let safety = 0.9;
+        let shrink = (tol / err).powf(0.2);
+        let dt_new = (dt0 * safety * shrink).max(dt_min);
+        params.dt = dt_new;
+
+        (err, false)
+    }
+}
+
+/// Adaptive timestep wrapper for the relax-mode geometry-masked RK4 stepper (step-doubling).
+pub fn step_llg_rk4_recompute_field_masked_relax_adaptive_geom(
+    m: &mut VectorField2D,
+    params: &mut LLGParams,
+    material: &Material,
+    scratch: &mut RK4Scratch,
+    mask: FieldMask,
+    geom_mask: Option<&[bool]>,
+    tol: f64,
+    dt_min: f64,
+    dt_max: f64,
+) -> (f64, bool) {
+    let dt0 = params.dt;
+
+    let mut m_big = VectorField2D::new(m.grid);
+    let mut m_small = VectorField2D::new(m.grid);
+    m_big.data.clone_from(&m.data);
+    m_small.data.clone_from(&m.data);
+
+    // big step
+    params.dt = dt0;
+    step_llg_rk4_recompute_field_masked_relax_geom(
+        &mut m_big, params, material, scratch, mask, geom_mask,
+    );
+
+    // two half steps
+    params.dt = 0.5 * dt0;
+    step_llg_rk4_recompute_field_masked_relax_geom(
+        &mut m_small,
+        params,
+        material,
+        scratch,
+        mask,
+        geom_mask,
+    );
+    step_llg_rk4_recompute_field_masked_relax_geom(
+        &mut m_small,
+        params,
+        material,
+        scratch,
+        mask,
+        geom_mask,
+    );
 
     params.dt = dt0;
 

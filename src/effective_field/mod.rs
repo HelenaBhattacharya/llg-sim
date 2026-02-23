@@ -38,7 +38,7 @@ pub fn build_h_eff_masked(
     zeeman::add_zeeman_field(b_eff, sim.b_ext);
 
     // Exchange + anisotropy
-    exchange::add_exchange_field(grid, m, b_eff, mat);
+    exchange::add_exchange_field_masked(grid, m, b_eff, mat, None);
     anisotropy::add_uniaxial_anisotropy_field(m, b_eff, mat);
 
     // DMI only if mask allows it and material has DMI enabled
@@ -48,6 +48,47 @@ pub fn build_h_eff_masked(
     }
 
     // Demag only if mask is Full and demag is enabled.
+    if matches!(mask, FieldMask::Full) && mat.demag {
+        demag::add_demag_field(grid, m, b_eff, mat);
+    }
+}
+
+/// Build effective induction with a term mask and an optional geometry mask.
+///
+/// `geom_mask` semantics:
+/// - Cells with geom_mask[idx]==false are treated as vacuum.
+/// - Local terms (exchange, anisotropy, DMI) are expected to respect the geometry mask.
+/// - Demag handling for masked geometries is deferred (Stage 3); for now demag is only
+///   applied on uniform full grids.
+pub fn build_h_eff_masked_geom(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    b_eff: &mut VectorField2D,
+    sim: &LLGParams,
+    mat: &Material,
+    mask: FieldMask,
+    geom_mask: Option<&[bool]>,
+) {
+    b_eff.set_uniform(0.0, 0.0, 0.0);
+
+    // Zeeman (always included; may be zero)
+    zeeman::add_zeeman_field(b_eff, sim.b_ext);
+
+    // Exchange + anisotropy
+    exchange::add_exchange_field_masked(grid, m, b_eff, mat, geom_mask);
+    // Anisotropy is local; for now we still add it everywhere and rely on the
+    // caller keeping m=0 outside the mask. We will make this explicitly mask-aware
+    // in Milestone 2.
+    anisotropy::add_uniaxial_anisotropy_field(m, b_eff, mat);
+
+    // DMI only if mask allows it and material has DMI enabled
+    let include_dmi = matches!(mask, FieldMask::ExchAnisDmi | FieldMask::Full);
+    if include_dmi && mat.dmi.is_some() {
+        dmi::add_dmi_field_masked(grid, m, b_eff, mat, geom_mask);
+    }
+
+    // Demag only if mask is Full and demag is enabled.
+    // Stage 3: demag + masked geometries will be handled via bridge mode or Poisson/MG.
     if matches!(mask, FieldMask::Full) && mat.demag {
         demag::add_demag_field(grid, m, b_eff, mat);
     }

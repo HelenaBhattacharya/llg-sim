@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use llg_sim::effective_field::FieldMask;
 use llg_sim::grid::Grid2D;
-use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax};
+use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax_geom};
 use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
@@ -110,12 +110,13 @@ fn main() -> std::io::Result<()> {
 
     // Relax
     for _ in 0..n_steps {
-        step_llg_rk4_recompute_field_masked_relax(
+        step_llg_rk4_recompute_field_masked_relax_geom(
             &mut m,
             &params,
             &material,
             &mut scratch,
             FieldMask::ExchAnisDmi,
+            None,
         );
     }
 

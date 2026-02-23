@@ -34,7 +34,7 @@
 //   --rust-root runs/st_problems/sp4 \
 //   --metrics \
 //   --out runs/st_problems/sp4/sp4_overlay.png
-//
+
 // Optional:
 //   --mark-mx-zero
 //     Mark first <m_x>=0 crossing time for MuMax (solid) and Rust (dashed).

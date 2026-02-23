@@ -1,6 +1,6 @@
 // src/amr/stepper.rs
 
-use crate::effective_field::{FieldMask, build_h_eff_masked};
+use crate::effective_field::{FieldMask, build_h_eff_masked, build_h_eff_masked_geom};
 use crate::grid::Grid2D;
 use crate::llg::RK4Scratch;
 use crate::params::{LLGParams, Material};
@@ -115,6 +115,7 @@ pub fn step_patch_rk4_recompute_field_masked_active(
     material: &Material,
     scratch: &mut PatchRK4Scratch,
     mask: FieldMask,
+    geom_mask: Option<&[bool]>,
     relax: bool,
 ) {
     let grid = &m.grid;
@@ -125,7 +126,11 @@ pub fn step_patch_rk4_recompute_field_masked_active(
     scratch.resize_if_needed(*grid);
 
     // Stage 1
-    build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
+    if geom_mask.is_some() {
+        build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
+    } else {
+        build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
+    }
     for &idx in active {
         let mi = m.data[idx];
         let bi = scratch.b1.data[idx];
@@ -144,7 +149,19 @@ pub fn step_patch_rk4_recompute_field_masked_active(
     }
 
     // Stage 2
-    build_h_eff_masked(grid, &scratch.m1, &mut scratch.b2, params, material, mask);
+    if geom_mask.is_some() {
+        build_h_eff_masked_geom(
+            grid,
+            &scratch.m1,
+            &mut scratch.b2,
+            params,
+            material,
+            mask,
+            geom_mask,
+        );
+    } else {
+        build_h_eff_masked(grid, &scratch.m1, &mut scratch.b2, params, material, mask);
+    }
     for &idx in active {
         let mi = scratch.m1.data[idx];
         let bi = scratch.b2.data[idx];
@@ -163,7 +180,19 @@ pub fn step_patch_rk4_recompute_field_masked_active(
     }
 
     // Stage 3
-    build_h_eff_masked(grid, &scratch.m2, &mut scratch.b3, params, material, mask);
+    if geom_mask.is_some() {
+        build_h_eff_masked_geom(
+            grid,
+            &scratch.m2,
+            &mut scratch.b3,
+            params,
+            material,
+            mask,
+            geom_mask,
+        );
+    } else {
+        build_h_eff_masked(grid, &scratch.m2, &mut scratch.b3, params, material, mask);
+    }
     for &idx in active {
         let mi = scratch.m2.data[idx];
         let bi = scratch.b3.data[idx];
@@ -182,7 +211,19 @@ pub fn step_patch_rk4_recompute_field_masked_active(
     }
 
     // Stage 4
-    build_h_eff_masked(grid, &scratch.m3, &mut scratch.b4, params, material, mask);
+    if geom_mask.is_some() {
+        build_h_eff_masked_geom(
+            grid,
+            &scratch.m3,
+            &mut scratch.b4,
+            params,
+            material,
+            mask,
+            geom_mask,
+        );
+    } else {
+        build_h_eff_masked(grid, &scratch.m3, &mut scratch.b4, params, material, mask);
+    }
     for &idx in active {
         let mi = scratch.m3.data[idx];
         let bi = scratch.b4.data[idx];
@@ -271,28 +312,64 @@ impl AmrStepperRK4 {
 
         // 2) Step fine patches (active interior only)
         for (p, s) in h.patches.iter_mut().zip(self.patch_scratch.iter_mut()) {
+            let active = p.active.as_slice();
+            let geom_mask = p.geom_mask_fine.as_deref();
+            let m = &mut p.m;
+
             step_patch_rk4_recompute_field_masked_active(
-                &mut p.m, &p.active, params, mat, s, mask, self.relax,
+                m,
+                active,
+                params,
+                mat,
+                s,
+                mask,
+                geom_mask,
+                self.relax,
             );
         }
 
         // 3) Step coarse (whole grid)
+        // If a geometry mask is present on the hierarchy, use the mask-aware `_geom`
+        // stepping functions so exchange behaves correctly at vacuum boundaries.
+        let geom_mask = h.geom_mask.as_deref();
         if self.relax {
-            crate::llg::step_llg_rk4_recompute_field_masked_relax(
-                &mut h.coarse,
-                params,
-                mat,
-                &mut self.coarse_scratch,
-                mask,
-            );
+            if let Some(gm) = geom_mask {
+                crate::llg::step_llg_rk4_recompute_field_masked_relax_geom(
+                    &mut h.coarse,
+                    params,
+                    mat,
+                    &mut self.coarse_scratch,
+                    mask,
+                    Some(gm),
+                );
+            } else {
+                crate::llg::step_llg_rk4_recompute_field_masked_relax(
+                    &mut h.coarse,
+                    params,
+                    mat,
+                    &mut self.coarse_scratch,
+                    mask,
+                );
+            }
         } else {
-            crate::llg::step_llg_rk4_recompute_field_masked(
-                &mut h.coarse,
-                params,
-                mat,
-                &mut self.coarse_scratch,
-                mask,
-            );
+            if let Some(gm) = geom_mask {
+                crate::llg::step_llg_rk4_recompute_field_masked_geom(
+                    &mut h.coarse,
+                    params,
+                    mat,
+                    &mut self.coarse_scratch,
+                    mask,
+                    Some(gm),
+                );
+            } else {
+                crate::llg::step_llg_rk4_recompute_field_masked(
+                    &mut h.coarse,
+                    params,
+                    mat,
+                    &mut self.coarse_scratch,
+                    mask,
+                );
+            }
         }
 
         // 4) Fine→coarse restriction under patches

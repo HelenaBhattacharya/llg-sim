@@ -13,14 +13,15 @@
 // - This is structurally AMR-friendly (local stencils), unlike global FFTs.
 // - Accurate open boundaries are *the* hard part. A padded Dirichlet box is a cheap
 //   approximation that can require a lot of vacuum, especially in z for thin films.
-// - **Hybrid mode (recommended):** uses MG for the long-range field and a small local
+// - **Hybrid mode (optional):** uses MG for the long-range field and a small local
 //   correction stencil ΔK = K_fft - K_mg (Newell/prism near-field) to fix the high-k
 //   / near-field operator mismatch. This is the classic particle-mesh / PPPM idea.
 //
-// Hybrid controls:
-//   LLG_DEMAG_MG_HYBRID_RADIUS=<cells>        (default 6; set 0 to disable)
+// Hybrid controls (OFF by default):
+//   LLG_DEMAG_MG_HYBRID_ENABLE=1|0            (default 0; must be 1 to use ΔK)
+//   LLG_DEMAG_MG_HYBRID_RADIUS=<cells>        (default 0; >0 enables ΔK *only if* ENABLE=1)
 //   LLG_DEMAG_MG_HYBRID_DELTA_VCYCLES=<n>     (default 60; one-time build cost)
-//   LLG_DEMAG_MG_HYBRID_CACHE=1|0            (default 1; caches ΔK in out/demag_cache)
+//   LLG_DEMAG_MG_HYBRID_CACHE=1|0             (default 1; caches ΔK in out/demag_cache)
 // - This implementation supports three outer BCs:
 //     * DirichletZero     : phi = 0 on the padded box boundary (cheap, needs lots of vacuum)
 //     * DirichletDipole   : boundary phi set by a monopole+dipole far-field approximation
@@ -114,6 +115,12 @@ pub struct DemagPoissonMGConfig {
     /// If None, run fixed v_cycles.
     pub tol_abs: Option<f64>,
 
+    /// Stop when max-norm residual <= tol_rel * max-norm(rhs) (dimensionless).
+    ///
+    /// This keeps the *relative* solve error roughly uniform as the RHS magnitude varies in time.
+    /// If None, no relative-tolerance stopping is used.
+    pub tol_rel: Option<f64>,
+
     /// Pre-smoothing iterations.
     pub pre_smooth: usize,
     /// Post-smoothing iterations.
@@ -147,13 +154,14 @@ pub struct DemagPoissonMGConfig {
 impl Default for DemagPoissonMGConfig {
     fn default() -> Self {
         Self {
-            // Aggressive by default: with Treecode BC we don't need "factor-of-two" padding.
-            pad_xy: 2,
-            n_vac_z: 2,
-            // With a stronger smoother, we can usually run fewer V-cycles.
-            v_cycles: 2,
+            // Robust by default: moderate padding avoids near-boundary artefacts; override via env for speed.
+            pad_xy: 6,
+            n_vac_z: 16,
+            // Converged-by-default on typical thin-film tests; override via env for speed/accuracy tradeoffs.
+            v_cycles: 8,
             v_cycles_max: 80,
             tol_abs: None,
+            tol_rel: None,
             pre_smooth: 2,
             post_smooth: 2,
             smoother: MGSmoother::RedBlackSOR,
@@ -202,6 +210,10 @@ impl DemagPoissonMGConfig {
         }
         if let Some(v) = get_f64("LLG_DEMAG_MG_TOL_ABS") {
             cfg.tol_abs = Some(v.max(0.0));
+        }
+        if let Some(v) = get_f64("LLG_DEMAG_MG_TOL_REL") {
+            // Clamp to a sensible range; tol_rel > 1.0 is effectively "no-op".
+            cfg.tol_rel = Some(v.max(0.0).min(1.0));
         }
         if let Some(v) = get_usize("LLG_DEMAG_MG_PRE_SMOOTH") {
             cfg.pre_smooth = v.max(1);
@@ -258,6 +270,9 @@ struct HybridConfig {
     /// Local correction stencil radius in cells (XY).
     ///
     /// 0 disables the hybrid correction and uses pure MG.
+    ///
+    /// NOTE: Even if this is set via env var, the hybrid correction is still disabled
+    /// unless `LLG_DEMAG_MG_HYBRID_ENABLE` is truthy.
     /// Typical useful values: 2..10.
     radius_xy: usize,
 
@@ -273,9 +288,11 @@ struct HybridConfig {
 impl Default for HybridConfig {
     fn default() -> Self {
         Self {
-            // Enable hybrid by default: MG alone is known to be inaccurate for high-k patterns.
-            // You can disable by setting LLG_DEMAG_MG_HYBRID_RADIUS=0.
-            radius_xy: 6,
+            // Default to *pure* MG. If/when the local correction (ΔK) is wanted for
+            // specific problems, enable explicitly via:
+            //   LLG_DEMAG_MG_HYBRID_ENABLE=1
+            //   LLG_DEMAG_MG_HYBRID_RADIUS=<cells>
+            radius_xy: 0,
             // A moderately-large, one-time build cost that pays off by making ΔK stable.
             delta_v_cycles: 60,
             cache_to_disk: true,
@@ -291,7 +308,40 @@ impl HybridConfig {
                 .and_then(|s| s.trim().parse::<usize>().ok())
         }
 
+        #[inline]
+        fn get_bool(name: &str) -> bool {
+            std::env::var(name)
+                .ok()
+                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+        }
+
         let mut cfg = Self::default();
+
+        // IMPORTANT: Hybrid ΔK is *double-gated* so it can never turn on accidentally.
+        //
+        // - By default: ENABLE=0 and radius_xy=0 -> pure MG.
+        // - Even if an old shell has LLG_DEMAG_MG_HYBRID_RADIUS lingering, ΔK is still
+        //   disabled unless LLG_DEMAG_MG_HYBRID_ENABLE is truthy.
+        if !get_bool("LLG_DEMAG_MG_HYBRID_ENABLE") {
+            // Helpful one-time hint if the user has a leftover radius var set.
+            //
+            // This makes it obvious (from stderr) that ΔK is *not* being used even if the
+            // shell environment still contains e.g. `LLG_DEMAG_MG_HYBRID_RADIUS=6`.
+            if let Some(v) = get_usize("LLG_DEMAG_MG_HYBRID_RADIUS") {
+                if v > 0 {
+                    static WARN_ONCE: OnceLock<()> = OnceLock::new();
+                    WARN_ONCE.get_or_init(|| {
+                        eprintln!(
+                            "[demag_mg] NOTE: LLG_DEMAG_MG_HYBRID_RADIUS={} is set but hybrid ΔK is DISABLED (set LLG_DEMAG_MG_HYBRID_ENABLE=1 to enable). Ignoring.",
+                            v
+                        );
+                    });
+                }
+            }
+            return cfg;
+        }
+
         if let Some(v) = get_usize("LLG_DEMAG_MG_HYBRID_RADIUS") {
             cfg.radius_xy = v;
         }
@@ -441,6 +491,40 @@ impl DeltaKernel2D {
                     row[i][2] += bz;
                 }
             });
+    }
+
+    /// Reduce impulse-noise by enforcing basic symmetry of the measured stencil.
+    fn symmetrize(&mut self, cell_dx: f64, cell_dy: f64) {
+        let r = self.radius as isize;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let k = self.idx(dx, dy);
+                let ki = self.idx(-dx, -dy);
+
+                self.dkxx[k] = 0.5 * (self.dkxx[k] + self.dkxx[ki]);
+                self.dkyy[k] = 0.5 * (self.dkyy[k] + self.dkyy[ki]);
+                self.dkzz[k] = 0.5 * (self.dkzz[k] + self.dkzz[ki]);
+                self.dkxy[k] = 0.5 * (self.dkxy[k] + self.dkxy[ki]);
+            }
+        }
+
+        // Optional x<->y swap symmetry when cells are effectively square.
+        if (cell_dx - cell_dy).abs() <= 1e-12 * cell_dx.abs().max(cell_dy.abs()).max(1.0) {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let k = self.idx(dx, dy);
+                    let ks = self.idx(dy, dx);
+
+                    let xx = 0.5 * (self.dkxx[k] + self.dkyy[ks]);
+                    let yy = 0.5 * (self.dkyy[k] + self.dkxx[ks]);
+                    let xy = 0.5 * (self.dkxy[k] + self.dkxy[ks]);
+
+                    self.dkxx[k] = xx;
+                    self.dkyy[k] = yy;
+                    self.dkxy[k] = xy;
+                }
+            }
+        }
     }
 }
 
@@ -1687,9 +1771,7 @@ impl DemagPoissonMG {
             }
             MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], post, omega_sor),
         }
-    }
-
-    fn solve_with_timing(&mut self) -> (u64, u64) {
+    }    fn solve_with_timing(&mut self) -> (u64, u64) {
         if !self.cfg.warm_start {
             self.levels[0].phi.fill(0.0);
         }
@@ -1699,24 +1781,78 @@ impl DemagPoissonMG {
         self.update_finest_boundary_bc();
         let bc_ns = t_bc.elapsed().as_nanos() as u64;
 
+        self.levels[0].enforce_dirichlet();
+
         let t_solve = Instant::now();
 
-        if let Some(tol) = self.cfg.tol_abs {
-            for _ in 0..self.cfg.v_cycles_max {
-                self.v_cycle(0);
-                // Keep boundary pinned (defensive).
-                self.levels[0].enforce_dirichlet();
+        // Iteration strategy:
+        // - Default: fixed number of V-cycles (cfg.v_cycles).
+        // - If cfg.tol_abs and/or cfg.tol_rel is set: run up to cfg.v_cycles_max V-cycles,
+        //   but *at least* cfg.v_cycles, stopping when the max-norm residual meets the target.
+        //
+        // The "at least cfg.v_cycles" floor keeps the solve quality more uniform in time (reduces
+        // time-dependent solve noise), while the residual stop prevents runaway runtimes.
+        let tol_abs = self.cfg.tol_abs;
+        let tol_rel = self.cfg.tol_rel;
+        let use_tol = tol_abs.is_some() || tol_rel.is_some();
 
+        // Relative tolerance target is scaled by max-norm(rhs) on the finest grid.
+        let rhs_max = if use_tol && tol_rel.is_some() {
+            let finest = &self.levels[0];
+            let nx = finest.nx;
+            let ny = finest.ny;
+            let nz = finest.nz;
+            finest
+                .rhs
+                .par_chunks(nx)
+                .enumerate()
+                .map(|(row_idx, row)| {
+                    let k = row_idx / ny;
+                    let j = row_idx % ny;
+                    if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
+                        return 0.0;
+                    }
+                    let mut m = 0.0f64;
+                    for &v in &row[1..nx - 1] {
+                        m = m.max(v.abs());
+                    }
+                    m
+                })
+                .reduce(|| 0.0, f64::max)
+        } else {
+            0.0
+        };
+
+        let tol_target = if use_tol {
+            let mut t = 0.0f64;
+            if let Some(a) = tol_abs {
+                t = t.max(a.max(0.0));
+            }
+            if let Some(r) = tol_rel {
+                t = t.max((r.max(0.0) * rhs_max).max(0.0));
+            }
+            t
+        } else {
+            0.0
+        };
+
+        let min_cycles = if use_tol { self.cfg.v_cycles.max(1) } else { 0 };
+        let max_cycles = if use_tol {
+            self.cfg.v_cycles_max.max(min_cycles).max(1)
+        } else {
+            self.cfg.v_cycles.max(1)
+        };
+
+        for iter in 0..max_cycles {
+            self.v_cycle(0);
+            // Keep boundary pinned (defensive).
+            self.levels[0].enforce_dirichlet();
+
+            if use_tol && (iter + 1) >= min_cycles {
                 let max_r = Self::compute_residual(&mut self.levels[0]);
-                if max_r <= tol {
+                if max_r <= tol_target {
                     break;
                 }
-            }
-        } else {
-            for _ in 0..self.cfg.v_cycles {
-                self.v_cycle(0);
-                // Keep boundary pinned (defensive).
-                self.levels[0].enforce_dirichlet();
             }
         }
 
@@ -1724,60 +1860,144 @@ impl DemagPoissonMG {
         self.levels[0].enforce_dirichlet();
 
         let solve_ns = t_solve.elapsed().as_nanos() as u64;
+
+        if use_tol {
+            let max_r = Self::compute_residual(&mut self.levels[0]);
+            eprintln!(
+                "[demag_mg] max_residual={:.3e}  rhs_max={:.3e}  tol_target={:.3e}  (min_cycles={}, max_cycles={})",
+                max_r, rhs_max, tol_target, min_cycles, max_cycles
+            );
+        }
+
         (bc_ns, solve_ns)
     }
 
+
     fn solve(&mut self) {
         let _ = self.solve_with_timing();
+    }    fn add_b_from_phi_on_magnet_layer(
+        &self,
+        m: &VectorField2D,
+        _ms: f64,
+        b_eff: &mut VectorField2D,
+    ) {
+        self.add_b_from_phi_on_magnet_layer_impl(Some(&m.data), b_eff);
     }
 
-    fn add_b_from_phi_on_magnet_layer(&self, b_eff: &mut VectorField2D) {
+    /// Like `add_b_from_phi_on_magnet_layer`, but computes the field for *all* cells in the
+    /// magnet XY window, regardless of whether `m` is zero there.
+    ///
+    /// This is used for ΔK impulse-response building, where we want the operator's response
+    /// at neighbouring target cells even though the impulse magnetisation is nonzero only at
+    /// a single source cell.
+    fn add_b_from_phi_on_magnet_layer_all(&self, b_eff: &mut VectorField2D) {
+        self.add_b_from_phi_on_magnet_layer_impl(None, b_eff);
+    }
+
+    fn add_b_from_phi_on_magnet_layer_impl(
+        &self,
+        mdata_opt: Option<&[[f64; 3]]>,
+        b_eff: &mut VectorField2D,
+    ) {
         let finest = &self.levels[0];
         let phi = &finest.phi;
 
         let nx_m = self.grid.nx;
+        let _ny_m = self.grid.ny;
 
         let dx = finest.dx;
         let dy = finest.dy;
         let dz = finest.dz;
 
-        let k = self.offz; // magnet layer index
+        let k = self.offz;
 
+        #[inline]
+        fn is_mag(mv: [f64; 3]) -> bool {
+            let n2 = mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2];
+            n2 > 1e-30
+        }
+
+        // Discrete consistency note:
+        //
+        // We extract H = -∇φ using the *mimetic* (finite-volume) face-gradient: average of the
+        // forward/backward one-sided differences (which reduces to a central difference away
+        // from boundaries). This makes the grad/div pair compatible with the Laplacian stencil
+        // used in the multigrid residual, and avoids the "half-gradient" artefact at padded
+        // boundaries.
+        //
+        // IMPORTANT: For magnet-vacuum interfaces, the potential already encodes the correct
+        // jump conditions via the RHS construction (one-sided face flux). Do *not* add an
+        // explicit ±(M·n)/2 correction term here.
         b_eff
             .data
             .par_chunks_mut(nx_m)
             .enumerate()
             .for_each(|(j, row)| {
+                let pj = self.offy + j;
                 for i in 0..nx_m {
+                    let idx2 = j * nx_m + i;
+                    if let Some(mdata) = mdata_opt {
+                        if !is_mag(mdata[idx2]) {
+                            continue;
+                        }
+                    }
+
                     let pi = self.offx + i;
-                    let pj = self.offy + j;
+                    let phi_c = phi[idx3(pi, pj, k, self.px, self.py)];
 
-                    // Central differences (magnet should be away from outer boundary due to padding).
-                    let ip = (pi + 1).min(self.px - 1);
-                    let im = pi.saturating_sub(1);
-                    let jp = (pj + 1).min(self.py - 1);
-                    let jm = pj.saturating_sub(1);
-                    let kp = (k + 1).min(self.pz - 1);
-                    let km = k.saturating_sub(1);
+                    // Average of one-sided face gradients (mimetic / adjoint-friendly).
+                    let mut dphi_dx = 0.0;
+                    let mut wdx = 0.0;
+                    if pi + 1 < self.px {
+                        let phi_p = phi[idx3(pi + 1, pj, k, self.px, self.py)];
+                        dphi_dx += (phi_p - phi_c) / dx;
+                        wdx += 1.0;
+                    }
+                    if pi > 0 {
+                        let phi_m = phi[idx3(pi - 1, pj, k, self.px, self.py)];
+                        dphi_dx += (phi_c - phi_m) / dx;
+                        wdx += 1.0;
+                    }
+                    if wdx > 0.0 {
+                        dphi_dx /= wdx;
+                    }
 
-                    let dphi_dx = (phi[idx3(ip, pj, k, self.px, self.py)]
-                        - phi[idx3(im, pj, k, self.px, self.py)])
-                        / (2.0 * dx);
-                    let dphi_dy = (phi[idx3(pi, jp, k, self.px, self.py)]
-                        - phi[idx3(pi, jm, k, self.px, self.py)])
-                        / (2.0 * dy);
-                    let dphi_dz = (phi[idx3(pi, pj, kp, self.px, self.py)]
-                        - phi[idx3(pi, pj, km, self.px, self.py)])
-                        / (2.0 * dz);
+                    let mut dphi_dy = 0.0;
+                    let mut wdy = 0.0;
+                    if pj + 1 < self.py {
+                        let phi_p = phi[idx3(pi, pj + 1, k, self.px, self.py)];
+                        dphi_dy += (phi_p - phi_c) / dy;
+                        wdy += 1.0;
+                    }
+                    if pj > 0 {
+                        let phi_m = phi[idx3(pi, pj - 1, k, self.px, self.py)];
+                        dphi_dy += (phi_c - phi_m) / dy;
+                        wdy += 1.0;
+                    }
+                    if wdy > 0.0 {
+                        dphi_dy /= wdy;
+                    }
 
-                    // H = -grad(phi); B = μ0 H
-                    let bx = -MU0 * dphi_dx;
-                    let by = -MU0 * dphi_dy;
-                    let bz = -MU0 * dphi_dz;
+                    let mut dphi_dz = 0.0;
+                    let mut wdz = 0.0;
+                    if k + 1 < self.pz {
+                        let phi_p = phi[idx3(pi, pj, k + 1, self.px, self.py)];
+                        dphi_dz += (phi_p - phi_c) / dz;
+                        wdz += 1.0;
+                    }
+                    if k > 0 {
+                        let phi_m = phi[idx3(pi, pj, k - 1, self.px, self.py)];
+                        dphi_dz += (phi_c - phi_m) / dz;
+                        wdz += 1.0;
+                    }
+                    if wdz > 0.0 {
+                        dphi_dz /= wdz;
+                    }
 
-                    row[i][0] += bx;
-                    row[i][1] += by;
-                    row[i][2] += bz;
+                    // B = μ0 H = -μ0 ∇φ
+                    row[i][0] += -MU0 * dphi_dx;
+                    row[i][1] += -MU0 * dphi_dy;
+                    row[i][2] += -MU0 * dphi_dz;
                 }
             });
     }
@@ -1785,7 +2005,7 @@ impl DemagPoissonMG {
     pub fn add_field(&mut self, m: &VectorField2D, b_eff: &mut VectorField2D, ms: f64) {
         self.build_rhs_from_m(m, ms);
         self.solve();
-        self.add_b_from_phi_on_magnet_layer(b_eff);
+        self.add_b_from_phi_on_magnet_layer(m, ms, b_eff);
     }
 
     fn add_field_timed(
@@ -1801,7 +2021,7 @@ impl DemagPoissonMG {
         let (bc_ns, solve_ns) = self.solve_with_timing();
 
         let t_grad = Instant::now();
-        self.add_b_from_phi_on_magnet_layer(b_eff);
+        self.add_b_from_phi_on_magnet_layer(m, ms, b_eff);
         let grad_ns = t_grad.elapsed().as_nanos() as u64;
 
         (rhs_ns, bc_ns, solve_ns, grad_ns)
@@ -1962,6 +2182,10 @@ impl DemagPoissonMGHybrid {
     }
 
     fn add_field(&mut self, m: &VectorField2D, b_eff: &mut VectorField2D, mat: &Material) {
+        // One-time, user-visible confirmation of whether the hybrid ΔK path is enabled.
+        // (This makes it easy to verify we're running *pure MG* during debugging.)
+        mg_hybrid_notice_once(&self.hyb);
+
         if mg_timing_enabled() {
             let t_total = Instant::now();
 
@@ -1994,6 +2218,26 @@ impl DemagPoissonMGHybrid {
             }
         }
     }
+}
+
+/// Print a one-time notice about whether the hybrid ΔK correction is enabled.
+///
+/// This is intentionally a one-time log to avoid spamming long runs.
+#[inline]
+fn mg_hybrid_notice_once(hyb: &HybridConfig) {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        if hyb.enabled() {
+            eprintln!(
+                "[demag_mg] hybrid ΔK ENABLED (radius_xy={}, delta_v_cycles={}, cache_to_disk={})",
+                hyb.radius_xy, hyb.delta_v_cycles, hyb.cache_to_disk
+            );
+        } else {
+            eprintln!(
+                "[demag_mg] hybrid ΔK DISABLED (pure MG). To enable: set LLG_DEMAG_MG_HYBRID_ENABLE=1 and LLG_DEMAG_MG_HYBRID_RADIUS>0"
+            );
+        }
+    });
 }
 
 // ---------------------------
@@ -2067,7 +2311,7 @@ fn mg_timing_record(
 
 // Bump this if the MG operator / hybrid stencil definition changes in a way that should
 // invalidate on-disk cached ΔK files.
-const DK_CACHE_MAGIC: &[u8; 8] = b"LLGDKH2\0";
+const DK_CACHE_MAGIC: &[u8; 8] = b"LLGDKH4\x00";
 
 fn ensure_cache_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -2222,13 +2466,23 @@ fn build_delta_kernel_impulse(
     let ms = mat.ms;
     let ms_inv = if ms.abs() > 0.0 { 1.0 / ms } else { 0.0 };
 
-    // Use a dedicated MG solver for stencil building so we don't perturb the runtime warm-start state.
+    // When building an impulse-response kernel we still want the *geometry* to be the full
+    // magnet window (all cells treated as "magnet" for face interpolation), even though the
+    // impulse magnetisation is nonzero only at one cell. We achieve this by adding a tiny
+    // nonzero marker to every cell so the is_mag() tests treat them as magnet, without
+    // materially affecting the field.
+    let geom_eps = 1e-14;
+
+
+    // Use a dedicated MG solver for building ΔK. We want this to be a stable, repeatable
+    // impulse-response measurement, so disable warm-starting and use a fixed (possibly larger)
+    // number of V-cycles.
     let mut cfg_imp = *mg_cfg;
     cfg_imp.warm_start = false;
     cfg_imp.tol_abs = None;
+    cfg_imp.tol_rel = None;
     cfg_imp.v_cycles = hyb.delta_v_cycles;
-    cfg_imp.v_cycles_max = hyb.delta_v_cycles;
-
+    cfg_imp.v_cycles_max = hyb.delta_v_cycles.max(1);
     let mut mg = DemagPoissonMG::new(*grid, cfg_imp);
 
     let r = hyb.radius_xy;
@@ -2236,93 +2490,141 @@ fn build_delta_kernel_impulse(
     let nst = stride * stride;
 
     let mut dk = DeltaKernel2D::new(r);
-    let mut dkxy_from_x = vec![0.0f64; nst];
-    let mut dkxy_from_y = vec![0.0f64; nst];
+    let mut dkxy_from_x = vec![0.0; nst];
+    let mut dkxy_from_y = vec![0.0; nst];
 
-    // Helper: build impulse magnetisation.
     let mut m_imp = VectorField2D::new(*grid);
     for v in &mut m_imp.data {
-        *v = [0.0, 0.0, 0.0];
+        *v = [geom_eps, 0.0, 0.0];
     }
 
     let mut b_fft = VectorField2D::new(*grid);
     let mut b_mg = VectorField2D::new(*grid);
 
+    // ----------------
     // X impulse
+    // ----------------
     {
+        // Magnetisation impulse at the centre cell (Mx = 1).
+        for v in &mut m_imp.data {
+            *v = [geom_eps, 0.0, 0.0];
+        }
         let center = m_imp.idx(cx, cy);
-        m_imp.data[center] = [1.0, 0.0, 0.0];
-    }
-    demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
-    for v in &mut b_mg.data {
-        *v = [0.0, 0.0, 0.0];
-    }
-    mg.add_field(&m_imp, &mut b_mg, ms);
-    for dy in -(r as isize)..=(r as isize) {
-        for dx in -(r as isize)..=(r as isize) {
-            let tx = (cx as isize + dx) as usize;
-            let ty = (cy as isize + dy) as usize;
-            let id = b_fft.idx(tx, ty);
-            let k = dk.idx(dx, dy);
-            dk.dkxx[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
-            dkxy_from_x[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
+        m_imp.data[center] = [1.0 + geom_eps, 0.0, 0.0];
+
+        // FFT reference (Newell).
+        for v in &mut b_fft.data {
+            *v = [0.0, 0.0, 0.0];
+        }
+        demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
+
+        // MG response (compute field everywhere in the magnet window, even where m=0).
+        for v in &mut b_mg.data {
+            *v = [0.0, 0.0, 0.0];
+        }
+        mg.build_rhs_from_m(&m_imp, ms);
+        mg.solve();
+        mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+
+        for dy in -(r as isize)..=(r as isize) {
+            for dx in -(r as isize)..=(r as isize) {
+                let tx = (cx as isize + dx) as usize;
+                let ty = (cy as isize + dy) as usize;
+                let id = m_imp.idx(tx, ty);
+                let k = dk.idx(dx, dy);
+
+                // For an x-impulse: Bx gives ΔKxx, By gives ΔKxy.
+                dk.dkxx[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
+                dkxy_from_x[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
+            }
         }
     }
 
+    // ----------------
     // Y impulse
-    for v in &mut m_imp.data {
-        *v = [0.0, 0.0, 0.0];
-    }
+    // ----------------
     {
+        for v in &mut m_imp.data {
+            *v = [geom_eps, 0.0, 0.0];
+        }
         let center = m_imp.idx(cx, cy);
-        m_imp.data[center] = [0.0, 1.0, 0.0];
-    }
-    demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
-    for v in &mut b_mg.data {
-        *v = [0.0, 0.0, 0.0];
-    }
-    mg.add_field(&m_imp, &mut b_mg, ms);
-    for dy in -(r as isize)..=(r as isize) {
-        for dx in -(r as isize)..=(r as isize) {
-            let tx = (cx as isize + dx) as usize;
-            let ty = (cy as isize + dy) as usize;
-            let id = b_fft.idx(tx, ty);
-            let k = dk.idx(dx, dy);
-            dk.dkyy[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
-            dkxy_from_y[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
+        m_imp.data[center] = [geom_eps, 1.0, 0.0];
+
+        for v in &mut b_fft.data {
+            *v = [0.0, 0.0, 0.0];
+        }
+        demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
+
+        for v in &mut b_mg.data {
+            *v = [0.0, 0.0, 0.0];
+        }
+        mg.build_rhs_from_m(&m_imp, ms);
+        mg.solve();
+        mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+
+        for dy in -(r as isize)..=(r as isize) {
+            for dx in -(r as isize)..=(r as isize) {
+                let tx = (cx as isize + dx) as usize;
+                let ty = (cy as isize + dy) as usize;
+                let id = m_imp.idx(tx, ty);
+                let k = dk.idx(dx, dy);
+
+                // For a y-impulse: By gives ΔKyy, Bx gives ΔKyx.
+                dk.dkyy[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
+                dkxy_from_y[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
+            }
         }
     }
 
+    // ----------------
     // Z impulse
-    for v in &mut m_imp.data {
-        *v = [0.0, 0.0, 0.0];
-    }
+    // ----------------
     {
+        for v in &mut m_imp.data {
+            *v = [geom_eps, 0.0, 0.0];
+        }
         let center = m_imp.idx(cx, cy);
-        m_imp.data[center] = [0.0, 0.0, 1.0];
-    }
-    demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
-    for v in &mut b_mg.data {
-        *v = [0.0, 0.0, 0.0];
-    }
-    mg.add_field(&m_imp, &mut b_mg, ms);
-    for dy in -(r as isize)..=(r as isize) {
-        for dx in -(r as isize)..=(r as isize) {
-            let tx = (cx as isize + dx) as usize;
-            let ty = (cy as isize + dy) as usize;
-            let id = b_fft.idx(tx, ty);
-            let k = dk.idx(dx, dy);
-            dk.dkzz[k] = (b_fft.data[id][2] - b_mg.data[id][2]) * ms_inv;
+        m_imp.data[center] = [geom_eps, 0.0, 1.0];
+
+        for v in &mut b_fft.data {
+            *v = [0.0, 0.0, 0.0];
+        }
+        demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
+
+        for v in &mut b_mg.data {
+            *v = [0.0, 0.0, 0.0];
+        }
+        mg.build_rhs_from_m(&m_imp, ms);
+        mg.solve();
+        mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+
+        for dy in -(r as isize)..=(r as isize) {
+            for dx in -(r as isize)..=(r as isize) {
+                let tx = (cx as isize + dx) as usize;
+                let ty = (cy as isize + dy) as usize;
+                let id = m_imp.idx(tx, ty);
+                let k = dk.idx(dx, dy);
+
+                // For a z-impulse: Bz gives ΔKzz.
+                dk.dkzz[k] = (b_fft.data[id][2] - b_mg.data[id][2]) * ms_inv;
+            }
         }
     }
 
-    // Enforce symmetry for ΔKxy by averaging the two ways of extracting it.
-    for i in 0..nst {
-        dk.dkxy[i] = 0.5 * (dkxy_from_x[i] + dkxy_from_y[i]);
+    // Symmetrise xy cross-term and reduce noise by averaging the two measurements.
+    for dy in -(r as isize)..=(r as isize) {
+        for dx in -(r as isize)..=(r as isize) {
+            let k = dk.idx(dx, dy);
+            dk.dkxy[k] = 0.5 * (dkxy_from_x[k] + dkxy_from_y[k]);
+        }
     }
+
+    // Enforce symmetry constraints (helps reduce impulse noise and tiny directional bias).
+    dk.symmetrize(grid.dx, grid.dy);
 
     dk
 }
+
 
 // Cache a solver instance so we don’t rebuild hierarchies every field evaluation.
 static DEMAG_MG_CACHE: OnceLock<Mutex<Option<DemagPoissonMGHybrid>>> = OnceLock::new();

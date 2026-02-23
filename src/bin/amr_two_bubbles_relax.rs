@@ -401,7 +401,7 @@ fn main() -> io::Result<()> {
 
     // Initial patch set from clustering (fallback if needed)
     let (mut patch_rects, init_stats) =
-        match compute_patch_rects_clustered_from_indicator(&m0, cluster_policy) {
+        match compute_patch_rects_clustered_from_indicator(&m0, cluster_policy, None) {
             Some((rs, st)) => (rs, st),
             None => {
                 let w = 64usize;

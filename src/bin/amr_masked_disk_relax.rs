@@ -13,10 +13,13 @@
 // - We compute metrics only INSIDE the mask.
 // - Patch selection uses clustering on the coarse field's mz proxy (to avoid boundary-to-vacuum dominating the indicator).
 
-use llg_sim::amr::{compute_patch_rects_clustered_from_indicator, AmrHierarchy2D, AmrStepperRK4,
-                   ClusterPolicy, Connectivity, Rect2i};
+use llg_sim::amr::{
+    AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i,
+    compute_patch_rects_clustered_from_indicator,
+};
 use llg_sim::effective_field::FieldMask;
-use llg_sim::geometry_mask::{mask_disk, Mask2D};
+use llg_sim::energy::compute_energy_geom;
+use llg_sim::geometry_mask::{Mask2D, mask_disk};
 use llg_sim::grid::Grid2D;
 use llg_sim::initial_states::{apply_mask_zero, init_vortex};
 use llg_sim::llg::RK4Scratch;
@@ -50,7 +53,10 @@ fn write_run_info(
     mat: &Material,
 ) -> io::Result<()> {
     let mut f = fs::File::create(path)?;
-    writeln!(f, "AMR masked disk relaxation benchmark (Stage 2C, demag OFF)")?;
+    writeln!(
+        f,
+        "AMR masked disk relaxation benchmark (Stage 2C, demag OFF)"
+    )?;
     writeln!(f, "")?;
 
     writeln!(
@@ -67,14 +73,22 @@ fn write_run_info(
     writeln!(f, "")?;
 
     writeln!(f, "Vortex initial state (masked):")?;
-    writeln!(f, "  center:       ({:.6e}, {:.6e})", vortex_center.0, vortex_center.1)?;
+    writeln!(
+        f,
+        "  center:       ({:.6e}, {:.6e})",
+        vortex_center.0, vortex_center.1
+    )?;
     writeln!(f, "  polarity:     {:.6e}", polarity)?;
     writeln!(f, "  chirality:    {:.6e}", chirality)?;
     writeln!(f, "  core_radius:  {:.6e}", core_radius)?;
     writeln!(f, "")?;
 
     writeln!(f, "Clustering policy (for initial static patches):")?;
-    writeln!(f, "  indicator_frac:   {:.6e}", cluster_policy.indicator_frac)?;
+    writeln!(
+        f,
+        "  indicator_frac:   {:.6e}",
+        cluster_policy.indicator_frac
+    )?;
     writeln!(f, "  buffer_cells:     {}", cluster_policy.buffer_cells)?;
     writeln!(f, "  connectivity:     {:?}", cluster_policy.connectivity)?;
     writeln!(f, "  merge_distance:   {}", cluster_policy.merge_distance)?;
@@ -147,6 +161,38 @@ fn mz_proxy(field: &VectorField2D) -> VectorField2D {
     for idx in 0..field.grid.n_cells() {
         out.data[idx] = [0.0, 0.0, field.data[idx][2]];
     }
+    out
+}
+
+// Upsample the base-grid mask to the uniform-fine grid so the discretised geometry is identical between AMR and the uniform-fine reference.
+fn upsample_mask_from_base(
+    base_mask: &Mask2D,
+    base: &Grid2D,
+    ratio: usize,
+    fine_grid: &Grid2D,
+) -> Mask2D {
+    assert_eq!(base_mask.len(), base.n_cells());
+    assert_eq!(fine_grid.nx, base.nx * ratio);
+    assert_eq!(fine_grid.ny, base.ny * ratio);
+
+    let fine_nx = fine_grid.nx;
+    let mut out: Mask2D = vec![false; fine_grid.n_cells()];
+
+    for j in 0..base.ny {
+        for i in 0..base.nx {
+            let v = base_mask[i + base.nx * j];
+            let i0 = i * ratio;
+            let j0 = j * ratio;
+            for fj in 0..ratio {
+                for fi in 0..ratio {
+                    let ii = i0 + fi;
+                    let jj = j0 + fj;
+                    out[ii + fine_nx * jj] = v;
+                }
+            }
+        }
+    }
+
     out
 }
 
@@ -225,7 +271,11 @@ fn write_efficiency_metrics(
     } else {
         0.0
     };
-    let speedup = if amr_secs > 0.0 { uniform_secs / amr_secs } else { 0.0 };
+    let speedup = if amr_secs > 0.0 {
+        uniform_secs / amr_secs
+    } else {
+        0.0
+    };
 
     let mut f = fs::File::create(path)?;
     writeln!(f, "coarse_cells:          {}", coarse_cells)?;
@@ -240,6 +290,30 @@ fn write_efficiency_metrics(
     Ok(())
 }
 
+fn write_energy_header(mut f: &fs::File) -> io::Result<()> {
+    writeln!(f, "step,time_s,exchange,anisotropy,zeeman,dmi,demag,total")
+}
+
+fn append_energy_row(
+    mut f: &fs::File,
+    step: usize,
+    time_s: f64,
+    e: llg_sim::energy::EnergyBreakdown,
+) -> io::Result<()> {
+    writeln!(
+        f,
+        "{},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e}",
+        step,
+        time_s,
+        e.exchange,
+        e.anisotropy,
+        e.zeeman,
+        e.dmi,
+        e.demag,
+        e.total()
+    )
+}
+
 fn run_uniform_fine_masked(
     fine_grid: Grid2D,
     fine_mask: &Mask2D,
@@ -250,6 +324,8 @@ fn run_uniform_fine_masked(
     polarity: f64,
     chirality: f64,
     core_radius: f64,
+    energy_path: Option<&Path>,
+    energy_every: usize,
 ) -> (VectorField2D, f64) {
     let mut m = VectorField2D::new(fine_grid);
     init_vortex(
@@ -264,18 +340,36 @@ fn run_uniform_fine_masked(
 
     let mut scratch = RK4Scratch::new(fine_grid);
 
+    let energy_file = if let Some(p) = energy_path {
+        let f = fs::File::create(p).expect("failed to create uniform energy csv");
+        write_energy_header(&f).expect("failed to write uniform energy header");
+        Some(f)
+    } else {
+        None
+    };
+
     let t0 = Instant::now();
     for step in 0..n_steps {
-        llg_sim::llg::step_llg_rk4_recompute_field_masked_relax(
+        llg_sim::llg::step_llg_rk4_recompute_field_masked_relax_geom(
             &mut m,
             params,
             mat,
             &mut scratch,
             FieldMask::ExchAnis,
+            Some(fine_mask.as_slice()),
         );
 
         // Keep vacuum cells pinned to zero (cheap and makes intent explicit).
         apply_mask_zero(&mut m, fine_mask);
+
+        if let Some(ref f) = energy_file {
+            if energy_every > 0 && (step % energy_every == 0) {
+                let e =
+                    compute_energy_geom(&m.grid, &m, mat, params.b_ext, Some(fine_mask.as_slice()));
+                let t = (step as f64) * params.dt;
+                append_energy_row(f, step, t, e).expect("failed to write uniform energy row");
+            }
+        }
 
         if step % 200 == 0 {
             println!("[uniform] step {step}/{n_steps}");
@@ -358,7 +452,7 @@ fn main() -> io::Result<()> {
 
     let fallback = Rect2i::new(base.nx / 2 - 24, base.ny / 2 - 24, 48, 48);
     let (patch_rects, stats) =
-        match compute_patch_rects_clustered_from_indicator(&proxy0, cluster_policy) {
+        match compute_patch_rects_clustered_from_indicator(&proxy0,cluster_policy,Some(mask_base.as_slice()),) {
             Some((rs, st)) if !rs.is_empty() => (rs, st),
             _ => {
                 let rs = vec![fallback];
@@ -374,16 +468,31 @@ fn main() -> io::Result<()> {
             }
         };
 
-    println!("[init] max_indicator(mz proxy, coarse) = {:.9e}", stats.max_indicator);
+    println!(
+        "[init] max_indicator(mz proxy, coarse) = {:.9e}",
+        stats.max_indicator
+    );
     println!("[init] clustered patches: {}", patch_rects.len());
     for (k, r) in patch_rects.iter().enumerate() {
-        println!("[init] patch {k}: i0={} j0={} nx={} ny={}", r.i0, r.j0, r.nx, r.ny);
+        println!(
+            "[init] patch {k}: i0={} j0={} nx={} ny={}",
+            r.i0, r.j0, r.nx, r.ny
+        );
     }
 
     // ----------------------------
     // 4) Outputs
     // ----------------------------
     let out_dir = ensure_out_dir()?;
+
+    // Energy logging cadence (steps). Set to 0 to disable.
+    let energy_every: usize = 20;
+
+    let energy_amr_path = out_dir.join("energy_amr.csv");
+    let energy_uniform_path = out_dir.join("energy_uniform.csv");
+
+    let energy_amr_file = fs::File::create(&energy_amr_path)?;
+    write_energy_header(&energy_amr_file)?;
 
     write_run_info(
         &out_dir.join("run_info.txt"),
@@ -405,17 +514,35 @@ fn main() -> io::Result<()> {
     // 5) Run AMR
     // ----------------------------
     let mut h_amr = AmrHierarchy2D::new(base, m0, ratio, ghost);
+
+    // Store the geometry mask on the hierarchy so the AMR stepper can call the
+    // mask-aware coarse-grid steppers internally.
+    h_amr.set_geom_mask(mask_base.clone());
+
     for r in &patch_rects {
         h_amr.add_patch(*r);
     }
+
     let mut stepper = AmrStepperRK4::new(&h_amr, true);
 
     let t0 = Instant::now();
     for step in 0..n_steps {
         stepper.step(&mut h_amr, &params, &mat, FieldMask::ExchAnis);
 
-        // Keep vacuum pinned to zero on the coarse level.
+        // Safety belt: keep vacuum pinned to zero on the coarse level.
         apply_mask_zero(&mut h_amr.coarse, &mask_base);
+
+        if energy_every > 0 && (step % energy_every == 0) {
+            let e = compute_energy_geom(
+                &h_amr.coarse.grid,
+                &h_amr.coarse,
+                &mat,
+                params.b_ext,
+                Some(mask_base.as_slice()),
+            );
+            let t = (step as f64) * params.dt;
+            append_energy_row(&energy_amr_file, step, t, e)?;
+        }
 
         if step % 200 == 0 {
             println!("[amr] step {step}/{n_steps}");
@@ -428,7 +555,7 @@ fn main() -> io::Result<()> {
     // Flatten and then apply fine mask to avoid interpolation bleed outside geometry.
     let mut fine_amr = h_amr.flatten_to_uniform_fine();
     let fine_grid = fine_amr.grid;
-    let fine_mask = mask_disk(&fine_grid, disk_radius, (0.0, 0.0));
+    let fine_mask = upsample_mask_from_base(&mask_base, &base, ratio, &fine_grid);
     apply_mask_zero(&mut fine_amr, &fine_mask);
 
     // ----------------------------
@@ -444,6 +571,8 @@ fn main() -> io::Result<()> {
         polarity,
         chirality,
         core_radius,
+        Some(&energy_uniform_path),
+        energy_every,
     );
     apply_mask_zero(&mut fine_uniform, &fine_mask);
 
@@ -480,6 +609,8 @@ fn main() -> io::Result<()> {
     println!("[mask] max |m| outside mask (amr) = {:.6e}", leak_amr);
     println!("[mask] max |m| outside mask (uni) = {:.6e}", leak_uni);
     println!("[output] wrote {}", out_dir.display());
+    println!("[energy] wrote {}", energy_amr_path.display());
+    println!("[energy] wrote {}", energy_uniform_path.display());
 
     Ok(())
 }

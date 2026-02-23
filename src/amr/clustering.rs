@@ -6,7 +6,7 @@
 // - Given a coarse-grid refinement indicator, identify *multiple disjoint* regions
 //   that should be refined and return a set of disjoint Rect2i patches.
 //
-// Approach (v0, practical):
+// Approach (practical v0):
 // 1) Compute indicator per cell and threshold at frac * max(indicator).
 // 2) Flag cells above threshold.
 // 3) Connected-components labelling on the flagged mask -> per-component bbox.
@@ -14,13 +14,15 @@
 // 5) Merge overlapping / near bboxes (merge_distance).
 // 6) Optionally down-select to max_patches via greedy merges.
 //
-// This intentionally stays simple (no Berger–Rigoutsos yet). It's designed to be
-// a clean stepping stone to "real" BR clustering later.
+// This intentionally stays simple (no Berger–Rigoutsos yet). It is designed to be
+// a clean stepping stone: it behaves deterministically, is easy to reason about,
+// and is "good enough" for localized textures (walls/vortices/bubbles/skyrmions).
 
 use std::collections::VecDeque;
 
-use crate::amr::indicator::indicator_grad2_forward;
+use crate::amr::indicator::indicator_grad2_forward_geom;
 use crate::amr::rect::Rect2i;
+use crate::geometry_mask::assert_mask_len;
 use crate::vector_field::VectorField2D;
 
 #[derive(Clone, Copy, Debug)]
@@ -77,8 +79,7 @@ impl ClusterPolicy {
         }
     }
 
-    /// Settings tuned for localized textures (bubbles/vortices/skyrmions) as validated
-    /// by `amr_two_bubbles_relax`.
+    /// Settings tuned for localized textures (bubbles/vortices/skyrmions).
     pub fn tuned_local_features() -> Self {
         Self::default()
     }
@@ -119,10 +120,33 @@ fn rects_overlap_or_near(a: Rect2i, b: Rect2i, merge_dist: usize, nx: usize, ny:
     a_exp.intersect(b).is_some()
 }
 
+#[inline]
+fn neighbour_offsets(conn: Connectivity) -> &'static [(isize, isize)] {
+    match conn {
+        Connectivity::Four => &[(1, 0), (-1, 0), (0, 1), (0, -1)],
+        Connectivity::Eight => &[
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ],
+    }
+}
+
 /// Compute clustered patch rectangles from an indicator on the *coarse* grid.
+///
+/// If `geom_mask` is provided:
+/// - Vacuum cells (mask=false) have indicator 0.
+/// - Forward neighbours outside the mask are treated as equal to the center cell (free boundary),
+///   so the indicator does not artificially spike at material–vacuum edges.
 pub fn compute_patch_rects_clustered_from_indicator(
     coarse: &VectorField2D,
     policy: ClusterPolicy,
+    geom_mask: Option<&[bool]>,
 ) -> Option<(Vec<Rect2i>, ClusterStats)> {
     let nx = coarse.grid.nx;
     let ny = coarse.grid.ny;
@@ -130,11 +154,15 @@ pub fn compute_patch_rects_clustered_from_indicator(
         return None;
     }
 
+    if let Some(msk) = geom_mask {
+        assert_mask_len(msk, &coarse.grid);
+    }
+
     // 1) max indicator
     let mut max_ind = 0.0_f64;
     for j in 0..ny {
         for i in 0..nx {
-            let ind = indicator_grad2_forward(coarse, i, j);
+            let ind = indicator_grad2_forward_geom(coarse, i, j, geom_mask);
             if ind > max_ind {
                 max_ind = ind;
             }
@@ -152,7 +180,7 @@ pub fn compute_patch_rects_clustered_from_indicator(
     let mut flagged_cells = 0usize;
     for j in 0..ny {
         for i in 0..nx {
-            let ind = indicator_grad2_forward(coarse, i, j);
+            let ind = indicator_grad2_forward_geom(coarse, i, j, geom_mask);
             if ind >= thresh {
                 flagged[idx(i, j, nx)] = true;
                 flagged_cells += 1;
@@ -167,31 +195,7 @@ pub fn compute_patch_rects_clustered_from_indicator(
     // 3) connected components -> bboxes
     let mut visited = vec![false; nx * ny];
     let mut rects: Vec<Rect2i> = Vec::new();
-
-    let neigh = |ii: isize, jj: isize, conn: Connectivity| -> [(isize, isize); 8] {
-        match conn {
-            Connectivity::Four => [
-                (ii - 1, jj),
-                (ii + 1, jj),
-                (ii, jj - 1),
-                (ii, jj + 1),
-                (ii, jj), // unused slots
-                (ii, jj),
-                (ii, jj),
-                (ii, jj),
-            ],
-            Connectivity::Eight => [
-                (ii - 1, jj),
-                (ii + 1, jj),
-                (ii, jj - 1),
-                (ii, jj + 1),
-                (ii - 1, jj - 1),
-                (ii - 1, jj + 1),
-                (ii + 1, jj - 1),
-                (ii + 1, jj + 1),
-            ],
-        }
-    };
+    let neigh = neighbour_offsets(policy.connectivity);
 
     for j0 in 0..ny {
         for i0 in 0..nx {
@@ -219,8 +223,9 @@ pub fn compute_patch_rects_clustered_from_indicator(
                 j_min = j_min.min(jj_u);
                 j_max = j_max.max(jj_u);
 
-                let ns = neigh(ii, jj, policy.connectivity);
-                for (ni, nj) in ns {
+                for (di, dj) in neigh {
+                    let ni = ii + di;
+                    let nj = jj + dj;
                     if ni < 0 || nj < 0 {
                         continue;
                     }

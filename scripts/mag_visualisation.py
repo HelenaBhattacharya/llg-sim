@@ -109,9 +109,59 @@ def _edges_nm(m: df.Field) -> Tuple[float, float]:
     return float(edges[0]) * 1e9, float(edges[1]) * 1e9
 
 
+
 def _auto_arrow_stride(nx: int, ny: int, target: int = 10) -> int:
     """Choose a quiver stride that yields ~target arrows across the smaller dimension."""
     return max(1, int(round(min(nx, ny) / float(target))))
+
+
+def _resample_vec_bilinear(src: np.ndarray, nx_t: int, ny_t: int) -> np.ndarray:
+    """Resample a (nx, ny, 3) vector field to (nx_t, ny_t, 3) via bilinear interpolation.
+
+    Assumes source and target cover the same physical extent (cell-centre aligned).
+    Used to align MuMax vs Rust grids in SP2 sweep triptych plots.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    if src.ndim != 3 or src.shape[2] != 3:
+        raise ValueError(f"Expected src shape (nx, ny, 3), got {src.shape}")
+
+    nx_s, ny_s, _ = src.shape
+    nx_t = int(nx_t)
+    ny_t = int(ny_t)
+    if nx_t <= 0 or ny_t <= 0:
+        raise ValueError(f"Invalid target shape ({nx_t}, {ny_t})")
+
+    x = (np.arange(nx_t, dtype=np.float64) + 0.5) * (nx_s / nx_t) - 0.5
+    y = (np.arange(ny_t, dtype=np.float64) + 0.5) * (ny_s / ny_t) - 0.5
+
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    x0 = np.clip(x0, 0, nx_s - 1)
+    x1 = np.clip(x1, 0, nx_s - 1)
+    y0 = np.clip(y0, 0, ny_s - 1)
+    y1 = np.clip(y1, 0, ny_s - 1)
+
+    wx = (x - x0).astype(np.float64)
+    wy = (y - y0).astype(np.float64)
+
+    wx2 = wx[:, None]
+    wy2 = wy[None, :]
+
+    v00 = src[x0[:, None], y0[None, :], :]
+    v10 = src[x1[:, None], y0[None, :], :]
+    v01 = src[x0[:, None], y1[None, :], :]
+    v11 = src[x1[:, None], y1[None, :], :]
+
+    w00 = (1.0 - wx2) * (1.0 - wy2)
+    w10 = wx2 * (1.0 - wy2)
+    w01 = (1.0 - wx2) * wy2
+    w11 = wx2 * wy2
+
+    out = w00[:, :, None] * v00 + w10[:, :, None] * v10 + w01[:, :, None] * v01 + w11[:, :, None] * v11
+    return out.astype(np.float64, copy=False)
 
 
 def plot_component_with_quiver(
@@ -400,6 +450,376 @@ def plot_residual_with_quiver(
     plt.close(fig)
 
 
+
+def plot_abd_triptych(
+    a: df.Field,
+    b: df.Field,
+    comp: str,
+    out_path: Path,
+    title: str,
+    clim: Optional[Tuple[float, float]] = (-1.0, 1.0),
+    show_arrows: bool = False,
+    arrow_stride: Optional[int] = None,
+    units: str = "nm",
+    cmap: str = "RdBu_r",
+    arrow_color: str = "white",
+    arrow_scale_cells: float = 10.0,
+    arrow_width: float = 0.0018,
+    delta_clim: Optional[Tuple[float, float]] = None,
+) -> None:
+    """Triptych plot: A (rust), B (mumax), and Δ = A - B.
+
+    Intended for meeting slides: A/B/Δ shown in one figure with a fixed, shared color scale.
+    Δ uses the same vmin/vmax as A and B when `clim` is provided.
+
+    Background scalar is the requested component (mx/my/mz/mpar).
+    Quiver arrows (if enabled) show in-plane vectors:
+      - for A and B: (mx, my)
+      - for Δ: (Δmx, Δmy)
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    va = _field_vector_array_2d(a)
+    vb = _field_vector_array_2d(b)
+    if va.shape != vb.shape:
+        raise ValueError(f"Triptych requires matching shapes, got {va.shape} vs {vb.shape}")
+
+    axa = va[:, :, 0]
+    aya = va[:, :, 1]
+    aza = va[:, :, 2]
+
+    axb = vb[:, :, 0]
+    ayb = vb[:, :, 1]
+    azb = vb[:, :, 2]
+
+    if comp == "mx":
+        A_bg = axa
+        B_bg = axb
+        D_bg = axa - axb
+        cbar_label_ab = "m_x"
+        cbar_label_d = "Δm_x"
+    elif comp == "my":
+        A_bg = aya
+        B_bg = ayb
+        D_bg = aya - ayb
+        cbar_label_ab = "m_y"
+        cbar_label_d = "Δm_y"
+    elif comp == "mz":
+        A_bg = aza
+        B_bg = azb
+        D_bg = aza - azb
+        cbar_label_ab = "m_z"
+        cbar_label_d = "Δm_z"
+    elif comp in {"mpar", "m_parallel", "mproj"}:
+        A_bg = -(axa + aya + aza) / np.sqrt(3.0)
+        B_bg = -(axb + ayb + azb) / np.sqrt(3.0)
+        D_bg = A_bg - B_bg
+        cbar_label_ab = "m_parallel"
+        cbar_label_d = "Δm_parallel"
+    else:
+        raise ValueError(f"Unknown component: {comp}")
+
+    nx, ny = A_bg.shape
+    if arrow_stride is None:
+        arrow_stride = _auto_arrow_stride(nx, ny)
+    s = max(1, int(arrow_stride))
+
+    if units == "nm":
+        lx, ly = _edges_nm(a)
+        xlabel, ylabel = "x (nm)", "y (nm)"
+    else:
+        edges = a.mesh.region.edges
+        lx, ly = float(edges[0]), float(edges[1])
+        xlabel, ylabel = "x (m)", "y (m)"
+
+    xs = (np.arange(nx) + 0.5) * (lx / nx)
+    ys = (np.arange(ny) + 0.5) * (ly / ny)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    Xs = X[::s, ::s]
+    Ys = Y[::s, ::s]
+
+    dx = lx / nx
+    dy = ly / ny
+
+    Ua = axa[::s, ::s] * dx * arrow_scale_cells
+    Va = aya[::s, ::s] * dy * arrow_scale_cells
+    Ub = axb[::s, ::s] * dx * arrow_scale_cells
+    Vb = ayb[::s, ::s] * dy * arrow_scale_cells
+    Ud = (axa - axb)[::s, ::s] * dx * arrow_scale_cells
+    Vd = (aya - ayb)[::s, ::s] * dy * arrow_scale_cells
+
+    aspect = (lx / ly) if (ly > 0) else 1.0
+    aspect = max(0.25, min(4.0, float(aspect)))
+    panel_h = 4.0
+    panel_w = min(7.5, 4.0 * aspect)
+    fig_w = 3.0 * panel_w
+    fig_h = panel_h
+
+    # GridSpec: top row = 3 panels; bottom row = 2 colorbars (A/B share; Δ separate)
+    fig = plt.figure(figsize=(fig_w, fig_h + 1.35))
+    gs = fig.add_gridspec(
+        nrows=2,
+        ncols=3,
+        height_ratios=[20.0, 1.2],
+        hspace=0.35,
+        wspace=0.08,
+    )
+    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])]
+    cax_ab = fig.add_subplot(gs[1, 0:2])
+    cax_d = fig.add_subplot(gs[1, 2])
+
+    # If delta_clim is provided, use fixed [-1,1] for A/B and separate limits for Δ.
+    ab_clim = (-1.0, 1.0) if delta_clim is not None else clim
+    d_clim = delta_clim if delta_clim is not None else clim
+
+    im0 = axes[0].imshow(
+        A_bg.T,
+        origin="lower",
+        extent=(0, lx, 0, ly),
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=ab_clim[0] if ab_clim else None,
+        vmax=ab_clim[1] if ab_clim else None,
+    )
+    axes[0].set_title("A (rust)")
+    axes[0].set_xlim(0, lx)
+    axes[0].set_ylim(0, ly)
+
+    axes[1].imshow(
+        B_bg.T,
+        origin="lower",
+        extent=(0, lx, 0, ly),
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=ab_clim[0] if ab_clim else None,
+        vmax=ab_clim[1] if ab_clim else None,
+    )
+    axes[1].set_title("B (mumax)")
+    axes[1].set_xlim(0, lx)
+    axes[1].set_ylim(0, ly)
+
+    imd = axes[2].imshow(
+        D_bg.T,
+        origin="lower",
+        extent=(0, lx, 0, ly),
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=d_clim[0] if d_clim else None,
+        vmax=d_clim[1] if d_clim else None,
+    )
+    axes[2].set_title("Δ = A − B")
+    axes[2].set_xlim(0, lx)
+    axes[2].set_ylim(0, ly)
+
+    if show_arrows:
+        for ax, U, V in [(axes[0], Ua, Va), (axes[1], Ub, Vb), (axes[2], Ud, Vd)]:
+            ax.quiver(
+                Xs.T, Ys.T, U.T, V.T,
+                color=arrow_color, angles="xy", scale_units="xy", scale=1.0,
+                width=arrow_width, pivot="mid",
+                headwidth=3.0, headlength=3.0, headaxislength=3.0, minlength=0.0,
+            )
+
+    for ax in axes:
+        ax.set_xlabel(xlabel)
+    axes[0].set_ylabel(ylabel)
+
+    fig.suptitle(title)
+
+    # Colorbar for A/B (shared)
+    cbar_ab = fig.colorbar(im0, cax=cax_ab, orientation="horizontal")
+    cbar_ab.set_label(cbar_label_ab)
+
+    # Colorbar for Δ (separate scale)
+    cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
+    cbar_d.set_label(cbar_label_d)
+
+    # Manual spacing (avoid tight_layout warnings with colorbar axes)
+    fig.subplots_adjust(top=0.88, bottom=0.14)
+
+    fig.savefig(out_path, dpi=250, bbox_inches="tight")
+# end plot_abd_triptych
+    plt.close(fig)
+
+
+def plot_abd_triptych_arrays(
+    va: np.ndarray,
+    vb: np.ndarray,
+    lx: float,
+    ly: float,
+    comp: str,
+    out_path: Path,
+    title: str,
+    clim: Optional[Tuple[float, float]] = (-1.0, 1.0),
+    delta_clim: Optional[Tuple[float, float]] = None,
+    show_arrows: bool = False,
+    arrow_stride: Optional[int] = None,
+    units: str = "nm",
+    cmap: str = "RdBu_r",
+    arrow_color: str = "white",
+    arrow_scale_cells: float = 10.0,
+    arrow_width: float = 0.0018,
+) -> None:
+    """Triptych plot using raw vector arrays (nx, ny, 3) for A and B.
+
+    This is used for SP2 sweep compare where Rust and MuMax grids may differ. B can be resampled
+    onto A before calling this function.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    va = np.asarray(va, dtype=np.float64)
+    vb = np.asarray(vb, dtype=np.float64)
+    if va.shape != vb.shape:
+        raise ValueError(f"Triptych arrays require matching shapes, got {va.shape} vs {vb.shape}")
+
+    axa, aya, aza = va[:, :, 0], va[:, :, 1], va[:, :, 2]
+    axb, ayb, azb = vb[:, :, 0], vb[:, :, 1], vb[:, :, 2]
+
+    if comp == "mx":
+        A_bg, B_bg = axa, axb
+        D_bg = axa - axb
+        cbar_label_ab, cbar_label_d = "m_x", "Δm_x"
+    elif comp == "my":
+        A_bg, B_bg = aya, ayb
+        D_bg = aya - ayb
+        cbar_label_ab, cbar_label_d = "m_y", "Δm_y"
+    elif comp == "mz":
+        A_bg, B_bg = aza, azb
+        D_bg = aza - azb
+        cbar_label_ab, cbar_label_d = "m_z", "Δm_z"
+    elif comp in {"mpar", "m_parallel", "mproj"}:
+        A_bg = -(axa + aya + aza) / np.sqrt(3.0)
+        B_bg = -(axb + ayb + azb) / np.sqrt(3.0)
+        D_bg = A_bg - B_bg
+        cbar_label_ab, cbar_label_d = "m_parallel", "Δm_parallel"
+    else:
+        raise ValueError(f"Unknown component: {comp}")
+
+    nx, ny = A_bg.shape
+    if arrow_stride is None:
+        arrow_stride = _auto_arrow_stride(nx, ny)
+    s = max(1, int(arrow_stride))
+
+    xlabel, ylabel = ("x (nm)", "y (nm)") if units == "nm" else ("x (m)", "y (m)")
+
+    xs = (np.arange(nx) + 0.5) * (lx / nx)
+    ys = (np.arange(ny) + 0.5) * (ly / ny)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    Xs = X[::s, ::s]
+    Ys = Y[::s, ::s]
+
+    dx = lx / nx
+    dy = ly / ny
+
+    Ua = axa[::s, ::s] * dx * arrow_scale_cells
+    Va = aya[::s, ::s] * dy * arrow_scale_cells
+    Ub = axb[::s, ::s] * dx * arrow_scale_cells
+    Vb = ayb[::s, ::s] * dy * arrow_scale_cells
+    Ud = (axa - axb)[::s, ::s] * dx * arrow_scale_cells
+    Vd = (aya - ayb)[::s, ::s] * dy * arrow_scale_cells
+
+    aspect = (lx / ly) if (ly > 0) else 1.0
+    aspect = max(0.25, min(4.0, float(aspect)))
+    panel_h = 4.0
+    panel_w = min(7.5, 4.0 * aspect)
+    fig_w = 3.0 * panel_w
+    fig_h = panel_h
+
+    fig = plt.figure(figsize=(fig_w, fig_h + 1.35))
+    gs = fig.add_gridspec(
+        nrows=2,
+        ncols=3,
+        height_ratios=[20.0, 1.2],
+        hspace=0.35,
+        wspace=0.08,
+    )
+    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])]
+    cax_ab = fig.add_subplot(gs[1, 0:2])
+    cax_d = fig.add_subplot(gs[1, 2])
+
+    ab_clim = (-1.0, 1.0) if delta_clim is not None else clim
+    d_clim = delta_clim if delta_clim is not None else clim
+
+    im0 = axes[0].imshow(
+        A_bg.T,
+        origin="lower",
+        extent=(0, lx, 0, ly),
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=ab_clim[0] if ab_clim else None,
+        vmax=ab_clim[1] if ab_clim else None,
+    )
+    axes[0].set_title("A (rust)")
+    axes[0].set_xlim(0, lx)
+    axes[0].set_ylim(0, ly)
+
+    axes[1].imshow(
+        B_bg.T,
+        origin="lower",
+        extent=(0, lx, 0, ly),
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=ab_clim[0] if ab_clim else None,
+        vmax=ab_clim[1] if ab_clim else None,
+    )
+    axes[1].set_title("B (mumax)")
+    axes[1].set_xlim(0, lx)
+    axes[1].set_ylim(0, ly)
+
+    imd = axes[2].imshow(
+        D_bg.T,
+        origin="lower",
+        extent=(0, lx, 0, ly),
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=d_clim[0] if d_clim else None,
+        vmax=d_clim[1] if d_clim else None,
+    )
+    axes[2].set_title("Δ = A − B")
+    axes[2].set_xlim(0, lx)
+    axes[2].set_ylim(0, ly)
+
+    if show_arrows:
+        for ax, U, V in [(axes[0], Ua, Va), (axes[1], Ub, Vb), (axes[2], Ud, Vd)]:
+            ax.quiver(
+                Xs.T,
+                Ys.T,
+                U.T,
+                V.T,
+                color=arrow_color,
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                width=arrow_width,
+                pivot="mid",
+                headwidth=3.0,
+                headlength=3.0,
+                headaxislength=3.0,
+                minlength=0.0,
+            )
+
+    for ax in axes:
+        ax.set_xlabel(xlabel)
+    axes[0].set_ylabel(ylabel)
+
+    fig.suptitle(title)
+
+    cbar_ab = fig.colorbar(im0, cax=cax_ab, orientation="horizontal")
+    cbar_ab.set_label(cbar_label_ab)
+
+    cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
+    cbar_d.set_label(cbar_label_d)
+
+    fig.subplots_adjust(top=0.88, bottom=0.14)
+
+    fig.savefig(out_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
 # -----------------------------------------------------------------------------
 # Movie helper
 # -----------------------------------------------------------------------------
@@ -621,7 +1041,7 @@ def export_series_frames(
         arrow_width=0.0018,
         show_arrows=True,
         show_axes=style.show_axes,
-        show_colorbar=False,
+        show_colorbar=True,
         clim=clim,
     )
 
@@ -702,9 +1122,11 @@ def export_series_frames(
                 plot_component_with_quiver(m, comp, out_png_v, title, style_vec, units=units)
 
     if movie:
+        # Standard movie from scalar-only frames
         frames_dir = frame_dirs[movie_component]
         out_mp4 = base_dir / "movies" / f"{series.kind}_{movie_component}.mp4"
         ok = write_mp4_from_frames(frames_dir, out_mp4, fps=fps)
+
         if verbose:
             if ok:
                 print(f"  [movie] wrote {out_mp4}")
@@ -717,6 +1139,20 @@ def export_series_frames(
                         f"    ffmpeg -y -framerate {fps} -i {frames_dir}/frame_%06d.png "
                         f"-c:v libx264 -pix_fmt yuv420p {out_mp4}"
                     )
+
+        # If vectors were requested, also build a vectors-overlay movie
+        if vectors:
+            frames_dir_v = vector_frame_dirs[movie_component]
+            out_mp4_v = base_dir / "movies" / f"{series.kind}_{movie_component}_vectors.mp4"
+            ok_v = write_mp4_from_frames(frames_dir_v, out_mp4_v, fps=fps)
+            if verbose:
+                if ok_v:
+                    print(f"  [movie] wrote {out_mp4_v} (vectors + colorbar)")
+                else:
+                    if _ffmpeg_available():
+                        print(f"  [movie] ffmpeg failed for {out_mp4_v} (vectors movie)")
+                    else:
+                        print("  [movie] ffmpeg not found; vectors frames exported only")
 
 
 def export_residual_series(
@@ -805,6 +1241,246 @@ def export_residual_series(
 
     print("  [compare] SP2 evolution compare not enabled (requires aligned time-series).")
 
+def export_abd_triptych_series(
+    series_a: ovf_utils.OvfSeries,
+    series_b: ovf_utils.OvfSeries,
+    out_root: Path,
+    components: Sequence[str],
+    units: str,
+    clim: Optional[Tuple[float, float]] = (-1.0, 1.0),
+    vectors: bool = False,
+    movie: bool = False,
+    movie_component: str = "mx",
+    fps: float = 10.0,
+    max_frames: Optional[int] = None,
+) -> None:
+    """Export A/B/Δ triptych frames for aligned series (SP4 time-series)."""
+    if series_a.problem != series_b.problem:
+        raise ValueError("Triptych export requires matching problems")
+
+    comps = _normalise_components(components)
+    if movie_component not in comps:
+        comps = list(comps) + [movie_component]
+
+    if series_a.problem != "sp4":
+        print("  [compare-abd] Only SP4 triptych export is enabled right now")
+        return
+
+    n = min(len(series_a.frames), len(series_b.frames))
+    if max_frames is not None:
+        n = min(n, int(max_frames))
+
+    base_dir = out_root / "compare_abd" / "sp4" / f"{series_a.source}_vs_{series_b.source}" / series_a.kind
+    frame_dirs = {comp: (base_dir / "frames" / comp) for comp in comps}
+    for d in frame_dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    # If clim is None (i.e. --clim auto), we keep A/B fixed at [-1,1] but autoscale Δ.
+    # To avoid per-frame flicker in movies, compute a per-component max|Δ| over the whole series.
+    delta_clims: Dict[str, Optional[Tuple[float, float]]] = {comp: None for comp in comps}
+    if clim is None:
+        maxabs: Dict[str, float] = {comp: 0.0 for comp in comps}
+        for i in range(n):
+            a = ovf_utils.load_slice_field(series_a.frames[i])
+            b = ovf_utils.load_slice_field(series_b.frames[i])
+            va = _field_vector_array_2d(a)
+            vb = _field_vector_array_2d(b)
+            dm = va - vb
+            dmx = dm[:, :, 0]
+            dmy = dm[:, :, 1]
+            dmz = dm[:, :, 2]
+            for comp in comps:
+                if comp == "mx":
+                    m = dmx
+                elif comp == "my":
+                    m = dmy
+                elif comp == "mz":
+                    m = dmz
+                elif comp in {"mpar", "m_parallel", "mproj"}:
+                    m = -(dmx + dmy + dmz) / np.sqrt(3.0)
+                else:
+                    continue
+                v = float(np.max(np.abs(m)))
+                if v > maxabs[comp]:
+                    maxabs[comp] = v
+
+        for comp in comps:
+            m = maxabs.get(comp, 0.0)
+            if m <= 0.0:
+                m = 1e-12
+            delta_clims[comp] = (-m, m)
+
+    for i in range(n):
+        a = ovf_utils.load_slice_field(series_a.frames[i])
+        b = ovf_utils.load_slice_field(series_b.frames[i])
+        flabel = _frame_label_sp4(series_a, i)
+        for comp in comps:
+            title = f"SP4 {series_a.kind} {series_a.source} vs {series_b.source}  {flabel}  ({comp})"
+            out_png = frame_dirs[comp] / f"frame_{i:06d}.png"
+            plot_abd_triptych(
+                a,
+                b,
+                comp=comp,
+                out_path=out_png,
+                title=title,
+                clim=clim,
+                delta_clim=delta_clims.get(comp),
+                show_arrows=bool(vectors),
+                units=units,
+            )
+
+    if movie:
+        frames_dir = frame_dirs[movie_component]
+        out_mp4 = base_dir / "movies" / f"{series_a.kind}_{movie_component}_abd.mp4"
+        write_mp4_from_frames(frames_dir, out_mp4, fps=fps)
+
+
+def export_abd_triptych_sp2_sweep(
+    series_a: ovf_utils.OvfSeries,
+    series_b: ovf_utils.OvfSeries,
+    out_root: Path,
+    units: str,
+    stage: str,
+    components: Sequence[str],
+    clim: Optional[Tuple[float, float]] = (-1.0, 1.0),
+    vectors: bool = False,
+    movie: bool = False,
+    movie_component: str = "mx",
+    fps: float = 10.0,
+) -> None:
+    """Export A/B/Δ triptych images for SP2 sweep finals (one per d/lex).
+
+    Handles different discretisations between Rust and MuMax by resampling B onto A per d.
+    """
+    if not (series_a.kind.startswith("sweep") and series_b.kind.startswith("sweep")):
+        print("  [compare-abd] SP2 triptych only enabled for sweep series")
+        return
+
+    def d_from(p: Path) -> Optional[int]:
+        m = re.search(r"m_d(\d+)_", p.name)
+        return int(m.group(1)) if m else None
+
+    map_a: Dict[int, Path] = {}
+    for p in series_a.frames:
+        d = d_from(p)
+        if d is not None:
+            map_a[int(d)] = p
+
+    map_b: Dict[int, Path] = {}
+    for p in series_b.frames:
+        d = d_from(p)
+        if d is not None:
+            map_b[int(d)] = p
+
+    common = sorted(set(map_a.keys()) & set(map_b.keys()), reverse=True)
+    if not common:
+        print("  [compare-abd] No common d values between series")
+        return
+
+    comps = _normalise_components(components)
+    if movie_component not in comps:
+        comps = list(comps) + [movie_component]
+
+    base_dir = (
+        out_root
+        / "compare_abd"
+        / "sp2"
+        / f"{series_a.source}_vs_{series_b.source}"
+        / "sweep"
+        / (stage or series_a.stage or "unknown")
+    )
+
+    frame_dirs = {comp: (base_dir / "frames" / comp) for comp in comps}
+    for ddir in frame_dirs.values():
+        ddir.mkdir(parents=True, exist_ok=True)
+
+    # If clim is None (--clim auto), keep A/B fixed [-1,1] and autoscale Δ per component across all d.
+    delta_clims: Dict[str, Optional[Tuple[float, float]]] = {comp: None for comp in comps}
+    if clim is None:
+        maxabs: Dict[str, float] = {comp: 0.0 for comp in comps}
+        for d in common:
+            a = ovf_utils.load_slice_field(map_a[d])
+            b = ovf_utils.load_slice_field(map_b[d])
+            va = _field_vector_array_2d(a)
+            vb = _field_vector_array_2d(b)
+            if vb.shape != va.shape:
+                vb = _resample_vec_bilinear(vb, va.shape[0], va.shape[1])
+            dm = va - vb
+            dmx, dmy, dmz = dm[:, :, 0], dm[:, :, 1], dm[:, :, 2]
+            for comp in comps:
+                if comp == "mx":
+                    m = dmx
+                elif comp == "my":
+                    m = dmy
+                elif comp == "mz":
+                    m = dmz
+                elif comp in {"mpar", "m_parallel", "mproj"}:
+                    m = -(dmx + dmy + dmz) / np.sqrt(3.0)
+                else:
+                    continue
+                v = float(np.max(np.abs(m)))
+                if v > maxabs[comp]:
+                    maxabs[comp] = v
+        for comp in comps:
+            m = maxabs.get(comp, 0.0)
+            if m <= 0.0:
+                m = 1e-12
+            delta_clims[comp] = (-m, m)
+
+    for d in common:
+        a = ovf_utils.load_slice_field(map_a[d])
+        b = ovf_utils.load_slice_field(map_b[d])
+        va = _field_vector_array_2d(a)
+        vb = _field_vector_array_2d(b)
+        if vb.shape != va.shape:
+            vb = _resample_vec_bilinear(vb, va.shape[0], va.shape[1])
+
+        # Use A's physical extent for axes
+        if units == "nm":
+            lx, ly = _edges_nm(a)
+        else:
+            edges = a.mesh.region.edges
+            lx, ly = float(edges[0]), float(edges[1])
+
+        for comp in comps:
+            title = f"SP2 sweep {stage} {series_a.source} vs {series_b.source} d/lex={d} ({comp})"
+            out_png = frame_dirs[comp] / f"d{int(d):02d}.png"
+            plot_abd_triptych_arrays(
+                va,
+                vb,
+                lx,
+                ly,
+                comp=comp,
+                out_path=out_png,
+                title=title,
+                clim=clim,
+                delta_clim=delta_clims.get(comp),
+                show_arrows=bool(vectors),
+                units=units,
+            )
+
+    if movie:
+        comp_dir = frame_dirs[movie_component]
+        frames_dir = comp_dir / "_frames_tmp"
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, d in enumerate(common):
+            src = comp_dir / f"d{int(d):02d}.png"
+            if src.exists():
+                shutil.copyfile(src, frames_dir / f"frame_{i:06d}.png")
+
+        out_mp4 = base_dir / "movies" / f"sweep_{stage}_{movie_component}_abd.mp4"
+        ok = write_mp4_from_frames(frames_dir, out_mp4, fps=fps)
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        if ok:
+            print(f"  [movie] wrote {out_mp4}")
+        else:
+            if _ffmpeg_available():
+                print(f"  [movie] ffmpeg failed for {out_mp4}")
+            else:
+                print("  [movie] ffmpeg not found; sweep frames exported only")
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -820,8 +1496,8 @@ def main() -> int:
         "--vectors",
         action="store_true",
         help=(
-            "Also export an extra set of frames with emphasized vector glyphs (no colorbar) "
-            "under frames_vectors/."
+            "Also export an extra set of frames with vector glyph overlays under frames_vectors/. "
+            "These frames keep the same colorbar/scale as the standard frames."
         ),
     )
     p.add_argument("--input", required=True, help="Input folder (runs/... or mumax_outputs/...).")
@@ -933,6 +1609,15 @@ def main() -> int:
         help="Export residuals between --input (A) and --input-b (B).",
     )
 
+    p.add_argument(
+        "--compare-abd",
+        action="store_true",
+        help=(
+            "Export A/B/Δ (A-B) triptych frames between --input (A) and --input-b (B). "
+            "Keeps a fixed shared color scale across panels. Can be combined with --compare."
+        ),
+    )
+
     args = p.parse_args()
 
     input_a = Path(args.input)
@@ -959,9 +1644,10 @@ def main() -> int:
     source_a = ovf_utils.infer_source(input_a) if args.source == "auto" else args.source
     problem = ovf_utils.detect_problem(input_a) if args.problem == "auto" else args.problem
 
-    if args.compare:
+    do_compare = bool(args.compare) or bool(args.compare_abd)
+    if do_compare:
         if not args.input_b:
-            raise SystemExit("--compare requires --input-b")
+            raise SystemExit("--compare/--compare-abd requires --input-b")
         input_b = Path(args.input_b)
         if not input_b.exists():
             raise SystemExit(f"Input-B path does not exist: {input_b}")
@@ -977,15 +1663,33 @@ def main() -> int:
                 if s.kind not in b_by_kind:
                     print(f"[compare] Missing B series for {s.kind}; skipping")
                     continue
-                export_residual_series(
-                    s,
-                    b_by_kind[s.kind],
-                    out_root,
-                    units=args.units,
-                    movie=args.movie,
-                    fps=args.fps,
-                    max_frames=args.max_frames,
-                )
+
+                if args.compare:
+                    export_residual_series(
+                        s,
+                        b_by_kind[s.kind],
+                        out_root,
+                        units=args.units,
+                        movie=args.movie,
+                        fps=args.fps,
+                        max_frames=args.max_frames,
+                    )
+
+                if args.compare_abd:
+                    export_abd_triptych_series(
+                        s,
+                        b_by_kind[s.kind],
+                        out_root,
+                        components=args.components,
+                        units=args.units,
+                        clim=clim,
+                        vectors=args.vectors,
+                        movie=args.movie,
+                        movie_component=args.movie_component,
+                        fps=args.fps,
+                        max_frames=args.max_frames,
+                    )
+
             print("Done (compare).")
             return 0
 
@@ -999,7 +1703,23 @@ def main() -> int:
                 if sa is None or sb is None:
                     print(f"[compare] Missing sweep series for stage={st}; skipping")
                     continue
-                export_residual_series(sa, sb, out_root, units=args.units, movie=False)
+                if args.compare:
+                    export_residual_series(sa, sb, out_root, units=args.units, movie=False)
+
+                if args.compare_abd:
+                    export_abd_triptych_sp2_sweep(
+                        sa,
+                        sb,
+                        out_root,
+                        units=args.units,
+                        stage=st,
+                        components=args.components,
+                        clim=clim,
+                        vectors=args.vectors,
+                        movie=args.movie,
+                        movie_component=args.movie_component,
+                        fps=args.fps,
+                    )
             print("Done (compare).")
             return 0
 

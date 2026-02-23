@@ -2,19 +2,20 @@
 
 use crate::amr::patch::Patch2D;
 use crate::amr::rect::Rect2i;
+use crate::geometry_mask::{Mask2D, assert_mask_len};
 use crate::grid::Grid2D;
 use crate::vector_field::VectorField2D;
 
-/// Minimal 2-level AMR hierarchy (Stage 1):
+/// Minimal 2-level AMR hierarchy:
 /// - Level 0: uniform base grid over the whole domain
 /// - Level 1: disjoint refined rectangular patches, refinement ratio = `ratio`
-///
-/// This is the smallest useful scaffold for validating coarse–fine coupling
-/// without involving demag.
 pub struct AmrHierarchy2D {
     pub base_grid: Grid2D,
     pub ratio: usize,
     pub ghost: usize,
+
+    /// Optional geometry mask on the *base (coarse) grid*.
+    pub geom_mask: Option<Mask2D>,
 
     /// Coarse (level-0) magnetisation over the whole domain.
     pub coarse: VectorField2D,
@@ -34,9 +35,73 @@ impl AmrHierarchy2D {
             base_grid,
             ratio,
             ghost,
+            geom_mask: None,
             coarse,
             patches: Vec::new(),
         }
+    }
+
+    /// Set (or replace) the geometry mask on the base grid.
+    pub fn set_geom_mask(&mut self, mask: Mask2D) {
+        assert_mask_len(&mask, &self.base_grid);
+        self.geom_mask = Some(mask);
+
+        // Update patch active sets + per-parent material flags.
+        let gm = self.geom_mask.as_deref();
+        for p in &mut self.patches {
+            p.rebuild_active_from_coarse_mask(&self.base_grid, gm);
+        }
+    }
+
+    /// Clear any geometry mask.
+    pub fn clear_geom_mask(&mut self) {
+        self.geom_mask = None;
+
+        // Revert patches to unmasked behaviour.
+        for p in &mut self.patches {
+            p.rebuild_active_from_coarse_mask(&self.base_grid, None);
+        }
+    }
+
+    /// Borrow the geometry mask as a slice (base grid), if present.
+    #[inline]
+    pub fn geom_mask(&self) -> Option<&[bool]> {
+        self.geom_mask.as_deref()
+    }
+
+    /// True if a geometry mask is present.
+    #[inline]
+    pub fn has_geom_mask(&self) -> bool {
+        self.geom_mask.is_some()
+    }
+
+    /// Construct a uniform-fine mask (resolution = base*ratio) by replicating each
+    /// coarse cell's mask value into its ratio×ratio fine children.
+    pub fn build_uniform_fine_mask(&self) -> Option<Mask2D> {
+        let m0 = self.geom_mask.as_ref()?;
+        assert_mask_len(m0, &self.base_grid);
+
+        let r = self.ratio;
+        let fine_nx = self.base_grid.nx * r;
+        let fine_ny = self.base_grid.ny * r;
+        let mut out = vec![false; fine_nx * fine_ny];
+
+        for j in 0..self.base_grid.ny {
+            for i in 0..self.base_grid.nx {
+                if !m0[self.base_grid.idx(i, j)] {
+                    continue;
+                }
+                let fi0 = i * r;
+                let fj0 = j * r;
+                for fj in 0..r {
+                    for fi in 0..r {
+                        out[(fj0 + fj) * fine_nx + (fi0 + fi)] = true;
+                    }
+                }
+            }
+        }
+
+        Some(out)
     }
 
     /// Add a new level-1 patch covering `coarse_rect`.
@@ -44,7 +109,14 @@ impl AmrHierarchy2D {
     /// The patch is initialised by sampling from the current coarse field.
     pub fn add_patch(&mut self, coarse_rect: Rect2i) {
         let mut p = Patch2D::new(&self.base_grid, coarse_rect, self.ratio, self.ghost);
+
+        // Respect geometry mask (updates active + parent_material + patch-local geom_mask_fine).
+        p.rebuild_active_from_coarse_mask(&self.base_grid, self.geom_mask.as_deref());
+
+        // Initialise the patch (interior + ghosts) by sampling from the current coarse field.
+        // This will also enforce the patch-local geometry mask when present.
         p.fill_all_from_coarse(&self.coarse);
+
         self.patches.push(p);
     }
 
@@ -56,6 +128,8 @@ impl AmrHierarchy2D {
     }
 
     /// Restrict all patch interiors back to the coarse grid (fine→coarse sync).
+    ///
+    /// This is mask-aware via Patch2D::parent_material.
     pub fn restrict_patches_to_coarse(&mut self) {
         for p in &self.patches {
             p.restrict_to_coarse(&mut self.coarse);
@@ -64,9 +138,8 @@ impl AmrHierarchy2D {
 
     /// Build a uniform fine-grid representation for diagnostics/IO.
     ///
-    /// We follow the standard AMR visualisation trick:
-    /// 1) interpolate (resample) the coarse field onto the finest uniform grid
-    /// 2) overwrite with the computed fine patch values
+    /// 1) resample coarse -> finest uniform
+    /// 2) overwrite with patch interiors (mask-aware scatter)
     pub fn flatten_to_uniform_fine(&self) -> VectorField2D {
         let fine_grid = Grid2D::new(
             self.base_grid.nx * self.ratio,
@@ -83,13 +156,7 @@ impl AmrHierarchy2D {
     }
 
     /// Replace the entire level-1 patch set, preserving fine values on overlaps.
-    ///
-    /// New patches are seeded from the current coarse field (via `add_patch`).
-    /// Then, for any region where a new patch overlaps an old patch (in global fine
-    /// indices), we copy the old fine values into the new patch so we do not lose
-    /// refinement detail during regrids.
     pub fn replace_patches_preserve_overlap(&mut self, new_rects: Vec<Rect2i>) {
-        // Move old patches out so we can rebuild self.patches cleanly.
         let old_patches: Vec<Patch2D> = std::mem::take(&mut self.patches);
 
         if new_rects.is_empty() {
@@ -149,10 +216,6 @@ impl AmrHierarchy2D {
         }
     }
 
-    /// Replace the current single patch with `new_rect`, preserving fine detail in the overlap region.
-    ///
-    /// Stage 2A assumes one patch. If there are 0 patches, we simply add it.
-    /// If there are >1 patches, we fall back to clearing and adding the new patch.
     pub fn replace_single_patch_preserve_overlap(&mut self, new_rect: Rect2i) {
         self.replace_patches_preserve_overlap(vec![new_rect]);
     }

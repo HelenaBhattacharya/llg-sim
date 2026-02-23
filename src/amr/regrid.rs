@@ -1,12 +1,21 @@
 // src/amr/regrid.rs
 //
-// Stage-2A single-patch regridding policy + helpers.
+// Regridding logic (Stage 2A + Stage 2B).
+//
+// Stage 2A:
+// - Single dynamic patch built from a coarse-grid indicator bbox.
+// - Regrid periodically, but only apply if the patch changed "materially".
+//
+// Stage 2B:
+// - Multi-patch dynamic regrid using clustering (clustering.rs).
+// - Apply a cheap hysteresis check to avoid 1-cell jitter: compare union-bbox
+//   movement/size change between old and new patch sets.
 
 use crate::amr::clustering::{
-    ClusterPolicy, ClusterStats, compute_patch_rects_clustered_from_indicator,
+    compute_patch_rects_clustered_from_indicator, ClusterPolicy, ClusterStats,
 };
 use crate::amr::hierarchy::AmrHierarchy2D;
-use crate::amr::indicator::{IndicatorStats, compute_patch_bbox_from_indicator};
+use crate::amr::indicator::{compute_patch_bbox_from_indicator_geom, IndicatorStats};
 use crate::amr::rect::Rect2i;
 
 #[derive(Clone, Copy, Debug)]
@@ -46,11 +55,18 @@ pub fn material_change(
 }
 
 /// Propose a single patch from the current coarse state.
+///
+/// This is mask-aware via `h.geom_mask()`.
 pub fn propose_single_patch(
     h: &AmrHierarchy2D,
     policy: RegridPolicy,
 ) -> Option<(Rect2i, IndicatorStats)> {
-    compute_patch_bbox_from_indicator(&h.coarse, policy.indicator_frac, policy.buffer_cells)
+    compute_patch_bbox_from_indicator_geom(
+        &h.coarse,
+        policy.indicator_frac,
+        policy.buffer_cells,
+        h.geom_mask(),
+    )
 }
 
 /// Apply Stage-2A regrid *if* the patch changes materially.
@@ -69,6 +85,7 @@ pub fn maybe_regrid_single_patch(
         policy.min_change_cells,
         policy.min_area_change_frac,
     ) {
+        // Data transfer should preserve overlap to avoid destroying fine detail.
         h.replace_single_patch_preserve_overlap(new_rect);
         Some((new_rect, stats))
     } else {
@@ -91,21 +108,29 @@ fn union_of_rects(rects: &[Rect2i]) -> Option<Rect2i> {
         i1 = i1.max(r.i1());
         j1 = j1.max(r.j1());
     }
+
     Some(Rect2i::new(i0, j0, i1 - i0, j1 - j0))
 }
 
 /// Stage-2B: clustered multi-patch regrid.
 ///
-/// We use a simple hysteresis test based on the union-bbox of all patches.
-/// This avoids 1-cell jitter while staying cheap.
+/// Returns Some((new_rects, stats)) if regrid occurred; else None.
+///
+/// Notes:
+/// - We compare old vs new *union* bounding boxes to decide whether to accept a regrid.
+///   This suppresses 1-cell jitter while staying cheap.
+/// - If `current_patches` is empty we always accept.
 pub fn maybe_regrid_multi_patch(
     h: &mut AmrHierarchy2D,
     current_patches: &[Rect2i],
     policy: RegridPolicy,
     cluster_policy: ClusterPolicy,
 ) -> Option<(Vec<Rect2i>, ClusterStats)> {
-    let (mut new_rects, stats) =
-        compute_patch_rects_clustered_from_indicator(&h.coarse, cluster_policy)?;
+    let (mut new_rects, stats) = compute_patch_rects_clustered_from_indicator(
+        &h.coarse,
+        cluster_policy,
+        h.geom_mask(),
+    )?;
 
     new_rects.sort_by_key(|r| (r.i0, r.j0, r.nx, r.ny));
 

@@ -13,8 +13,8 @@
 // - Regrids using multi-patch clustering every N steps.
 
 use llg_sim::amr::{
-    compute_patch_rects_clustered_from_indicator, maybe_regrid_multi_patch, AmrHierarchy2D,
-    AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i, RegridPolicy,
+    AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i, RegridPolicy,
+    compute_patch_rects_clustered_from_indicator, maybe_regrid_multi_patch,
 };
 use llg_sim::effective_field::FieldMask;
 use llg_sim::grid::Grid2D;
@@ -68,14 +68,22 @@ fn write_run_info(
     writeln!(f, "")?;
 
     writeln!(f, "Vortex initial state:")?;
-    writeln!(f, "  center:       ({:.6e}, {:.6e})", vortex_center.0, vortex_center.1)?;
+    writeln!(
+        f,
+        "  center:       ({:.6e}, {:.6e})",
+        vortex_center.0, vortex_center.1
+    )?;
     writeln!(f, "  polarity:     {:.6e}", polarity)?;
     writeln!(f, "  chirality:    {:.6e}", chirality)?;
     writeln!(f, "  core_radius:  {:.6e}", core_radius)?;
     writeln!(f, "")?;
 
     writeln!(f, "Clustering policy:")?;
-    writeln!(f, "  indicator_frac:   {:.6e}", cluster_policy.indicator_frac)?;
+    writeln!(
+        f,
+        "  indicator_frac:   {:.6e}",
+        cluster_policy.indicator_frac
+    )?;
     writeln!(f, "  buffer_cells:     {}", cluster_policy.buffer_cells)?;
     writeln!(f, "  connectivity:     {:?}", cluster_policy.connectivity)?;
     writeln!(f, "  merge_distance:   {}", cluster_policy.merge_distance)?;
@@ -84,8 +92,16 @@ fn write_run_info(
     writeln!(f, "")?;
 
     writeln!(f, "Regrid hysteresis:")?;
-    writeln!(f, "  min_change_cells:     {}", regrid_policy.min_change_cells)?;
-    writeln!(f, "  min_area_change_frac: {:.6e}", regrid_policy.min_area_change_frac)?;
+    writeln!(
+        f,
+        "  min_change_cells:     {}",
+        regrid_policy.min_change_cells
+    )?;
+    writeln!(
+        f,
+        "  min_area_change_frac: {:.6e}",
+        regrid_policy.min_area_change_frac
+    )?;
     writeln!(f, "")?;
 
     writeln!(f, "LLG params:")?;
@@ -201,7 +217,11 @@ fn write_efficiency_metrics(
     } else {
         0.0
     };
-    let speedup = if amr_secs > 0.0 { uniform_secs / amr_secs } else { 0.0 };
+    let speedup = if amr_secs > 0.0 {
+        uniform_secs / amr_secs
+    } else {
+        0.0
+    };
 
     let mut f = fs::File::create(path)?;
     writeln!(f, "coarse_cells:          {}", coarse_cells)?;
@@ -365,7 +385,7 @@ fn main() -> io::Result<()> {
     // Initial patch set from clustering (fallback if needed)
     let fallback = Rect2i::new(base.nx / 2 - 32, base.ny / 2 - 32, 64, 64);
     let (mut patch_rects, init_stats) =
-        match compute_patch_rects_clustered_from_indicator(&m0, cluster_policy) {
+        match compute_patch_rects_clustered_from_indicator(&m0, cluster_policy, None) {
             Some((rs, st)) if !rs.is_empty() => (rs, st),
             _ => {
                 let rs = vec![fallback];
@@ -381,10 +401,16 @@ fn main() -> io::Result<()> {
             }
         };
 
-    println!("[init] max_indicator(coarse) = {:.9e}", init_stats.max_indicator);
+    println!(
+        "[init] max_indicator(coarse) = {:.9e}",
+        init_stats.max_indicator
+    );
     println!("[init] clustered patches: {}", patch_rects.len());
     for (k, r) in patch_rects.iter().enumerate() {
-        println!("[init] patch {k}: i0={} j0={} nx={} ny={}", r.i0, r.j0, r.nx, r.ny);
+        println!(
+            "[init] patch {k}: i0={} j0={} nx={} ny={}",
+            r.i0, r.j0, r.nx, r.ny
+        );
     }
 
     // ----------------------------
@@ -446,7 +472,10 @@ fn main() -> io::Result<()> {
 
     println!("[final] patches: {}", patch_rects.len());
     for (k, r) in patch_rects.iter().enumerate() {
-        println!("[final] patch {k}: i0={} j0={} nx={} ny={}", r.i0, r.j0, r.nx, r.ny);
+        println!(
+            "[final] patch {k}: i0={} j0={} nx={} ny={}",
+            r.i0, r.j0, r.nx, r.ny
+        );
     }
 
     let fine_amr = h_amr.flatten_to_uniform_fine();
@@ -495,8 +524,16 @@ fn main() -> io::Result<()> {
         .iter()
         .map(|r| (r.nx * ratio) as f64 * (r.ny * ratio) as f64)
         .sum();
-    let coverage = if uniform_fine_cells > 0.0 { fine_active_cells / uniform_fine_cells } else { 0.0 };
-    let speedup = if amr_secs > 0.0 { uniform_secs / amr_secs } else { 0.0 };
+    let coverage = if uniform_fine_cells > 0.0 {
+        fine_active_cells / uniform_fine_cells
+    } else {
+        0.0
+    };
+    let speedup = if amr_secs > 0.0 {
+        uniform_secs / amr_secs
+    } else {
+        0.0
+    };
 
     println!("[perf] active coverage = {:.6e}", coverage);
     println!("[perf] speedup (uniform/amr) = {:.6e}", speedup);

@@ -14,11 +14,18 @@ use crate::grid::Grid2D;
 use crate::vec3::normalize;
 use crate::vector_field::VectorField2D;
 
-use crate::geometry_mask::cell_center_xy_centered;
+use crate::geometry_mask::{assert_mask_len, cell_center_xy_centered};
+
+#[inline]
+fn require_mask_len(mask: Option<&[bool]>, grid: &Grid2D) {
+    if let Some(msk) = mask {
+        assert_mask_len(msk, grid);
+    }
+}
 
 /// Apply a boolean mask by setting m=(0,0,0) where mask=false.
 pub fn apply_mask_zero(m: &mut VectorField2D, mask: &[bool]) {
-    assert_eq!(m.data.len(), mask.len());
+    assert_mask_len(mask, &m.grid);
     for (v, &inside) in m.data.iter_mut().zip(mask.iter()) {
         if !inside {
             *v = [0.0; 3];
@@ -80,6 +87,8 @@ pub fn seed_reversed_core(
     let outer = normalize(outer_dir);
     let core = normalize(core_dir);
 
+    require_mask_len(mask, grid);
+
     for j in 0..grid.ny {
         for i in 0..grid.nx {
             let id = j * grid.nx + i;
@@ -117,6 +126,8 @@ pub fn init_vortex(
     let core_r2 = core_radius * core_radius;
     let pol = polarity.signum();
     let chi = chirality.signum();
+
+    require_mask_len(mask, grid);
 
     for j in 0..grid.ny {
         for i in 0..grid.nx {
@@ -179,6 +190,8 @@ pub fn init_skyrmion(
     let (cx, cy) = center;
     let p = core_polarity.signum();
     let inv_delta = 1.0 / delta.max(1e-30);
+
+    require_mask_len(mask, grid);
 
     for j in 0..grid.ny {
         for i in 0..grid.nx {
@@ -254,6 +267,8 @@ pub fn seed_reversed_cores(
     let outer = normalize(outer_dir);
     let core = normalize(core_dir);
 
+    require_mask_len(mask, grid);
+
     for j in 0..grid.ny {
         for i in 0..grid.nx {
             let id = j * grid.nx + i;
@@ -310,6 +325,8 @@ pub fn seed_smooth_bubbles(
 ) {
     let inv_w = 1.0 / wall_width.max(1e-30);
     let s = outer_polarity.signum();
+
+    require_mask_len(mask, grid);
 
     for j in 0..grid.ny {
         for i in 0..grid.nx {

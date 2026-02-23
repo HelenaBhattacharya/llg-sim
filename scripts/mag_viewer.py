@@ -186,11 +186,93 @@ def _flatten_fortran(a: np.ndarray) -> np.ndarray:
     return np.asarray(a).ravel(order="F")
 
 
+# --------------------------------------------------------------------------
+# Bilinear resampler for vector fields (for compare mode grid mismatch)
+# --------------------------------------------------------------------------
+def _resample_vec_bilinear(src: np.ndarray, nx_t: int, ny_t: int) -> np.ndarray:
+    """Resample a (nx, ny, 3) vector field to (nx_t, ny_t, 3) via bilinear interpolation.
+
+    Assumes the source and target cover the same physical extent and that values live at cell centres.
+    This is intended to make compare mode robust when Rust and MuMax use different discretisations.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    if src.ndim != 3 or src.shape[2] != 3:
+        raise ValueError(f"Expected src shape (nx, ny, 3), got {src.shape}")
+
+    nx_s, ny_s, _ = src.shape
+    nx_t = int(nx_t)
+    ny_t = int(ny_t)
+    if nx_t <= 0 or ny_t <= 0:
+        raise ValueError(f"Invalid target shape ({nx_t}, {ny_t})")
+
+    # Map target cell centres to source index space (centre-aligned).
+    # x in [-0.5, nx_s-0.5], so that target centre at i=0 maps to src centre at 0, etc.
+    x = (np.arange(nx_t, dtype=np.float64) + 0.5) * (nx_s / nx_t) - 0.5
+    y = (np.arange(ny_t, dtype=np.float64) + 0.5) * (ny_s / ny_t) - 0.5
+
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    # Clamp to valid range
+    x0 = np.clip(x0, 0, nx_s - 1)
+    x1 = np.clip(x1, 0, nx_s - 1)
+    y0 = np.clip(y0, 0, ny_s - 1)
+    y1 = np.clip(y1, 0, ny_s - 1)
+
+    wx = (x - x0).astype(np.float64)
+    wy = (y - y0).astype(np.float64)
+
+    # Broadcast weights to 2D grid
+    wx2 = wx[:, None]
+    wy2 = wy[None, :]
+
+    # Gather corners (nx_t, ny_t, 3)
+    v00 = src[x0[:, None], y0[None, :], :]
+    v10 = src[x1[:, None], y0[None, :], :]
+    v01 = src[x0[:, None], y1[None, :], :]
+    v11 = src[x1[:, None], y1[None, :], :]
+
+    w00 = (1.0 - wx2) * (1.0 - wy2)
+    w10 = wx2 * (1.0 - wy2)
+    w01 = (1.0 - wx2) * wy2
+    w11 = wx2 * wy2
+
+    out = w00[:, :, None] * v00 + w10[:, :, None] * v10 + w01[:, :, None] * v01 + w11[:, :, None] * v11
+    return out.astype(np.float64, copy=False)
+
+
 def _parse_sp2_d_from_path(p: Path) -> Optional[int]:
-    m = re.search(r"m_d(\d+)_", p.name)
+    """Best-effort parse of d/lex from an SP2 OVF filename.
+
+    We support multiple historical naming conventions, e.g.
+      - m_d30_rem.ovf
+      - m_d30_hc_best.ovf
+      - d30_rem.ovf / d_30_rem.ovf
+      - ..._d30_... / ...-d30-...
+
+    This is used for sweep labeling and for aligning Rust vs MuMax sweeps by d.
+    """
+    name = p.name
+
+    # Most specific / legacy convention used by our generators
+    m = re.search(r"m_d(\d+)_", name)
     if m:
         return int(m.group(1))
+
+    # Common variants: _d30_, -d30-, d_30, d30.
+    # Keep it reasonably strict to avoid capturing unrelated numbers.
+    for pat in [
+        r"(?:^|[_-])d_(\d+)(?:[_-]|\.|$)",
+        r"(?:^|[_-])d(\d+)(?:[_-]|\.|$)",
+    ]:
+        m2 = re.search(pat, name)
+        if m2:
+            return int(m2.group(1))
+
     return None
+
 
 
 def _finite_minmax(a: np.ndarray) -> Tuple[float, float]:
@@ -199,6 +281,88 @@ def _finite_minmax(a: np.ndarray) -> Tuple[float, float]:
     if arr.size == 0:
         return 0.0, 0.0
     return float(arr.min()), float(arr.max())
+
+
+# --------------------------------------------------------------------------
+# Helper: synthesize SP2 hc sweep from per-d final OVFs if no explicit sweep exists
+# --------------------------------------------------------------------------
+def _fallback_sp2_hc_sweep_series_from_root(root: Path, source: str) -> Any:
+    """Build a synthetic SP2 coercivity 'sweep' series from per-d final OVFs.
+
+    Some output layouts (especially for hc) may not include an explicit sweep directory.
+    In that case we synthesize a sweep by finding one representative final OVF per d/lex.
+
+    Selection priority per d:
+      1) *_hc_best.ovf
+      2) *_hc.ovf   (excluding *_hc_best.ovf and *_hc_pos.ovf)
+      3) *_hc_pos.ovf
+
+    The returned object behaves like an `ovf_utils.OvfSeries` for the viewer.
+    """
+    if not root.exists():
+        raise ValueError(f"SP2 root does not exist: {root}")
+
+    # Gather candidates efficiently.
+    candidates = list(root.rglob("*_hc*.ovf"))
+    if not candidates:
+        raise ValueError(f"No SP2 hc OVFs found under: {root}")
+
+    # Pick one representative file per d.
+    # Lower rank = higher priority.
+    best_by_d: Dict[int, Tuple[int, Path]] = {}
+
+    for p in candidates:
+        name = p.name
+        d = _parse_sp2_d_from_path(p)
+        if d is None:
+            continue
+
+        if name.endswith("_hc_best.ovf"):
+            rank = 0
+        elif name.endswith("_hc_pos.ovf"):
+            rank = 2
+        elif name.endswith("_hc.ovf") and (not name.endswith("_hc_best.ovf")) and (not name.endswith("_hc_pos.ovf")):
+            rank = 1
+        else:
+            continue
+
+        prev = best_by_d.get(d)
+        if prev is None:
+            best_by_d[d] = (rank, p)
+            continue
+
+        prev_rank, prev_path = prev
+        if rank < prev_rank:
+            best_by_d[d] = (rank, p)
+        elif rank == prev_rank:
+            # Tie-breaker: prefer lexicographically last path (typically newest if timestamped)
+            if str(p) > str(prev_path):
+                best_by_d[d] = (rank, p)
+
+    if not best_by_d:
+        raise ValueError(
+            "Could not synthesize an SP2 hc sweep: no files matching *_hc_best.ovf / *_hc.ovf / *_hc_pos.ovf "
+            f"with parsable d/lex found under {root}"
+        )
+
+    # Build frames sorted by d/lex (descending, matching compare overlays).
+    ds = sorted(best_by_d.keys(), reverse=True)
+    frames = [best_by_d[d][1] for d in ds]
+
+    # Create a minimal series-like object for the viewer.
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        problem="sp2",
+        source=source,
+        kind="sweep_hc",
+        stage="hc",
+        d_lex=None,
+        tag=None,
+        frames=frames,
+        meta={},
+        series_id=f"sp2:sweep_hc:{source}",
+    )
 
 
 @dataclass
@@ -459,6 +623,9 @@ class MagViewer:
         # Metrics for overlay: (mx_mean, my_mean, mz_mean, msum, mpar)
         self._last_metrics: Tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
 
+        # Note when compare mode resamples B onto A's grid
+        self._last_resample_note: str = ""
+
     # ------------------------------------------------------------------
     # Loading / geometry
     # ------------------------------------------------------------------
@@ -499,8 +666,14 @@ class MagViewer:
             info_b = self.frames_b[self.idx]
             m_b = ovf_utils.load_slice_field(info_b.path)
             vec_b = ovf_utils.field_vector_array_2d(m_b)
+
             if vec_b.shape != vec_a.shape:
-                raise ValueError(f"A/B frame shape mismatch: {vec_a.shape} vs {vec_b.shape}")
+                # Resample B onto A's grid so compare mode works even when discretisations differ.
+                src_shape = vec_b.shape
+                vec_b = _resample_vec_bilinear(vec_b, vec_a.shape[0], vec_a.shape[1])
+                self._last_resample_note = f"B resampled {src_shape[0]}x{src_shape[1]} -> {vec_a.shape[0]}x{vec_a.shape[1]}"
+            else:
+                self._last_resample_note = ""
 
         # Update caches
         self._cur_loaded_idx = self.idx
@@ -672,7 +845,8 @@ class MagViewer:
         line1 = f"{head}  |  {info_a.label}  |  frame {self.idx+1}/{len(self.frames_a)}"
         if self.compare and self.frames_b is not None:
             info_b = self.frames_b[self.idx]
-            line1 += f"\nCompare: {view}  |  B: {info_b.path.name}"
+            note = f"  |  {self._last_resample_note}" if getattr(self, "_last_resample_note", "") else ""
+            line1 += f"\nCompare: {view}  |  B: {info_b.path.name}{note}"
         else:
             line1 += f"\nView: {view}"
 
@@ -1191,7 +1365,15 @@ def main() -> int:
         series_a = _select_sp4_series(series_a_all, args.case)
     else:
         series_a_all = ovf_utils.discover_sp2_series(input_a, source=source_a)
-        series_a = _select_sp2_series(series_a_all, args.d, args.stage, args.tag)
+        try:
+            series_a = _select_sp2_series(series_a_all, args.d, args.stage, args.tag)
+        except ValueError:
+            # For SP2 coercivity, allow sweep-mode compare without specifying --d by
+            # synthesizing a sweep from per-d final OVFs.
+            if args.d is None and str(args.stage).lower().strip() in {"hc", "coercivity"}:
+                series_a = _fallback_sp2_hc_sweep_series_from_root(input_a, source=source_a)
+            else:
+                raise
 
     frames_a = _downsample_frames_by_ns(_build_frame_list(series_a), args.sample_ns)
     if not frames_a:
@@ -1212,9 +1394,29 @@ def main() -> int:
             series_b = _select_sp4_series(series_b_all, args.case)
         else:
             series_b_all = ovf_utils.discover_sp2_series(input_b, source=source_b)
-            series_b = _select_sp2_series(series_b_all, args.d, args.stage, args.tag)
+            try:
+                series_b = _select_sp2_series(series_b_all, args.d, args.stage, args.tag)
+            except ValueError:
+                if args.d is None and str(args.stage).lower().strip() in {"hc", "coercivity"}:
+                    series_b = _fallback_sp2_hc_sweep_series_from_root(input_b, source=source_b)
+                else:
+                    raise
 
-        frames_a, frames_b = _align_for_compare(series_a, series_b)
+        if series_b is None:
+            raise SystemExit("Compare mode selected but could not resolve Series-B.")
+
+        try:
+            frames_a, frames_b = _align_for_compare(series_a, series_b)
+        except ValueError as e:
+            # Keep compare mode usable when sweep metadata doesn't overlap.
+            print(f"[warn] compare alignment fallback: {e}")
+            frames_a = _build_frame_list(series_a)
+            frames_b = _build_frame_list(series_b)
+            n = min(len(frames_a), len(frames_b))
+            if n == 0:
+                raise SystemExit("No frames available to compare between Series-A and Series-B.")
+            frames_a, frames_b = frames_a[:n], frames_b[:n]
+
         frames_a, frames_b = _downsample_paired_frames_by_ns(frames_a, frames_b, args.sample_ns)
 
     print("=" * 80)
@@ -1248,4 +1450,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
