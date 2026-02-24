@@ -1,13 +1,20 @@
 // src/amr/stepper.rs
 
-use crate::effective_field::{FieldMask, build_h_eff_masked, build_h_eff_masked_geom};
+use crate::effective_field::{
+    FieldMask, build_h_eff_masked, build_h_eff_masked_geom, demag_fft_uniform,
+};
 use crate::grid::Grid2D;
-use crate::llg::RK4Scratch;
+use crate::llg::{
+    RK4Scratch, step_llg_rk4_recompute_field_masked_add,
+    step_llg_rk4_recompute_field_masked_geom_add, step_llg_rk4_recompute_field_masked_relax_add,
+    step_llg_rk4_recompute_field_masked_relax_geom_add,
+};
 use crate::params::{LLGParams, Material};
 use crate::vec3::{cross, normalize};
 use crate::vector_field::VectorField2D;
 
 use crate::amr::hierarchy::AmrHierarchy2D;
+use crate::amr::interp::sample_bilinear;
 
 // ------------------------------------------------------------
 // Patch-local RK4 with an explicit "active index" set.
@@ -24,6 +31,7 @@ pub struct PatchRK4Scratch {
     pub b2: VectorField2D,
     pub b3: VectorField2D,
     pub b4: VectorField2D,
+    pub b_add: VectorField2D,
     pub k1: Vec<[f64; 3]>,
     pub k2: Vec<[f64; 3]>,
     pub k3: Vec<[f64; 3]>,
@@ -41,6 +49,7 @@ impl PatchRK4Scratch {
             b2: VectorField2D::new(grid),
             b3: VectorField2D::new(grid),
             b4: VectorField2D::new(grid),
+            b_add: VectorField2D::new(grid),
             k1: vec![[0.0; 3]; n],
             k2: vec![[0.0; 3]; n],
             k3: vec![[0.0; 3]; n],
@@ -132,6 +141,12 @@ pub fn step_patch_rk4_recompute_field_masked_active(
         build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
     }
     for &idx in active {
+        let a = scratch.b_add.data[idx];
+        scratch.b1.data[idx][0] += a[0];
+        scratch.b1.data[idx][1] += a[1];
+        scratch.b1.data[idx][2] += a[2];
+    }
+    for &idx in active {
         let mi = m.data[idx];
         let bi = scratch.b1.data[idx];
         scratch.k1[idx] = if relax {
@@ -161,6 +176,12 @@ pub fn step_patch_rk4_recompute_field_masked_active(
         );
     } else {
         build_h_eff_masked(grid, &scratch.m1, &mut scratch.b2, params, material, mask);
+    }
+    for &idx in active {
+        let a = scratch.b_add.data[idx];
+        scratch.b2.data[idx][0] += a[0];
+        scratch.b2.data[idx][1] += a[1];
+        scratch.b2.data[idx][2] += a[2];
     }
     for &idx in active {
         let mi = scratch.m1.data[idx];
@@ -194,6 +215,12 @@ pub fn step_patch_rk4_recompute_field_masked_active(
         build_h_eff_masked(grid, &scratch.m2, &mut scratch.b3, params, material, mask);
     }
     for &idx in active {
+        let a = scratch.b_add.data[idx];
+        scratch.b3.data[idx][0] += a[0];
+        scratch.b3.data[idx][1] += a[1];
+        scratch.b3.data[idx][2] += a[2];
+    }
+    for &idx in active {
         let mi = scratch.m2.data[idx];
         let bi = scratch.b3.data[idx];
         scratch.k3[idx] = if relax {
@@ -223,6 +250,12 @@ pub fn step_patch_rk4_recompute_field_masked_active(
         );
     } else {
         build_h_eff_masked(grid, &scratch.m3, &mut scratch.b4, params, material, mask);
+    }
+    for &idx in active {
+        let a = scratch.b_add.data[idx];
+        scratch.b4.data[idx][0] += a[0];
+        scratch.b4.data[idx][1] += a[1];
+        scratch.b4.data[idx][2] += a[2];
     }
     for &idx in active {
         let mi = scratch.m3.data[idx];
@@ -265,6 +298,8 @@ pub fn step_patch_rk4_recompute_field_masked_active(
 pub struct AmrStepperRK4 {
     pub coarse_scratch: RK4Scratch,
     pub patch_scratch: Vec<PatchRK4Scratch>,
+    pub b_demag_fine: VectorField2D,
+    pub b_demag_coarse: VectorField2D,
     pub relax: bool,
 }
 
@@ -276,9 +311,20 @@ impl AmrStepperRK4 {
             .iter()
             .map(|p| PatchRK4Scratch::new(p.grid))
             .collect();
+        let b_demag_coarse = VectorField2D::new(h.base_grid);
+        let fine_grid = Grid2D::new(
+            h.base_grid.nx * h.ratio,
+            h.base_grid.ny * h.ratio,
+            h.base_grid.dx / (h.ratio as f64),
+            h.base_grid.dy / (h.ratio as f64),
+            h.base_grid.dz,
+        );
+        let b_demag_fine = VectorField2D::new(fine_grid);
         Self {
             coarse_scratch,
             patch_scratch,
+            b_demag_fine,
+            b_demag_coarse,
             relax,
         }
     }
@@ -310,21 +356,79 @@ impl AmrStepperRK4 {
         // 1) Coarse→fine ghost fill
         h.fill_patch_ghosts();
 
+        // Phase-2 Bridge B: compute demag on the flattened *uniform fine composite* magnetisation
+        // (gold FFT operator), then sample the resulting demag field back to patches and coarse.
+        // This is validation-first (not a speed mode).
+        let mut m_fine = h.flatten_to_uniform_fine();
+
+        // If a geometry mask exists, ensure vacuum stays m=(0,0,0) on the fine grid before demag.
+        if let Some(fm) = h.build_uniform_fine_mask() {
+            for idx in 0..m_fine.grid.n_cells() {
+                if !fm[idx] {
+                    m_fine.data[idx] = [0.0, 0.0, 0.0];
+                }
+            }
+        }
+
+        // Ensure our cached fine demag buffer matches the fine grid.
+        if self.b_demag_fine.grid.nx != m_fine.grid.nx
+            || self.b_demag_fine.grid.ny != m_fine.grid.ny
+            || self.b_demag_fine.grid.dx != m_fine.grid.dx
+            || self.b_demag_fine.grid.dy != m_fine.grid.dy
+            || self.b_demag_fine.grid.dz != m_fine.grid.dz
+        {
+            self.b_demag_fine = VectorField2D::new(m_fine.grid);
+        }
+
+        self.b_demag_fine.set_uniform(0.0, 0.0, 0.0);
+        demag_fft_uniform::compute_demag_field_pbc(
+            &m_fine.grid,
+            &m_fine,
+            &mut self.b_demag_fine,
+            mat,
+            0,
+            0,
+        );
+
+        // Build a coarse-grid addend by sampling the fine demag field at coarse cell centres.
+        self.b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
+        for j in 0..h.base_grid.ny {
+            let y = (j as f64 + 0.5) * h.base_grid.dy;
+            for i in 0..h.base_grid.nx {
+                let x = (i as f64 + 0.5) * h.base_grid.dx;
+                let v = sample_bilinear(&self.b_demag_fine, x, y);
+                let idx = h.base_grid.idx(i, j);
+                self.b_demag_coarse.data[idx] = v;
+            }
+        }
+
         // 2) Step fine patches (active interior only)
         for (p, s) in h.patches.iter_mut().zip(self.patch_scratch.iter_mut()) {
-            let active = p.active.as_slice();
             let geom_mask = p.geom_mask_fine.as_deref();
+            let nxp = p.grid.nx;
+            let nyp = p.grid.ny;
+
+            // Build patch-local demag addend by sampling the fine demag field.
+            for j in 0..nyp {
+                for i in 0..nxp {
+                    let (x, y) = p.cell_center_xy(i, j);
+                    let v = sample_bilinear(&self.b_demag_fine, x, y);
+                    let idx = p.grid.idx(i, j);
+                    s.b_add.data[idx] = v;
+
+                    if let Some(gm) = geom_mask {
+                        if !gm[idx] {
+                            s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                        }
+                    }
+                }
+            }
+
+            let active = p.active.as_slice();
             let m = &mut p.m;
 
             step_patch_rk4_recompute_field_masked_active(
-                m,
-                active,
-                params,
-                mat,
-                s,
-                mask,
-                geom_mask,
-                self.relax,
+                m, active, params, mat, s, mask, geom_mask, self.relax,
             );
         }
 
@@ -334,40 +438,44 @@ impl AmrStepperRK4 {
         let geom_mask = h.geom_mask.as_deref();
         if self.relax {
             if let Some(gm) = geom_mask {
-                crate::llg::step_llg_rk4_recompute_field_masked_relax_geom(
+                step_llg_rk4_recompute_field_masked_relax_geom_add(
                     &mut h.coarse,
                     params,
                     mat,
                     &mut self.coarse_scratch,
                     mask,
                     Some(gm),
+                    Some(&self.b_demag_coarse),
                 );
             } else {
-                crate::llg::step_llg_rk4_recompute_field_masked_relax(
+                step_llg_rk4_recompute_field_masked_relax_add(
                     &mut h.coarse,
                     params,
                     mat,
                     &mut self.coarse_scratch,
                     mask,
+                    Some(&self.b_demag_coarse),
                 );
             }
         } else {
             if let Some(gm) = geom_mask {
-                crate::llg::step_llg_rk4_recompute_field_masked_geom(
+                step_llg_rk4_recompute_field_masked_geom_add(
                     &mut h.coarse,
                     params,
                     mat,
                     &mut self.coarse_scratch,
                     mask,
                     Some(gm),
+                    Some(&self.b_demag_coarse),
                 );
             } else {
-                crate::llg::step_llg_rk4_recompute_field_masked(
+                step_llg_rk4_recompute_field_masked_add(
                     &mut h.coarse,
                     params,
                     mat,
                     &mut self.coarse_scratch,
                     mask,
+                    Some(&self.b_demag_coarse),
                 );
             }
         }

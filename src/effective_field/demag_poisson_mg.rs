@@ -42,6 +42,7 @@ use super::demag_fft_uniform;
 
 use rayon::prelude::*;
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::fs;
 use std::io::{Read, Write};
@@ -312,7 +313,12 @@ impl HybridConfig {
         fn get_bool(name: &str) -> bool {
             std::env::var(name)
                 .ok()
-                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .map(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
                 .unwrap_or(false)
         }
 
@@ -800,6 +806,753 @@ impl BarnesHutTree {
 // Multigrid data structures
 // ---------------------------
 
+// -----------------------------------------------------------------------------
+// A3/A4 operator + multigrid hygiene upgrades
+// -----------------------------------------------------------------------------
+//
+// Motivation (A3):
+//   The pure Poisson+FD demag operator can deviate from the Newell/FFT demag kernel
+//   primarily at high-|k| (near-field) and can show lattice anisotropy (axes vs diagonals).
+//   A practical, AMR-friendly lever is to improve the *discrete Laplacian* on the finest
+//   level so its symbol is closer to -|k|^2 over more of the Brillouin zone.
+//
+// Motivation (A4):
+//   Once the fine-grid operator changes, a multigrid hierarchy built by rediscretization
+//   can become inconsistent. Galerkin coarse operators A_c = R A_f P preserve the intended
+//   operator across levels. Trilinear prolongation (cell-centered) is also a significant
+//   quality upgrade over piecewise-constant injection.
+//
+// This file keeps the existing boundary-condition machinery unchanged (DirichletTreecode,
+// boundary stamping, etc.), and only modifies the bulk MG operator/smoother/transfer
+// operators.
+//
+// Optional env controls (safe defaults chosen for A3/A4 experimentation):
+//   LLG_DEMAG_MG_STENCIL   = "7" | "iso9"          (default: "iso9")
+//   LLG_DEMAG_MG_PROLONG   = "inject" | "trilinear" (default: "trilinear")
+//   LLG_DEMAG_MG_COARSE_OP = "rediscretize" | "galerkin" (default: "galerkin")
+//
+// Notes:
+//  - The "iso9" stencil is a 2D 9-point Mehrstellen Laplacian in the xy plane (requires
+//    dx≈dy) plus a standard 3-point 2nd-order Laplacian in z. This tends to reduce
+//    axis/diagonal anisotropy in thin-film problems while keeping coefficients positive.
+//  - If dx and dy differ appreciably, we fall back to the standard 7-point stencil.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaplacianStencilKind {
+    SevenPoint,
+    Iso9PlusZ,
+    Iso27,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProlongationKind {
+    Injection,
+    Trilinear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoarseOpKind {
+    Rediscretize,
+    Galerkin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MGOperatorSettings {
+    stencil: LaplacianStencilKind,
+    prolong: ProlongationKind,
+    coarse_op: CoarseOpKind,
+}
+
+fn env_str_lower(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+}
+
+impl MGOperatorSettings {
+    fn from_env() -> Self {
+        let stencil = match env_str_lower("LLG_DEMAG_MG_STENCIL").as_deref() {
+            Some("7") | Some("7pt") | Some("seven") | Some("sevenpoint") => {
+                LaplacianStencilKind::SevenPoint
+            }
+            Some("iso9") | Some("9") | Some("9pt") | Some("mehrstellen9") => {
+                LaplacianStencilKind::Iso9PlusZ
+            }
+            Some("iso27") | Some("27") | Some("27pt") | Some("mehrstellen27") => {
+                LaplacianStencilKind::Iso27
+            }
+            Some(other) => {
+                eprintln!(
+                    "[demag_mg] WARNING: unknown LLG_DEMAG_MG_STENCIL='{}' -> using 'iso9'",
+                    other
+                );
+                LaplacianStencilKind::Iso9PlusZ
+            }
+            None => LaplacianStencilKind::Iso9PlusZ,
+        };
+
+        let prolong = match env_str_lower("LLG_DEMAG_MG_PROLONG").as_deref() {
+            Some("inject") | Some("injection") | Some("pc") | Some("piecewiseconstant") => {
+                ProlongationKind::Injection
+            }
+            Some("trilinear") | Some("linear") | Some("tl") => ProlongationKind::Trilinear,
+            Some(other) => {
+                eprintln!(
+                    "[demag_mg] WARNING: unknown LLG_DEMAG_MG_PROLONG='{}' -> using 'trilinear'",
+                    other
+                );
+                ProlongationKind::Trilinear
+            }
+            None => ProlongationKind::Trilinear,
+        };
+
+        let coarse_op = match env_str_lower("LLG_DEMAG_MG_COARSE_OP").as_deref() {
+            Some("rediscretize") | Some("re") | Some("rd") => CoarseOpKind::Rediscretize,
+            Some("galerkin") | Some("g") => CoarseOpKind::Galerkin,
+            Some(other) => {
+                eprintln!(
+                    "[demag_mg] WARNING: unknown LLG_DEMAG_MG_COARSE_OP='{}' -> using 'galerkin'",
+                    other
+                );
+                CoarseOpKind::Galerkin
+            }
+            None => CoarseOpKind::Galerkin,
+        };
+
+        Self {
+            stencil,
+            prolong,
+            coarse_op,
+        }
+    }
+
+    fn tag(&self) -> String {
+        let s = match self.stencil {
+            LaplacianStencilKind::SevenPoint => "7",
+            LaplacianStencilKind::Iso9PlusZ => "iso9",
+            LaplacianStencilKind::Iso27 => "iso27",
+        };
+        let p = match self.prolong {
+            ProlongationKind::Injection => "inj",
+            ProlongationKind::Trilinear => "tri",
+        };
+        let c = match self.coarse_op {
+            CoarseOpKind::Rediscretize => "rd",
+            CoarseOpKind::Galerkin => "gal",
+        };
+        format!("{}_{}_{}", s, p, c)
+    }
+}
+
+/// A small constant-coefficient 3D stencil for a cell-centered Laplacian-like operator.
+/// Represents:
+///    (A φ)_c = center * φ_c + Σ_i coeffs[i] * φ_{c + offs[i]}
+///
+/// For classic Laplacians, `center` is negative and `diag = -center` is positive.
+/// We store `diag` explicitly for Weighted-Jacobi updates.
+#[derive(Clone, Debug)]
+struct Stencil3D {
+    center: f64,
+    diag: f64,
+    offs: Vec<[isize; 3]>,
+    coeffs: Vec<f64>,
+}
+
+impl Stencil3D {
+    fn seven_point(dx: f64, dy: f64, dz: f64) -> Self {
+        let sx = 1.0 / (dx * dx);
+        let sy = 1.0 / (dy * dy);
+        let sz = 1.0 / (dz * dz);
+        let center = -2.0 * (sx + sy + sz);
+        let mut offs = Vec::with_capacity(6);
+        let mut coeffs = Vec::with_capacity(6);
+        offs.push([1, 0, 0]);
+        coeffs.push(sx);
+        offs.push([-1, 0, 0]);
+        coeffs.push(sx);
+        offs.push([0, 1, 0]);
+        coeffs.push(sy);
+        offs.push([0, -1, 0]);
+        coeffs.push(sy);
+        offs.push([0, 0, 1]);
+        coeffs.push(sz);
+        offs.push([0, 0, -1]);
+        coeffs.push(sz);
+        let diag = -center;
+        Self {
+            center,
+            diag,
+            offs,
+            coeffs,
+        }
+    }
+
+    fn iso9_plus_z(dx: f64, dy: f64, dz: f64) -> Self {
+        // 2D 9-point Mehrstellen Laplacian (requires dx≈dy) + standard z second derivative.
+        let rel = (dx - dy).abs() / dx.max(dy).max(1e-30);
+        if rel > 1e-6 {
+            // Conservative fallback.
+            return Self::seven_point(dx, dy, dz);
+        }
+        let h = 0.5 * (dx + dy);
+        let inv_h2 = 1.0 / (h * h);
+        let cz = 1.0 / (dz * dz);
+
+        // xy plane:
+        //   (1/(6h^2)) * [ 4*(E+W+N+S) + 1*(NE+NW+SE+SW) - 20*C ]
+        let c_axis = (2.0 / 3.0) * inv_h2; // 4/(6h^2)
+        let c_diag = (1.0 / 6.0) * inv_h2; // 1/(6h^2)
+
+        let center = -(10.0 / 3.0) * inv_h2 - 2.0 * cz;
+
+        let mut offs = Vec::with_capacity(10);
+        let mut coeffs = Vec::with_capacity(10);
+
+        // axis neighbors in xy
+        offs.push([1, 0, 0]);
+        coeffs.push(c_axis);
+        offs.push([-1, 0, 0]);
+        coeffs.push(c_axis);
+        offs.push([0, 1, 0]);
+        coeffs.push(c_axis);
+        offs.push([0, -1, 0]);
+        coeffs.push(c_axis);
+
+        // diagonals in xy
+        offs.push([1, 1, 0]);
+        coeffs.push(c_diag);
+        offs.push([1, -1, 0]);
+        coeffs.push(c_diag);
+        offs.push([-1, 1, 0]);
+        coeffs.push(c_diag);
+        offs.push([-1, -1, 0]);
+        coeffs.push(c_diag);
+
+        // z neighbors (standard 2nd order)
+        offs.push([0, 0, 1]);
+        coeffs.push(cz);
+        offs.push([0, 0, -1]);
+        coeffs.push(cz);
+
+        let diag = -center;
+        Self {
+            center,
+            diag,
+            offs,
+            coeffs,
+        }
+    }
+    /// 27-point "isotropic" (Mehrstellen-style) Laplacian on a cell-centered grid.
+    ///
+    /// This is the classic 27-point isotropic stencil for uniform spacing, generalized
+    /// to (possibly) anisotropic spacing by using the physical squared distance for
+    /// the diagonal directions:
+    ///   - faces:   (±1,0,0), (0,±1,0), (0,0,±1)
+    ///   - edges:   (±1,±1,0), (±1,0,±1), (0,±1,±1)
+    ///   - corners: (±1,±1,±1)
+    ///
+    /// Weights are chosen so the Fourier symbol better matches -|k|^2 over more of
+    /// the Brillouin zone for nearly-isotropic grids.
+    fn iso27(dx: f64, dy: f64, dz: f64) -> Self {
+        // 1) Build diagonal weights (edges + corners) as:  w = alpha / |d|^2.
+        //    Choose alpha near the SPD limit for best near-field matching, unless overridden.
+        let mut sx1 = 0.0_f64;
+        let mut sy1 = 0.0_f64;
+        let mut sz1 = 0.0_f64;
+
+        for di in -1isize..=1 {
+            for dj in -1isize..=1 {
+                for dk in -1isize..=1 {
+                    if di == 0 && dj == 0 && dk == 0 {
+                        continue;
+                    }
+                    let nn = di.abs() + dj.abs() + dk.abs();
+                    if nn == 1 {
+                        // Faces handled separately.
+                        continue;
+                    }
+
+                    let ddx = (di as f64) * dx;
+                    let ddy = (dj as f64) * dy;
+                    let ddz = (dk as f64) * dz;
+                    let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+                    if dist_sq <= 0.0 {
+                        continue;
+                    }
+                    let w1 = 1.0 / dist_sq;
+
+                    sx1 += w1 * ddx * ddx;
+                    sy1 += w1 * ddy * ddy;
+                    sz1 += w1 * ddz * ddz;
+                }
+            }
+        }
+
+        // Optional user override.
+        let alpha_env = std::env::var("LLG_DEMAG_MG_ISO27_FLUX_ALPHA")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|a| a.is_finite() && *a > 0.0);
+
+        // Compute SPD-safe upper bound for alpha to keep all face weights non-negative (M-matrix).
+        // Since S_axis_diag = alpha * s_axis1, we need alpha <= 2 / s_axis1 for each axis.
+        let mut alpha_max = f64::INFINITY;
+        if sx1 > 0.0 {
+            alpha_max = alpha_max.min(2.0 / sx1);
+        }
+        if sy1 > 0.0 {
+            alpha_max = alpha_max.min(2.0 / sy1);
+        }
+        if sz1 > 0.0 {
+            alpha_max = alpha_max.min(2.0 / sz1);
+        }
+        if alpha_max.is_finite() {
+            alpha_max *= 0.999; // small margin
+        }
+
+        // Default: choose alpha close to the SPD limit for better near-field matching.
+        // (Env var can still override; we clamp if it exceeds alpha_max.)
+        const ALPHA_DEFAULT_FRAC: f64 = 0.99;
+        let alpha_default = if alpha_max.is_finite() {
+            (ALPHA_DEFAULT_FRAC * alpha_max).max(0.0)
+        } else {
+            0.0
+        };
+
+        let mut alpha = alpha_env.unwrap_or(alpha_default);
+
+        // Clamp env-provided alpha if needed.
+        if alpha_max.is_finite() && alpha > alpha_max {
+            eprintln!(
+                "[demag_mg] WARNING: LLG_DEMAG_MG_ISO27_FLUX_ALPHA={} too large (max≈{}). Clamping to keep SPD.",
+                alpha, alpha_max
+            );
+            alpha = alpha_max.max(0.0);
+        }
+
+        // 2) Choose face weights so that the stencil is exact on x^2, y^2, z^2:
+        //      Σ_n w_n Δx_n^2 = 2, etc.
+        //    Here the diagonal contributions are alpha*sx1, alpha*sy1, alpha*sz1 (dimensionless), so:
+        //      w_fx = (2 - alpha*sx1) / (2 dx^2), etc.
+        let w_fx = (2.0 - alpha * sx1) / (2.0 * dx * dx);
+        let w_fy = (2.0 - alpha * sy1) / (2.0 * dy * dy);
+        let w_fz = (2.0 - alpha * sz1) / (2.0 * dz * dz);
+
+        // 3) Assemble the 26-neighbour stencil.
+        let mut offs = Vec::with_capacity(26);
+        let mut coeffs = Vec::with_capacity(26);
+
+        // Faces.
+        offs.push([1, 0, 0]);
+        coeffs.push(w_fx);
+        offs.push([-1, 0, 0]);
+        coeffs.push(w_fx);
+
+        offs.push([0, 1, 0]);
+        coeffs.push(w_fy);
+        offs.push([0, -1, 0]);
+        coeffs.push(w_fy);
+
+        offs.push([0, 0, 1]);
+        coeffs.push(w_fz);
+        offs.push([0, 0, -1]);
+        coeffs.push(w_fz);
+
+        // Edges + corners.
+        for di in -1isize..=1 {
+            for dj in -1isize..=1 {
+                for dk in -1isize..=1 {
+                    if di == 0 && dj == 0 && dk == 0 {
+                        continue;
+                    }
+                    let nn = di.abs() + dj.abs() + dk.abs();
+                    if nn == 0 || nn == 1 {
+                        continue; // faces already added
+                    }
+
+                    let ddx = (di as f64) * dx;
+                    let ddy = (dj as f64) * dy;
+                    let ddz = (dk as f64) * dz;
+                    let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+                    if dist_sq <= 0.0 {
+                        continue;
+                    }
+
+                    offs.push([di, dj, dk]);
+                    coeffs.push(alpha / dist_sq);
+                }
+            }
+        }
+
+        // Center coefficient (negative), and positive diagonal magnitude for WJ updates.
+        let sum_nb: f64 = coeffs.iter().copied().sum();
+        let center = -sum_nb;
+        let diag = sum_nb;
+
+        Self {
+            center,
+            diag,
+            offs,
+            coeffs,
+        }
+    }
+
+    fn from_kind(kind: LaplacianStencilKind, dx: f64, dy: f64, dz: f64) -> Self {
+        match kind {
+            LaplacianStencilKind::SevenPoint => Self::seven_point(dx, dy, dz),
+            LaplacianStencilKind::Iso9PlusZ => Self::iso9_plus_z(dx, dy, dz),
+            LaplacianStencilKind::Iso27 => Self::iso27(dx, dy, dz),
+        }
+    }
+
+    #[inline]
+    fn clamp_idx(v: isize, lo: isize, hi: isize) -> isize {
+        if v < lo {
+            lo
+        } else if v > hi {
+            hi
+        } else {
+            v
+        }
+    }
+
+    #[inline]
+    fn idx(nx: usize, ny: usize, i: usize, j: usize, k: usize) -> usize {
+        (k * ny + j) * nx + i
+    }
+
+    /// Apply the stencil at a single cell (with clamped indexing at domain edges).
+    fn apply_at(
+        &self,
+        phi: &[f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        i: usize,
+        j: usize,
+        k: usize,
+    ) -> f64 {
+        let idc = Self::idx(nx, ny, i, j, k);
+        let mut sum = self.center * phi[idc];
+
+        let i0 = i as isize;
+        let j0 = j as isize;
+        let k0 = k as isize;
+
+        let nxm = nx as isize - 1;
+        let nym = ny as isize - 1;
+        let nzm = nz as isize - 1;
+
+        for (off, &c) in self.offs.iter().zip(self.coeffs.iter()) {
+            let ii = Self::clamp_idx(i0 + off[0], 0, nxm) as usize;
+            let jj = Self::clamp_idx(j0 + off[1], 0, nym) as usize;
+            let kk = Self::clamp_idx(k0 + off[2], 0, nzm) as usize;
+            sum += c * phi[Self::idx(nx, ny, ii, jj, kk)];
+        }
+        sum
+    }
+
+    /// Sum of off-diagonal contributions Σ c_n φ_n at a single cell.
+    fn offdiag_sum_at(
+        &self,
+        phi: &[f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        i: usize,
+        j: usize,
+        k: usize,
+    ) -> f64 {
+        let i0 = i as isize;
+        let j0 = j as isize;
+        let k0 = k as isize;
+
+        let nxm = nx as isize - 1;
+        let nym = ny as isize - 1;
+        let nzm = nz as isize - 1;
+
+        let mut sum = 0.0;
+        for (off, &c) in self.offs.iter().zip(self.coeffs.iter()) {
+            let ii = Self::clamp_idx(i0 + off[0], 0, nxm) as usize;
+            let jj = Self::clamp_idx(j0 + off[1], 0, nym) as usize;
+            let kk = Self::clamp_idx(k0 + off[2], 0, nzm) as usize;
+            sum += c * phi[Self::idx(nx, ny, ii, jj, kk)];
+        }
+        sum
+    }
+
+    /// Build a Galerkin coarse operator A_c = R A_f P for constant-coefficient stencils.
+    ///
+    /// We compute a *single interior row stencil* numerically on a small test grid, which is
+    /// valid for all interior cells of the real MG level (translation invariant operator).
+    fn galerkin_coarsen(
+        fine: &Stencil3D,
+        rx: usize,
+        ry: usize,
+        rz: usize,
+        prolong: ProlongationKind,
+    ) -> Self {
+        // Choose a coarse grid large enough so the central row is unaffected by clamped edges.
+        // (Support radius is small; 9^3 is cheap.)
+        let ncx: usize = 9;
+        let ncy: usize = 9;
+        let ncz: usize = 9;
+
+        let nfx = ncx * rx;
+        let nfy = ncy * ry;
+        let nfz = ncz * rz;
+
+        let c0 = (ncx / 2, ncy / 2, ncz / 2);
+        let id_c0 = Self::idx(ncx, ncy, c0.0, c0.1, c0.2);
+
+        let mut phi_c = vec![0.0f64; ncx * ncy * ncz];
+        let mut phi_f = vec![0.0f64; nfx * nfy * nfz];
+        let mut y_f = vec![0.0f64; nfx * nfy * nfz];
+        let mut y_c = vec![0.0f64; ncx * ncy * ncz];
+
+        let mut map: HashMap<(isize, isize, isize), f64> = HashMap::new();
+
+        for kz in 0..ncz {
+            for jy in 0..ncy {
+                for ix in 0..ncx {
+                    phi_c.fill(0.0);
+                    phi_c[Self::idx(ncx, ncy, ix, jy, kz)] = 1.0;
+
+                    // P: coarse -> fine
+                    prolongate_scalar(
+                        &phi_c, ncx, ncy, ncz, &mut phi_f, nfx, nfy, nfz, rx, ry, rz, prolong,
+                    );
+
+                    // y_f = A_f phi_f
+                    apply_stencil_to_field(fine, &phi_f, &mut y_f, nfx, nfy, nfz);
+
+                    // R: fine -> coarse (block average)
+                    restrict_scalar_avg(&y_f, nfx, nfy, nfz, &mut y_c, ncx, ncy, ncz, rx, ry, rz);
+
+                    let coeff = y_c[id_c0];
+                    if coeff.abs() > 1e-14 {
+                        let off = (
+                            ix as isize - c0.0 as isize,
+                            jy as isize - c0.1 as isize,
+                            kz as isize - c0.2 as isize,
+                        );
+                        map.insert(off, coeff);
+                    }
+                }
+            }
+        }
+
+        // Convert map -> sorted stencil.
+        let mut keys: Vec<(isize, isize, isize)> = map.keys().cloned().collect();
+        keys.sort();
+
+        let mut center = 0.0;
+        let mut offs = Vec::new();
+        let mut coeffs = Vec::new();
+
+        for key in keys {
+            let c = map[&key];
+            if key == (0, 0, 0) {
+                center = c;
+            } else {
+                offs.push([key.0, key.1, key.2]);
+                coeffs.push(c);
+            }
+        }
+
+        let diag = -center;
+        Self {
+            center,
+            diag,
+            offs,
+            coeffs,
+        }
+    }
+}
+
+/// Apply a constant-coefficient stencil operator to a whole scalar field.
+/// Uses clamped indexing at edges (sufficient for Galerkin-stencil construction).
+fn apply_stencil_to_field(
+    st: &Stencil3D,
+    phi: &[f64],
+    out: &mut [f64],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+) {
+    debug_assert_eq!(phi.len(), nx * ny * nz);
+    debug_assert_eq!(out.len(), nx * ny * nz);
+
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                out[Stencil3D::idx(nx, ny, i, j, k)] = st.apply_at(phi, nx, ny, nz, i, j, k);
+            }
+        }
+    }
+}
+
+/// Block-average restriction R: fine -> coarse.
+fn restrict_scalar_avg(
+    fine: &[f64],
+    nfx: usize,
+    nfy: usize,
+    nfz: usize,
+    coarse: &mut [f64],
+    ncx: usize,
+    ncy: usize,
+    ncz: usize,
+    rx: usize,
+    ry: usize,
+    rz: usize,
+) {
+    debug_assert_eq!(fine.len(), nfx * nfy * nfz);
+    debug_assert_eq!(coarse.len(), ncx * ncy * ncz);
+
+    let norm = 1.0 / ((rx * ry * rz) as f64);
+
+    for kz in 0..ncz {
+        for jy in 0..ncy {
+            for ix in 0..ncx {
+                let mut sum = 0.0;
+                for fk in 0..rz {
+                    for fj in 0..ry {
+                        for fi in 0..rx {
+                            let i = ix * rx + fi;
+                            let j = jy * ry + fj;
+                            let k = kz * rz + fk;
+                            sum += fine[Stencil3D::idx(nfx, nfy, i, j, k)];
+                        }
+                    }
+                }
+                coarse[Stencil3D::idx(ncx, ncy, ix, jy, kz)] = norm * sum;
+            }
+        }
+    }
+}
+
+/// Prolongation P: coarse -> fine (scalar).
+///  - Injection replicates the coarse value across the fine block.
+///  - Trilinear uses cell-centered linear interpolation (ratio 2 only; ratio 1 = identity).
+fn prolongate_scalar(
+    coarse: &[f64],
+    ncx: usize,
+    ncy: usize,
+    ncz: usize,
+    fine: &mut [f64],
+    nfx: usize,
+    nfy: usize,
+    nfz: usize,
+    rx: usize,
+    ry: usize,
+    rz: usize,
+    kind: ProlongationKind,
+) {
+    debug_assert_eq!(coarse.len(), ncx * ncy * ncz);
+    debug_assert_eq!(fine.len(), nfx * nfy * nfz);
+
+    match kind {
+        ProlongationKind::Injection => {
+            fine.fill(0.0);
+            for kz in 0..ncz {
+                for jy in 0..ncy {
+                    for ix in 0..ncx {
+                        let v = coarse[Stencil3D::idx(ncx, ncy, ix, jy, kz)];
+                        for fk in 0..rz {
+                            for fj in 0..ry {
+                                for fi in 0..rx {
+                                    let i = ix * rx + fi;
+                                    let j = jy * ry + fj;
+                                    let k = kz * rz + fk;
+                                    fine[Stencil3D::idx(nfx, nfy, i, j, k)] = v;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ProlongationKind::Trilinear => {
+            // We compute each fine cell from up to 8 coarse neighbors.
+            fine.fill(0.0);
+            for k in 0..nfz {
+                let kz = k / rz;
+                let rk = k % rz;
+                let (k0, k1, wk0, wk1) = interp_1d_cell_centered(kz, rk, ncz, rz);
+
+                for j in 0..nfy {
+                    let jy = j / ry;
+                    let rj = j % ry;
+                    let (j0, j1, wj0, wj1) = interp_1d_cell_centered(jy, rj, ncy, ry);
+
+                    for i in 0..nfx {
+                        let ix = i / rx;
+                        let ri = i % rx;
+                        let (i0, i1, wi0, wi1) = interp_1d_cell_centered(ix, ri, ncx, rx);
+
+                        let mut v = 0.0;
+
+                        // 8-corner trilinear mix (some weights may be zero if r?==0 and neighbor clamped)
+                        v += wi0 * wj0 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i0, j0, k0)];
+                        v += wi1 * wj0 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i1, j0, k0)];
+                        v += wi0 * wj1 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i0, j1, k0)];
+                        v += wi1 * wj1 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i1, j1, k0)];
+                        v += wi0 * wj0 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i0, j0, k1)];
+                        v += wi1 * wj0 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i1, j0, k1)];
+                        v += wi0 * wj1 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i0, j1, k1)];
+                        v += wi1 * wj1 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i1, j1, k1)];
+
+                        fine[Stencil3D::idx(nfx, nfy, i, j, k)] = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cell-centered linear interpolation weights for 2:1 coarsening.
+/// Coarse index is `I = i_f / r`, with remainder `ri = i_f % r`.
+///
+/// For r==2:
+///   fine i=2I   lies 0.25H left  of coarse center -> 0.75*I + 0.25*(I-1)
+///   fine i=2I+1 lies 0.25H right of coarse center -> 0.75*I + 0.25*(I+1)
+///
+/// For r==1: identity.
+fn interp_1d_cell_centered(
+    i_coarse: usize,
+    r_i: usize,
+    n_coarse: usize,
+    r: usize,
+) -> (usize, usize, f64, f64) {
+    if r == 1 {
+        return (
+            i_coarse.min(n_coarse - 1),
+            i_coarse.min(n_coarse - 1),
+            1.0,
+            0.0,
+        );
+    }
+    // currently MG uses only r==2 when coarsening
+    debug_assert!(r == 2);
+
+    let i0 = i_coarse.min(n_coarse - 1);
+    if r_i == 0 {
+        let i1 = if i0 > 0 { i0 - 1 } else { 0 };
+        if i1 == i0 {
+            (i0, i0, 1.0, 0.0)
+        } else {
+            (i0, i1, 0.75, 0.25)
+        }
+    } else {
+        let i1 = (i0 + 1).min(n_coarse - 1);
+        if i1 == i0 {
+            (i0, i0, 1.0, 0.0)
+        } else {
+            (i0, i1, 0.75, 0.25)
+        }
+    }
+}
+
 struct MGLevel {
     nx: usize,
     ny: usize,
@@ -810,6 +1563,9 @@ struct MGLevel {
     inv_dx2: f64,
     inv_dy2: f64,
     inv_dz2: f64,
+
+    /// Discrete operator stencil used on this level.
+    stencil: Stencil3D,
 
     /// Current solution on this level.
     phi: Vec<f64>,
@@ -837,6 +1593,7 @@ impl MGLevel {
             inv_dx2: 1.0 / (dx * dx),
             inv_dy2: 1.0 / (dy * dy),
             inv_dz2: 1.0 / (dz * dz),
+            stencil: Stencil3D::seven_point(dx, dy, dz),
             phi: vec![0.0; n],
             rhs: vec![0.0; n],
             res: vec![0.0; n],
@@ -853,11 +1610,20 @@ impl MGLevel {
         let (phi, bc_phi) = (&mut self.phi, &self.bc_phi);
         stamp_dirichlet_bc(phi, bc_phi, nx, ny, nz);
     }
+
+    #[inline]
+    fn idx(&self, i: usize, j: usize, k: usize) -> usize {
+        idx3(i, j, k, self.nx, self.ny)
+    }
 }
 
 pub struct DemagPoissonMG {
     grid: Grid2D,
     cfg: DemagPoissonMGConfig,
+
+    // Operator / multigrid settings (A3/A4). Not part of DemagPoissonMGConfig to avoid
+    // breaking external struct-literal construction; configured via env vars.
+    op: MGOperatorSettings,
 
     // padded domain size
     px: usize,
@@ -874,6 +1640,24 @@ pub struct DemagPoissonMG {
 
 impl DemagPoissonMG {
     pub fn new(grid: Grid2D, cfg: DemagPoissonMGConfig) -> Self {
+        let mut cfg = cfg;
+
+        // Operator / MG hierarchy settings (A3/A4), configured via env vars.
+        let op = MGOperatorSettings::from_env();
+
+        // Red-black SOR is only valid for the classic 7-point axis-only Laplacian with
+        // rediscretized coarse operators and injection prolongation.
+        let rb_allowed = op.stencil == LaplacianStencilKind::SevenPoint
+            && op.coarse_op == CoarseOpKind::Rediscretize
+            && op.prolong == ProlongationKind::Injection;
+
+        if cfg.smoother == MGSmoother::RedBlackSOR && !rb_allowed {
+            eprintln!(
+                "[demag_mg] INFO: overriding smoother RedBlackSOR -> WeightedJacobi (stencil/prolong/coarse-op requires it)."
+            );
+            cfg.smoother = MGSmoother::WeightedJacobi;
+        }
+
         let nx = grid.nx.max(1);
         let ny = grid.ny.max(1);
 
@@ -944,9 +1728,34 @@ impl DemagPoissonMG {
             }
         }
 
+        // Assign operator stencils per level.
+        //
+        // Finest level: chosen discretization. Coarse levels:
+        //  - Rediscretize: same chosen discretization on each level.
+        //  - Galerkin: A_c = R A_f P using our restriction/prolongation operators.
+        if !levels.is_empty() {
+            levels[0].stencil =
+                Stencil3D::from_kind(op.stencil, levels[0].dx, levels[0].dy, levels[0].dz);
+            for l in 1..levels.len() {
+                let rx = levels[l - 1].nx / levels[l].nx;
+                let ry = levels[l - 1].ny / levels[l].ny;
+                let rz = levels[l - 1].nz / levels[l].nz;
+
+                levels[l].stencil = match op.coarse_op {
+                    CoarseOpKind::Rediscretize => {
+                        Stencil3D::from_kind(op.stencil, levels[l].dx, levels[l].dy, levels[l].dz)
+                    }
+                    CoarseOpKind::Galerkin => {
+                        Stencil3D::galerkin_coarsen(&levels[l - 1].stencil, rx, ry, rz, op.prolong)
+                    }
+                };
+            }
+        }
+
         Self {
             grid,
             cfg,
+            op,
             px,
             py,
             pz,
@@ -966,6 +1775,7 @@ impl DemagPoissonMG {
             && self.grid.dz == grid.dz
             && self.cfg.pad_xy == cfg.pad_xy
             && self.cfg.n_vac_z == cfg.n_vac_z
+            && self.op == MGOperatorSettings::from_env()
     }
 
     fn build_rhs_from_m(&mut self, m: &VectorField2D, ms: f64) {
@@ -1440,51 +2250,49 @@ impl DemagPoissonMG {
         let ny = level.ny;
         let nz = level.nz;
 
-        let sx = level.inv_dx2;
-        let sy = level.inv_dy2;
-        let sz = level.inv_dz2;
+        // IMPORTANT (borrow checker): do NOT hold `&level.stencil` across `level.enforce_dirichlet()`.
+        // Clone once; the stencil is small (<= 26 neighbors) and constant within this call.
+        let st = level.stencil.clone();
 
-        let denom = 2.0 * (sx + sy + sz);
-        let plane = nx * ny;
-
+        // Weighted Jacobi:
+        //   φ^{new} = (1-ω) φ^{old} + ω * ( (Σ offdiag c_n φ_n) - rhs ) / diag
+        // where diag = -center (positive for Laplacian-like stencils).
         for _ in 0..iters {
-            // Start with zeros, then stamp in Dirichlet boundary values.
-            level.tmp.fill(0.0);
-            stamp_dirichlet_bc(&mut level.tmp, &level.bc_phi, nx, ny, nz);
+            // tmp = old phi (read-only snapshot)
+            level.tmp.copy_from_slice(&level.phi);
 
-            let phi_ro: &[f64] = &level.phi;
-            let rhs_ro: &[f64] = &level.rhs;
+            // Limit the lifetime of `tmp`/`rhs` borrows so we can call `enforce_dirichlet()` afterwards.
+            {
+                let tmp: &[f64] = &level.tmp;
+                let rhs: &[f64] = &level.rhs;
+                let st_ref = &st;
 
-            // Parallelise over rows for good scaling when nz is small.
-            level
-                .tmp
-                .par_chunks_mut(nx)
-                .enumerate()
-                .for_each(|(row_idx, tmp_row)| {
-                    let k = row_idx / ny;
-                    let j = row_idx % ny;
-                    if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                        return;
-                    }
-                    let base = row_idx * nx;
-                    for i in 1..(nx - 1) {
-                        let id = base + i;
+                // Update interior in parallel: each (k,j) row writes to a disjoint `phi_row`.
+                level
+                    .phi
+                    .par_chunks_mut(nx)
+                    .enumerate()
+                    .for_each(|(row_idx, phi_row)| {
+                        let k = row_idx / ny;
+                        let j = row_idx % ny;
 
-                        let xm = phi_ro[id - 1];
-                        let xp = phi_ro[id + 1];
-                        let ym = phi_ro[id - nx];
-                        let yp = phi_ro[id + nx];
-                        let zm = phi_ro[id - plane];
-                        let zp = phi_ro[id + plane];
+                        // Skip boundary planes/rows (Dirichlet)
+                        if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
+                            return;
+                        }
 
-                        let off = sx * (xm + xp) + sy * (ym + yp) + sz * (zm + zp);
-                        let phi_new = (off - rhs_ro[id]) / denom;
+                        let base = row_idx * nx;
+                        for i in 1..(nx - 1) {
+                            let id = base + i;
+                            let off = st_ref.offdiag_sum_at(tmp, nx, ny, nz, i, j, k);
+                            let phi_gs = (off - rhs[id]) / st_ref.diag;
+                            phi_row[i] = (1.0 - omega) * tmp[id] + omega * phi_gs;
+                        }
+                    });
+            }
 
-                        tmp_row[i] = (1.0 - omega) * phi_ro[id] + omega * phi_new;
-                    }
-                });
-
-            std::mem::swap(&mut level.phi, &mut level.tmp);
+            // Keep Dirichlet boundaries pinned (cheap, correctness-critical)
+            level.enforce_dirichlet();
         }
     }
 
@@ -1582,16 +2390,9 @@ impl DemagPoissonMG {
         let ny = level.ny;
         let nz = level.nz;
 
-        let sx = level.inv_dx2;
-        let sy = level.inv_dy2;
-        let sz = level.inv_dz2;
-        let diag = -2.0 * (sx + sy + sz);
-
-        level.res.fill(0.0);
-
-        let plane = nx * ny;
-        let phi_ro: &[f64] = &level.phi;
-        let rhs_ro: &[f64] = &level.rhs;
+        let phi: &[f64] = &level.phi;
+        let rhs: &[f64] = &level.rhs;
+        let st = &level.stencil;
 
         level
             .res
@@ -1600,32 +2401,34 @@ impl DemagPoissonMG {
             .map(|(row_idx, res_row)| {
                 let k = row_idx / ny;
                 let j = row_idx % ny;
+
+                // Boundary planes: homogeneous residual (Dirichlet).
                 if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
+                    res_row.fill(0.0);
                     return 0.0f64;
                 }
 
                 let base = row_idx * nx;
                 let mut max_abs: f64 = 0.0;
 
+                // Boundary cells in the row.
+                res_row[0] = 0.0;
+                res_row[nx - 1] = 0.0;
+
                 for i in 1..(nx - 1) {
                     let id = base + i;
 
-                    let xm = phi_ro[id - 1];
-                    let xp = phi_ro[id + 1];
-                    let ym = phi_ro[id - nx];
-                    let yp = phi_ro[id + nx];
-                    let zm = phi_ro[id - plane];
-                    let zp = phi_ro[id + plane];
-
-                    let aphi = sx * (xm + xp) + sy * (ym + yp) + sz * (zm + zp) + diag * phi_ro[id];
-                    let r = rhs_ro[id] - aphi;
+                    // r = rhs - A phi
+                    let aphi = st.apply_at(phi, nx, ny, nz, i, j, k);
+                    let r = rhs[id] - aphi;
 
                     res_row[i] = r;
                     max_abs = max_abs.max(r.abs());
                 }
+
                 max_abs
             })
-            .reduce(|| 0.0f64, f64::max)
+            .reduce(|| 0.0, |a, b| a.max(b))
     }
 
     fn restrict_residual(fine: &MGLevel, coarse: &mut MGLevel) {
@@ -1676,43 +2479,96 @@ impl DemagPoissonMG {
             });
     }
 
-    fn prolongate_add(coarse: &MGLevel, fine: &mut MGLevel) {
-        // Piecewise-constant prolongation (injection):
-        // each fine cell receives the correction of its parent coarse cell.
-        //
-        // This is robust for cell-centered multigrid, and works with semi-coarsening.
-        let nxf = fine.nx;
-        let nyf = fine.ny;
-        let nzf = fine.nz;
+    fn prolongate_add(coarse: &MGLevel, fine: &mut MGLevel, kind: ProlongationKind) {
+        let rx = fine.nx / coarse.nx;
+        let ry = fine.ny / coarse.ny;
+        let rz = fine.nz / coarse.nz;
 
-        let rxf = fine.nx / coarse.nx;
-        let ryf = fine.ny / coarse.ny;
-        let rzf = fine.nz / coarse.nz;
+        let nfx = fine.nx;
+        let nfy = fine.ny;
+        let nfz = fine.nz;
 
-        debug_assert!(rxf == 1 || rxf == 2);
-        debug_assert!(ryf == 1 || ryf == 2);
-        debug_assert!(rzf == 1 || rzf == 2);
+        match kind {
+            ProlongationKind::Injection => {
+                let cphi: &[f64] = &coarse.phi;
 
-        fine.phi
-            .par_chunks_mut(nxf)
-            .enumerate()
-            .for_each(|(rowf_idx, phi_row)| {
-                let kf = rowf_idx / nyf;
-                let jf = rowf_idx % nyf;
+                fine.phi
+                    .par_chunks_mut(nfx)
+                    .enumerate()
+                    .for_each(|(row_idx, phi_row)| {
+                        let k = row_idx / nfy;
+                        let j = row_idx % nfy;
 
-                if kf == 0 || kf + 1 == nzf || jf == 0 || jf + 1 == nyf {
-                    return;
-                }
+                        if k == 0 || k + 1 == nfz || j == 0 || j + 1 == nfy {
+                            return;
+                        }
 
-                let kc = kf / rzf;
-                let jc = jf / ryf;
+                        let kc = k / rz;
+                        let jc = j / ry;
 
-                for if_ in 1..(nxf - 1) {
-                    let ic = if_ / rxf;
-                    let corr = coarse.phi[idx3(ic, jc, kc, coarse.nx, coarse.ny)];
-                    phi_row[if_] += corr;
-                }
-            });
+                        for i in 1..(nfx - 1) {
+                            let ic = i / rx;
+
+                            // Match old behaviour: only prolongate from coarse interior cells
+                            if ic == 0
+                                || ic + 1 >= coarse.nx
+                                || jc == 0
+                                || jc + 1 >= coarse.ny
+                                || kc == 0
+                                || kc + 1 >= coarse.nz
+                            {
+                                continue;
+                            }
+
+                            let v = cphi[coarse.idx(ic, jc, kc)];
+                            phi_row[i] += v;
+                        }
+                    });
+            }
+
+            ProlongationKind::Trilinear => {
+                let cphi: &[f64] = &coarse.phi;
+
+                fine.phi
+                    .par_chunks_mut(nfx)
+                    .enumerate()
+                    .for_each(|(row_idx, phi_row)| {
+                        let k = row_idx / nfy;
+                        let j = row_idx % nfy;
+
+                        if k == 0 || k + 1 == nfz || j == 0 || j + 1 == nfy {
+                            return;
+                        }
+
+                        let kz = k / rz;
+                        let rk = k % rz;
+                        let (k0, k1, wk0, wk1) = interp_1d_cell_centered(kz, rk, coarse.nz, rz);
+
+                        let jy = j / ry;
+                        let rj = j % ry;
+                        let (j0, j1, wj0, wj1) = interp_1d_cell_centered(jy, rj, coarse.ny, ry);
+
+                        for i in 1..(nfx - 1) {
+                            let ix = i / rx;
+                            let ri = i % rx;
+                            let (i0, i1, wi0, wi1) = interp_1d_cell_centered(ix, ri, coarse.nx, rx);
+
+                            let mut v = 0.0;
+
+                            v += wi0 * wj0 * wk0 * cphi[coarse.idx(i0, j0, k0)];
+                            v += wi1 * wj0 * wk0 * cphi[coarse.idx(i1, j0, k0)];
+                            v += wi0 * wj1 * wk0 * cphi[coarse.idx(i0, j1, k0)];
+                            v += wi1 * wj1 * wk0 * cphi[coarse.idx(i1, j1, k0)];
+                            v += wi0 * wj0 * wk1 * cphi[coarse.idx(i0, j0, k1)];
+                            v += wi1 * wj0 * wk1 * cphi[coarse.idx(i1, j0, k1)];
+                            v += wi0 * wj1 * wk1 * cphi[coarse.idx(i0, j1, k1)];
+                            v += wi1 * wj1 * wk1 * cphi[coarse.idx(i1, j1, k1)];
+
+                            phi_row[i] += v;
+                        }
+                    });
+            }
+        }
     }
 
     fn v_cycle(&mut self, l: usize) {
@@ -1762,7 +2618,7 @@ impl DemagPoissonMG {
                 let (a, b) = self.levels.split_at_mut(l + 1);
                 (&mut a[l], &b[0])
             };
-            Self::prolongate_add(coarse, fine);
+            Self::prolongate_add(coarse, fine, self.op.prolong);
         }
 
         match smoother {
@@ -1771,7 +2627,8 @@ impl DemagPoissonMG {
             }
             MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], post, omega_sor),
         }
-    }    fn solve_with_timing(&mut self) -> (u64, u64) {
+    }
+    fn solve_with_timing(&mut self) -> (u64, u64) {
         if !self.cfg.warm_start {
             self.levels[0].phi.fill(0.0);
         }
@@ -1872,10 +2729,10 @@ impl DemagPoissonMG {
         (bc_ns, solve_ns)
     }
 
-
     fn solve(&mut self) {
         let _ = self.solve_with_timing();
-    }    fn add_b_from_phi_on_magnet_layer(
+    }
+    fn add_b_from_phi_on_magnet_layer(
         &self,
         m: &VectorField2D,
         _ms: f64,
@@ -2041,6 +2898,8 @@ struct DeltaKernelKey {
     dz_bits: u64,
     pad_xy: usize,
     n_vac_z: usize,
+    // MG operator settings that affect the resulting ΔK (stencil/prolong/coarse-op).
+    op: MGOperatorSettings,
     bc: BoundaryCondition,
     // Only relevant for DirichletTreecode, but included so disk caches are safe.
     tree_theta_bits: u64,
@@ -2051,7 +2910,12 @@ struct DeltaKernelKey {
 }
 
 impl DeltaKernelKey {
-    fn new(grid: &Grid2D, mg_cfg: &DemagPoissonMGConfig, hyb: &HybridConfig) -> Self {
+    fn new(
+        grid: &Grid2D,
+        mg_cfg: &DemagPoissonMGConfig,
+        hyb: &HybridConfig,
+        op: MGOperatorSettings,
+    ) -> Self {
         Self {
             nx: grid.nx,
             ny: grid.ny,
@@ -2060,6 +2924,7 @@ impl DeltaKernelKey {
             dz_bits: grid.dz.to_bits(),
             pad_xy: mg_cfg.pad_xy,
             n_vac_z: mg_cfg.n_vac_z,
+            op,
             bc: mg_cfg.bc,
             tree_theta_bits: mg_cfg.tree_theta.to_bits(),
             tree_leaf: mg_cfg.tree_leaf,
@@ -2080,7 +2945,7 @@ impl DeltaKernelKey {
         let dz = f64::from_bits(self.dz_bits);
         let tree_theta = f64::from_bits(self.tree_theta_bits);
         let fname = format!(
-            "demag_mg_hybrid_dk_nx{}_ny{}_dx{:.3e}_dy{:.3e}_dz{:.3e}_pad{}_nvacz{}_bc{}_th{:.3e}_leaf{}_dep{}_r{}_dv{}.bin",
+            "demag_mg_hybrid_dk_nx{}_ny{}_dx{:.3e}_dy{:.3e}_dz{:.3e}_pad{}_nvacz{}_op{}_bc{}_th{:.3e}_leaf{}_dep{}_r{}_dv{}.bin",
             self.nx,
             self.ny,
             dx,
@@ -2088,6 +2953,7 @@ impl DeltaKernelKey {
             dz,
             self.pad_xy,
             self.n_vac_z,
+            self.op.tag(),
             bc_tag,
             tree_theta,
             self.tree_leaf,
@@ -2141,7 +3007,7 @@ impl DemagPoissonMGHybrid {
 
         let mut hyb_eff = self.hyb;
         hyb_eff.radius_xy = r_eff;
-        let key = DeltaKernelKey::new(&self.mg.grid, &self.mg.cfg, &hyb_eff);
+        let key = DeltaKernelKey::new(&self.mg.grid, &self.mg.cfg, &hyb_eff, self.mg.op);
 
         if self.dk_key == Some(key) && self.dk.is_some() {
             return;
@@ -2366,6 +3232,7 @@ fn load_delta_kernel_from_disk(key: &DeltaKernelKey) -> Option<DeltaKernel2D> {
         dz_bits,
         pad_xy,
         n_vac_z,
+        op: key.op,
         bc,
         tree_theta_bits,
         tree_leaf,
@@ -2472,7 +3339,6 @@ fn build_delta_kernel_impulse(
     // nonzero marker to every cell so the is_mag() tests treat them as magnet, without
     // materially affecting the field.
     let geom_eps = 1e-14;
-
 
     // Use a dedicated MG solver for building ΔK. We want this to be a stable, repeatable
     // impulse-response measurement, so disable warm-starting and use a fixed (possibly larger)
@@ -2624,7 +3490,6 @@ fn build_delta_kernel_impulse(
 
     dk
 }
-
 
 // Cache a solver instance so we don’t rebuild hierarchies every field evaluation.
 static DEMAG_MG_CACHE: OnceLock<Mutex<Option<DemagPoissonMGHybrid>>> = OnceLock::new();

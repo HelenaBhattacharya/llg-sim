@@ -1,6 +1,6 @@
 // src/bin/amr_vortex_relax.rs
 //
-// Stage-2B AMR benchmark: vortex relaxation (demag OFF).
+// Stage-2B AMR benchmark: vortex relaxation (demag ON via Bridge B).
 // Purpose:
 //   - De-risk clustering generality on a non-wall, non-bubble feature.
 //   - Validate multi-patch clustering machinery behaves sensibly on ring-like gradients.
@@ -16,10 +16,10 @@ use llg_sim::amr::{
     AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i, RegridPolicy,
     compute_patch_rects_clustered_from_indicator, maybe_regrid_multi_patch,
 };
-use llg_sim::effective_field::FieldMask;
+use llg_sim::effective_field::{FieldMask, demag_fft_uniform};
 use llg_sim::grid::Grid2D;
 use llg_sim::initial_states::init_vortex;
-use llg_sim::llg::RK4Scratch;
+use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax_add};
 use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
@@ -51,7 +51,10 @@ fn write_run_info(
     mat: &Material,
 ) -> io::Result<()> {
     let mut f = fs::File::create(path)?;
-    writeln!(f, "AMR vortex relaxation benchmark (Stage 2B, demag OFF)")?;
+    writeln!(
+        f,
+        "AMR vortex relaxation benchmark (Stage 2B, demag ON via Bridge B)"
+    )?;
     writeln!(f, "")?;
 
     writeln!(
@@ -294,15 +297,31 @@ fn run_uniform_fine(
     );
 
     let mut scratch = RK4Scratch::new(fine_grid);
+    // Bridge-B-consistent uniform reference: compute demag once per timestep and treat it as a frozen addend.
+    let mut b_demag = VectorField2D::new(fine_grid);
+    b_demag.set_uniform(0.0, 0.0, 0.0);
 
     let t0 = Instant::now();
     for step in 0..n_steps {
-        llg_sim::llg::step_llg_rk4_recompute_field_masked_relax(
+        // Demag addend (FFT, open boundaries). Overwrite buffer each timestep.
+        b_demag.set_uniform(0.0, 0.0, 0.0);
+        demag_fft_uniform::compute_demag_field_pbc(
+            &fine_grid,
+            &m,
+            &mut b_demag,
+            mat,
+            0,
+            0,
+        );
+
+        // Local terms (Exch+Anis) + frozen demag addend.
+        step_llg_rk4_recompute_field_masked_relax_add(
             &mut m,
             params,
             mat,
             &mut scratch,
             FieldMask::ExchAnis,
+            Some(&b_demag),
         );
         if step % 200 == 0 {
             println!("[uniform] step {step}/{n_steps}");
@@ -327,7 +346,7 @@ fn main() -> io::Result<()> {
         k_u: -1.0e5,
         easy_axis: [0.0, 0.0, 1.0],
         dmi: None,
-        demag: false,
+        demag: true,
         demag_method: DemagMethod::FftUniform,
     };
 

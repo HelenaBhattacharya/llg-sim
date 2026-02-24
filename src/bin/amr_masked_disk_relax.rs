@@ -451,22 +451,25 @@ fn main() -> io::Result<()> {
     let proxy0 = mz_proxy(&m0);
 
     let fallback = Rect2i::new(base.nx / 2 - 24, base.ny / 2 - 24, 48, 48);
-    let (patch_rects, stats) =
-        match compute_patch_rects_clustered_from_indicator(&proxy0,cluster_policy,Some(mask_base.as_slice()),) {
-            Some((rs, st)) if !rs.is_empty() => (rs, st),
-            _ => {
-                let rs = vec![fallback];
-                let st = llg_sim::amr::ClusterStats {
-                    max_indicator: 0.0,
-                    threshold: 0.0,
-                    flagged_cells: 0,
-                    components: 0,
-                    patches_before_merge: 1,
-                    patches_after_merge: 1,
-                };
-                (rs, st)
-            }
-        };
+    let (patch_rects, stats) = match compute_patch_rects_clustered_from_indicator(
+        &proxy0,
+        cluster_policy,
+        Some(mask_base.as_slice()),
+    ) {
+        Some((rs, st)) if !rs.is_empty() => (rs, st),
+        _ => {
+            let rs = vec![fallback];
+            let st = llg_sim::amr::ClusterStats {
+                max_indicator: 0.0,
+                threshold: 0.0,
+                flagged_cells: 0,
+                components: 0,
+                patches_before_merge: 1,
+                patches_after_merge: 1,
+            };
+            (rs, st)
+        }
+    };
 
     println!(
         "[init] max_indicator(mz proxy, coarse) = {:.9e}",

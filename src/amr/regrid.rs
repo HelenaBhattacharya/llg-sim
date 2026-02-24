@@ -12,10 +12,10 @@
 //   movement/size change between old and new patch sets.
 
 use crate::amr::clustering::{
-    compute_patch_rects_clustered_from_indicator, ClusterPolicy, ClusterStats,
+    ClusterPolicy, ClusterStats, compute_patch_rects_clustered_from_indicator,
 };
 use crate::amr::hierarchy::AmrHierarchy2D;
-use crate::amr::indicator::{compute_patch_bbox_from_indicator_geom, IndicatorStats};
+use crate::amr::indicator::{IndicatorStats, compute_patch_bbox_from_indicator_geom};
 use crate::amr::rect::Rect2i;
 
 #[derive(Clone, Copy, Debug)]
@@ -126,11 +126,8 @@ pub fn maybe_regrid_multi_patch(
     policy: RegridPolicy,
     cluster_policy: ClusterPolicy,
 ) -> Option<(Vec<Rect2i>, ClusterStats)> {
-    let (mut new_rects, stats) = compute_patch_rects_clustered_from_indicator(
-        &h.coarse,
-        cluster_policy,
-        h.geom_mask(),
-    )?;
+    let (mut new_rects, stats) =
+        compute_patch_rects_clustered_from_indicator(&h.coarse, cluster_policy, h.geom_mask())?;
 
     new_rects.sort_by_key(|r| (r.i0, r.j0, r.nx, r.ny));
 

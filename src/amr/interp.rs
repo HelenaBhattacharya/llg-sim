@@ -22,13 +22,15 @@ fn clamp_usize(x: isize, n: usize) -> usize {
 /// - grid origin at (0,0) in the lower-left corner
 /// - cell centres at (i+0.5)*dx, (j+0.5)*dy
 ///
-/// Returns a *renormalised* unit vector.
-pub fn sample_bilinear_unit(field: &VectorField2D, x: f64, y: f64) -> [f64; 3] {
+/// Returns the *raw interpolated vector* (no normalisation).
+///
+/// Use this for fields where the magnitude is physically meaningful (e.g. B_eff, B_demag).
+pub fn sample_bilinear(field: &VectorField2D, x: f64, y: f64) -> [f64; 3] {
     let g = &field.grid;
     let nx = g.nx;
     let ny = g.ny;
     if nx == 0 || ny == 0 {
-        return [0.0, 0.0, 1.0];
+        return [0.0, 0.0, 0.0];
     }
 
     // Convert physical coordinate to continuous cell-centre index.
@@ -66,7 +68,17 @@ pub fn sample_bilinear_unit(field: &VectorField2D, x: f64, y: f64) -> [f64; 3] {
 
     let v0 = lerp(v00, v10, tx);
     let v1 = lerp(v01, v11, tx);
-    let v = lerp(v0, v1, ty);
+    lerp(v0, v1, ty)
+}
 
+/// Bilinear sample (with clamping) at (x,y), returning a *renormalised* unit vector.
+///
+/// Use this for unit-magnetisation fields `m`.
+pub fn sample_bilinear_unit(field: &VectorField2D, x: f64, y: f64) -> [f64; 3] {
+    let v = sample_bilinear(field, x, y);
+    // For an empty field, keep the historical +z fallback.
+    if v[0] == 0.0 && v[1] == 0.0 && v[2] == 0.0 {
+        return [0.0, 0.0, 1.0];
+    }
     normalize(v)
 }

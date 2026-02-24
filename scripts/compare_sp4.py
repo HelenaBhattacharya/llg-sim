@@ -98,7 +98,6 @@ def plot_triplet(
     ax.plot(t_ns, mz, label=f"{prefix}mz", marker=marker, linestyle=linestyle, markersize=ms, linewidth=lw)
 
 
-
 # ----------------------------
 # Metrics helpers
 # ----------------------------
@@ -231,6 +230,259 @@ def print_metrics_block(
         f"  mz: RMSE={rm_mz:.6e}  max|Δm|={ma_mz:.3e} ({_pct_full_scale(ma_mz):.2f}%FS)  "
         f"p95|Δm|={p95_mz:.3e} ({_pct_full_scale(p95_mz):.2f}%FS)  t@max={tmz:.3e}s"
     )
+
+
+# ----------------------------
+# Dynamics diagnostics (NEW): frequency + phase drift
+# ----------------------------
+
+def _median_dt(t: Array) -> float:
+    t2 = np.asarray(t, dtype=float)
+    if t2.size < 3:
+        return float("nan")
+    d = np.diff(t2)
+    d = d[np.isfinite(d) & (d > 0)]
+    if d.size == 0:
+        return float("nan")
+    return float(np.median(d))
+
+
+def _resample_uniform(t: Array, y: Array, *, t0: float, t1: float, dt: float) -> Tuple[Array, Array]:
+    """Resample y(t) onto a uniform grid in [t0, t1] (inclusive-ish)."""
+    if not np.isfinite(dt) or dt <= 0:
+        return np.asarray([]), np.asarray([])
+
+    # Avoid pathological point counts
+    max_n = 200_000
+    n = int(np.floor((t1 - t0) / dt)) + 1
+    if n < 8:
+        return np.asarray([]), np.asarray([])
+    if n > max_n:
+        dt = (t1 - t0) / float(max_n - 1)
+        n = max_n
+
+    tg = t0 + dt * np.arange(n, dtype=float)
+    t2, y2 = _sanitize_xy(t, y)
+    if t2.size < 2:
+        return np.asarray([]), np.asarray([])
+
+    yg = np.interp(tg, t2, y2)
+    return tg, yg
+
+
+def _hann(n: int) -> Array:
+    if n <= 1:
+        return np.ones((n,), dtype=float)
+    return 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n, dtype=float) / float(n - 1))
+
+
+def dominant_frequency_hz(t: Array, y: Array, *, fmin: float = 0.0, fmax: Optional[float] = None) -> float:
+    """Estimate dominant frequency (Hz) in y(t) using FFT peak picking (after mean removal + Hann window)."""
+    t2, y2 = _sanitize_xy(t, y)
+    if t2.size < 8:
+        return float("nan")
+
+    dt = _median_dt(t2)
+    if not np.isfinite(dt) or dt <= 0:
+        return float("nan")
+
+    # uniform grid over the provided samples
+    t0, t1 = float(t2[0]), float(t2[-1])
+    tg, yg = _resample_uniform(t2, y2, t0=t0, t1=t1, dt=dt)
+    if tg.size < 8:
+        return float("nan")
+
+    yg = yg - float(np.mean(yg))
+    w = _hann(int(yg.size))
+    x = yg * w
+
+    # rFFT
+    X = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(x.size, d=dt)
+    amp = np.abs(X)
+
+    # ignore DC
+    amp[0] = 0.0
+
+    if fmin is not None and fmin > 0:
+        amp[freqs < float(fmin)] = 0.0
+    if fmax is not None and np.isfinite(fmax):
+        amp[freqs > float(fmax)] = 0.0
+
+    i = int(np.argmax(amp))
+    if amp[i] <= 0:
+        return float("nan")
+    return float(freqs[i])
+
+
+def _bandpass_fft(tg: Array, x: Array, *, f0: float, rel_bw: float) -> Array:
+    """Crude FFT-domain bandpass around f0 with relative half-bandwidth rel_bw."""
+    if tg.size < 8 or not np.isfinite(f0) or f0 <= 0:
+        return x
+
+    dt = float(tg[1] - tg[0])
+    X = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(x.size, d=dt)
+
+    bw = float(rel_bw) * f0
+    if not np.isfinite(bw) or bw <= 0:
+        bw = 0.2 * f0
+
+    f_lo = max(0.0, f0 - bw)
+    f_hi = f0 + bw
+
+    mask = (freqs >= f_lo) & (freqs <= f_hi)
+    Xf = np.zeros_like(X)
+    Xf[mask] = X[mask]
+    xf = np.fft.irfft(Xf, n=x.size)
+    return xf
+
+
+def _analytic_signal(x: Array) -> Array:
+    """Return analytic signal via Hilbert transform (FFT-based)."""
+    n = int(x.size)
+    if n < 8:
+        return x.astype(complex)
+
+    X = np.fft.fft(x)
+    h = np.zeros(n, dtype=float)
+    if n % 2 == 0:
+        h[0] = 1.0
+        h[n // 2] = 1.0
+        h[1: n // 2] = 2.0
+    else:
+        h[0] = 1.0
+        h[1: (n + 1) // 2] = 2.0
+
+    z = np.fft.ifft(X * h)
+    return z
+
+
+def phase_drift_slope(
+    t: Array,
+    y_ref: Array,
+    y_other: Array,
+    *,
+    f0: float,
+    rel_bw: float,
+) -> Tuple[float, float]:
+    """Estimate linear phase drift slope (rad/s) between y_other and y_ref, plus residual std (rad)."""
+    if t.size < 16:
+        return float("nan"), float("nan")
+
+    # remove mean and (optionally) bandpass around f0
+    x0 = np.asarray(y_ref, dtype=float) - float(np.mean(y_ref))
+    x1 = np.asarray(y_other, dtype=float) - float(np.mean(y_other))
+
+    x0 = _bandpass_fft(t, x0, f0=f0, rel_bw=rel_bw)
+    x1 = _bandpass_fft(t, x1, f0=f0, rel_bw=rel_bw)
+
+    z0 = _analytic_signal(x0)
+    z1 = _analytic_signal(x1)
+
+    ph0 = np.unwrap(np.angle(z0))
+    ph1 = np.unwrap(np.angle(z1))
+
+    dph = ph1 - ph0
+    dph = dph - float(dph[0])  # remove constant offset
+
+    # Fit dph(t) ~ a*t + b
+    a, b = np.polyfit(t, dph, 1)
+    fit = a * t + b
+    resid = float(np.std(dph - fit))
+
+    return float(a), resid
+
+
+def _pick_component_for_dyn(mx: Array, my: Array, mz: Array, *, mode: str) -> Tuple[str, Array]:
+    if mode in ("mx", "my", "mz"):
+        return mode, {"mx": mx, "my": my, "mz": mz}[mode]
+
+    # auto: choose largest variance component
+    v = {
+        "mx": float(np.nanstd(mx)),
+        "my": float(np.nanstd(my)),
+        "mz": float(np.nanstd(mz)),
+    }
+    # Pylance type-fix: v.get returns Optional[float], so use __getitem__ for total ordering.
+    key = max(v.keys(), key=lambda k: v[k])
+    return key, {"mx": mx, "my": my, "mz": mz}[key]
+
+
+def print_dynamics_block(
+    label: str,
+    t_m: Array, mx_m: Array, my_m: Array, mz_m: Array,
+    t_r: Array, mx_r: Array, my_r: Array, mz_r: Array,
+    *,
+    dyn_tmin: Optional[float],
+    dyn_tmax: Optional[float],
+    dyn_component: str,
+    dyn_rel_bw: float,
+) -> None:
+    """Print frequency + phase drift diagnostics (Rust vs MuMax) on an overlap window."""
+    lo, hi = overlap_window(t_m, t_r)
+
+    # default to "second half" if user didn't set dyn_tmin
+    if dyn_tmin is None:
+        dyn_lo = lo + 0.5 * (hi - lo)
+    else:
+        dyn_lo = max(lo, float(dyn_tmin))
+
+    dyn_hi = hi if dyn_tmax is None else min(hi, float(dyn_tmax))
+    if dyn_hi <= dyn_lo:
+        print(f"[dyn] {label}: no valid dynamics window (lo={dyn_lo:.3e}, hi={dyn_hi:.3e})")
+        return
+
+    # clip
+    t_m2, mx_m2, my_m2, mz_m2 = clip_time(t_m, mx_m, my_m, mz_m, lo=dyn_lo, hi=dyn_hi)
+    t_r2, mx_r2, my_r2, mz_r2 = clip_time(t_r, mx_r, my_r, mz_r, lo=dyn_lo, hi=dyn_hi)
+
+    if t_m2.size < 16 or t_r2.size < 16:
+        print(f"[dyn] {label}: not enough points after clipping (n_m={t_m2.size}, n_r={t_r2.size})")
+        return
+
+    # choose component (based on MuMax over the window)
+    comp, y_m = _pick_component_for_dyn(mx_m2, my_m2, mz_m2, mode=dyn_component)
+    _, y_r = _pick_component_for_dyn(mx_r2, my_r2, mz_r2, mode=comp)
+
+    # choose uniform dt
+    dt_m = _median_dt(np.asarray(t_m2, dtype=float))
+    dt_r = _median_dt(np.asarray(t_r2, dtype=float))
+    dt = min(dt_m, dt_r)
+    if not np.isfinite(dt) or dt <= 0:
+        print(f"[dyn] {label}: could not determine dt (dt_m={dt_m}, dt_r={dt_r})")
+        return
+
+    tg, ymg = _resample_uniform(t_m2, y_m, t0=dyn_lo, t1=dyn_hi, dt=dt)
+    tg2, yrg = _resample_uniform(t_r2, y_r, t0=dyn_lo, t1=dyn_hi, dt=dt)
+    if tg.size < 32 or tg2.size < 32:
+        print(f"[dyn] {label}: resampling produced too few points")
+        return
+
+    # They should match but be safe:
+    n = min(tg.size, tg2.size)
+    tg = tg[:n]
+    ymg = ymg[:n]
+    yrg = yrg[:n]
+
+    # frequency estimates
+    f_m = dominant_frequency_hz(tg, ymg)
+    f_r = dominant_frequency_hz(tg, yrg)
+
+    # phase drift estimate around the midpoint frequency
+    f0 = float(np.nanmean([f_m, f_r]))
+    slope, resid = phase_drift_slope(tg, ymg, yrg, f0=f0, rel_bw=float(dyn_rel_bw))
+
+    # conversions
+    df_fft = f_r - f_m if (np.isfinite(f_r) and np.isfinite(f_m)) else float("nan")
+    df_phase = slope / (2.0 * np.pi) if np.isfinite(slope) else float("nan")
+    drift_cycles_per_ns = (df_phase * 1e-9) if np.isfinite(df_phase) else float("nan")
+    drift_cycles_end = (df_phase * (dyn_hi - dyn_lo)) if np.isfinite(df_phase) else float("nan")
+
+    print(f"\n[dyn] {label}  window: t in [{dyn_lo:.3e}, {dyn_hi:.3e}] s  component={comp}")
+    print(f"  f_mumax={f_m:.6e} Hz   f_rust={f_r:.6e} Hz   Δf_fft={df_fft:.6e} Hz")
+    print(f"  phase drift: slope={slope:.6e} rad/s  ⇒ Δf_phase={df_phase:.6e} Hz  ({drift_cycles_per_ns:.6e} cycles/ns)")
+    print(f"  drift over window: {drift_cycles_end:.3e} cycles   phase-fit residual std={resid:.3e} rad")
 
 
 # ----------------------------
@@ -367,6 +619,7 @@ def main():
     )
     ap.add_argument(
         "--metrics-tmin",
+        type=float,
         default=None,
         help="Optional metrics window start time in seconds (e.g. 3e-9).",
     )
@@ -381,6 +634,34 @@ def main():
         choices=["rust", "mumax"],
         default="rust",
         help="Interpolate the other dataset onto this time grid for metrics (default: rust).",
+    )
+
+    # dynamics diagnostics (frequency + phase drift)
+    ap.add_argument(
+        "--dyn-tmin",
+        type=float,
+        default=None,
+        help=(
+            "Optional dynamics window start time in seconds. If omitted, uses the second half of the overlap window."
+        ),
+    )
+    ap.add_argument(
+        "--dyn-tmax",
+        type=float,
+        default=None,
+        help="Optional dynamics window end time in seconds.",
+    )
+    ap.add_argument(
+        "--dyn-component",
+        choices=["auto", "mx", "my", "mz"],
+        default="auto",
+        help="Component used for frequency/phase drift diagnostics (default: auto = pick largest-variance component).",
+    )
+    ap.add_argument(
+        "--dyn-rel-bw",
+        type=float,
+        default=0.20,
+        help="Relative half-bandwidth around dominant frequency for phase drift estimation (default: 0.20).",
     )
 
     args = ap.parse_args()
@@ -430,6 +711,26 @@ def main():
                 tmin=args.metrics_tmin,
                 tmax=args.metrics_tmax,
                 interp_to=args.metrics_interp,
+            )
+
+            # --- NEW: frequency + phase drift diagnostics ---
+            print_dynamics_block(
+                "SP4a",
+                t_a, mx_a, my_a, mz_a,
+                t_ra, mx_ra, my_ra, mz_ra,
+                dyn_tmin=args.dyn_tmin,
+                dyn_tmax=args.dyn_tmax,
+                dyn_component=args.dyn_component,
+                dyn_rel_bw=args.dyn_rel_bw,
+            )
+            print_dynamics_block(
+                "SP4b",
+                t_b, mx_b, my_b, mz_b,
+                t_rb, mx_rb, my_rb, mz_rb,
+                dyn_tmin=args.dyn_tmin,
+                dyn_tmax=args.dyn_tmax,
+                dyn_component=args.dyn_component,
+                dyn_rel_bw=args.dyn_rel_bw,
             )
 
     # --- Plot layout (UNCHANGED) ---

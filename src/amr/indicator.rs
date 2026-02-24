@@ -100,11 +100,7 @@ pub fn indicator_grad2_forward_geom(
     } else {
         let idn = field.idx(ip, j);
         if let Some(msk) = geom_mask {
-            if !msk[idn] {
-                v
-            } else {
-                field.data[idn]
-            }
+            if !msk[idn] { v } else { field.data[idn] }
         } else {
             field.data[idn]
         }
@@ -115,11 +111,7 @@ pub fn indicator_grad2_forward_geom(
     } else {
         let idn = field.idx(i, jp);
         if let Some(msk) = geom_mask {
-            if !msk[idn] {
-                v
-            } else {
-                field.data[idn]
-            }
+            if !msk[idn] { v } else { field.data[idn] }
         } else {
             field.data[idn]
         }
