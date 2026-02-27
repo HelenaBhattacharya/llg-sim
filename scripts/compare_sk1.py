@@ -1,292 +1,310 @@
 #!/usr/bin/env python3
-"""
-compare_sk1.py — Compare SK1 outputs (MuMax vs Rust)
+"""compare_sk1.py — visualise FFT vs Poisson-MG demag on sk1 outputs.
 
-Computes:
-  - Skyrmion number Q for each snapshot
-  - Radial profiles: <m_z(r)> and <m_perp(r)> (radial average around skyrmion core)
+Reads OVFs written by sk1.rs under:
+  runs/st_problems/sk1/<case>_rust/
 
-Typical use:
-  python3 scripts/compare_sk1.py \
-    --mumax mumax_outputs/st_problems/sk1/sk1_out \
-    --rust  runs/st_problems/sk1/sk1_rust \
-    --outdir plots/sk1_compare
+Expected files:
+  m.ovf
+  b_fft.ovf
+  b_mg_env.ovf
+  b_diff_env.ovf   (optional; if missing we compute diff)
+
+Outputs PNGs into:
+  runs/st_problems/sk1/<case>_rust/plots/
+
+Usage:
+  python3 scripts/compare_sk1.py --case sk1a
+  python3 scripts/compare_sk1.py --case sk1a --root runs/st_problems/sk1
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
-import discretisedfield as df
 
 
-@dataclass
-class SnapshotAnalysis:
-    path: Path
-    Q: float
-    center_nm: Tuple[float, float]
-    mz_core: float
-    r_nm: np.ndarray
-    mz_r: np.ndarray
-    mperp_r: np.ndarray
-    counts: np.ndarray
+_OVF_KV_RE = re.compile(r"^\#\s*([^:]+)\s*:\s*(.*)$")
 
 
-def load_slice_field(path: Path) -> df.Field:
-    f = df.Field.from_file(str(path))
-    # Thin film => z slice
-    return f.sel("z")
+def _parse_header_kv(lines: List[str]) -> Dict[str, str]:
+    kv: Dict[str, str] = {}
+    for ln in lines:
+        m = _OVF_KV_RE.match(ln)
+        if not m:
+            continue
+        key = m.group(1).strip().lower()
+        val = m.group(2).strip()
+        kv[key] = val
+    return kv
 
 
-def field_array_and_mesh(m: df.Field) -> Tuple[np.ndarray, float, float, float, float]:
+def load_ovf_text(path: Path) -> Tuple[Dict[str, str], np.ndarray]:
+    """Minimal OVF 2.0 ASCII reader.
+
+    Returns: (meta_kv, arr) where arr shape = (ny, nx, 3)
+    Assumes x-fastest then y ordering.
     """
-    Returns:
-      vec: (nx, ny, 3) numpy array
-      dx, dy: cell sizes [m]
-      lx, ly: sample size [m]
-    """
-    arr = np.asarray(m.array)
-    if arr.ndim == 4 and arr.shape[-1] == 3:
-        arr = arr[:, :, 0, :]
-    if arr.ndim != 3 or arr.shape[-1] != 3:
-        raise ValueError(f"Unexpected field array shape: {arr.shape}")
+    txt = path.read_text().splitlines()
+    try:
+        i0 = next(i for i, ln in enumerate(txt) if ln.strip() == "# Begin: Data Text")
+        i1 = next(i for i, ln in enumerate(txt) if ln.strip() == "# End: Data Text")
+    except StopIteration as e:
+        raise ValueError(f"{path}: missing '# Begin: Data Text' / '# End: Data Text'") from e
 
-    dx, dy = float(m.mesh.cell[0]), float(m.mesh.cell[1])
-    lx, ly = float(m.mesh.region.edges[0]), float(m.mesh.region.edges[1])
-    return arr, dx, dy, lx, ly
+    kv = _parse_header_kv(txt[:i0])
 
+    def get_int(k: str) -> int:
+        return int(kv[k])
 
-def skyrmion_number(arr: np.ndarray, dx: float, dy: float) -> float:
-    """
-    Q = 1/(4π) ∫ m · (∂x m × ∂y m) dx dy
+    nx = get_int("xnodes")
+    ny = get_int("ynodes")
 
-    Uses np.gradient (non-periodic boundaries).
-    """
-    mx = arr[:, :, 0]
-    my = arr[:, :, 1]
-    mz = arr[:, :, 2]
+    floats: List[float] = []
+    for ln in txt[i0 + 1 : i1]:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 3:
+            continue
+        floats.extend([float(parts[0]), float(parts[1]), float(parts[2])])
 
-    dmx_dx, dmx_dy = np.gradient(mx, dx, dy, edge_order=2)
-    dmy_dx, dmy_dy = np.gradient(my, dx, dy, edge_order=2)
-    dmz_dx, dmz_dy = np.gradient(mz, dx, dy, edge_order=2)
-
-    # (∂x m × ∂y m)
-    cx = dmy_dx * dmz_dy - dmz_dx * dmy_dy
-    cy = dmz_dx * dmx_dy - dmx_dx * dmz_dy
-    cz = dmx_dx * dmy_dy - dmy_dx * dmx_dy
-
-    density = mx * cx + my * cy + mz * cz
-    Q = float((density / (4.0 * np.pi)).sum() * dx * dy)
-    return Q
+    arr = np.asarray(floats, dtype=np.float64)
+    expected = nx * ny * 3
+    if arr.size != expected:
+        raise ValueError(f"{path}: expected {expected} floats, got {arr.size}")
+    return kv, arr.reshape((ny, nx, 3))
 
 
-def find_core_center(arr: np.ndarray, dx: float, dy: float) -> Tuple[int, int, float]:
-    """
-    Core center via argmin(mz). Returns (ic, jc, mz_core).
-    """
-    mz = arr[:, :, 2]
-    flat_idx = int(np.argmin(mz))
-    ic_np, jc_np = np.unravel_index(flat_idx, mz.shape)
-    ic = int(ic_np)
-    jc = int(jc_np)
-    return ic, jc, float(mz[ic, jc])
+def save_mz_with_glyphs(path: Path, m: np.ndarray, title: str, stride: int = 10) -> None:
+    """Plot m_z as a heatmap and overlay light-grey in-plane glyph arrows (mx,my)."""
+    mz = m[..., 2]
+    mx = m[..., 0]
+    my = m[..., 1]
 
+    ny, nx = mz.shape
+    xs = np.arange(0, nx, stride)
+    ys = np.arange(0, ny, stride)
+    X, Y = np.meshgrid(xs, ys)
 
-def radial_profile(
-    arr: np.ndarray,
-    dx: float,
-    dy: float,
-    lx: float,
-    ly: float,
-    nbins: int = 120,
-    center_idx: Optional[Tuple[int, int]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Tuple[float, float]]:
-    """
-    Radial averages around core center:
-      <mz(r)> and <m_perp(r)>
+    U = mx[ys[:, None], xs[None, :]]
+    V = my[ys[:, None], xs[None, :]]
 
-    Returns:
-      r_nm (bin centers),
-      mz_r,
-      mperp_r,
-      counts,
-      center_nm
-    """
-    nx, ny, _ = arr.shape
-    mx = arr[:, :, 0]
-    my = arr[:, :, 1]
-    mz = arr[:, :, 2]
-    mperp = np.sqrt(mx * mx + my * my)
+    plt.figure(figsize=(6, 6))
+    im = plt.imshow(mz, origin="lower", cmap="bwr", vmin=-1, vmax=1)
+    plt.colorbar(im, fraction=0.046, pad=0.04)
 
-    if center_idx is None:
-        ic, jc, _ = find_core_center(arr, dx, dy)
-    else:
-        ic, jc = center_idx
+    # Normalise in-plane vectors for visual clarity
+    mag = np.sqrt(U**2 + V**2)
+    mag[mag == 0.0] = 1.0
+    U_plot = U / mag
+    V_plot = V / mag
 
-    # coordinates of cell centers [m]
-    xs = (np.arange(nx) + 0.5) * dx
-    ys = (np.arange(ny) + 0.5) * dy
-    xc = xs[ic]
-    yc = ys[jc]
-
-    X, Y = np.meshgrid(xs, ys, indexing="ij")
-    R = np.sqrt((X - xc) ** 2 + (Y - yc) ** 2)
-
-    # bins from 0 to half the smaller side
-    r_max = 0.5 * min(lx, ly)
-    edges = np.linspace(0.0, r_max, nbins + 1)
-    idx = np.digitize(R.ravel(), edges) - 1
-    idx = np.clip(idx, 0, nbins - 1)
-
-    # accumulate
-    mz_sum = np.bincount(idx, weights=mz.ravel(), minlength=nbins)
-    mp_sum = np.bincount(idx, weights=mperp.ravel(), minlength=nbins)
-    counts = np.bincount(idx, minlength=nbins).astype(float)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mz_r = mz_sum / counts
-        mp_r = mp_sum / counts
-
-    # bin centers [nm]
-    r_centers = 0.5 * (edges[:-1] + edges[1:])
-    r_nm = r_centers * 1e9
-
-    center_nm = (float(xc * 1e9), float(yc * 1e9))
-    return r_nm, mz_r, mp_r, counts, center_nm
-
-
-def analyse_snapshot(path: Path, nbins: int) -> SnapshotAnalysis:
-    m = load_slice_field(path)
-    arr, dx, dy, lx, ly = field_array_and_mesh(m)
-
-    Q = skyrmion_number(arr, dx, dy)
-    ic, jc, mz_core = find_core_center(arr, dx, dy)
-    r_nm, mz_r, mp_r, counts, center_nm = radial_profile(
-        arr, dx, dy, lx, ly, nbins=nbins, center_idx=(ic, jc)
+    plt.quiver(
+        X,
+        Y,
+        U_plot,
+        V_plot,
+        color="white",
+        angles="xy",
+        scale_units="xy",
+        scale=0.35,
+        width=0.004,
+        headwidth=3.5,
+        headlength=4.5,
+        headaxislength=3.5,
+        minlength=0.0,
+        pivot="mid",
     )
 
-    return SnapshotAnalysis(
-        path=path,
-        Q=Q,
-        center_nm=center_nm,
-        mz_core=mz_core,
-        r_nm=r_nm,
-        mz_r=mz_r,
-        mperp_r=mp_r,
-        counts=counts,
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def save_angle_with_glyphs(path: Path, m: np.ndarray, title: str, stride: int = 10) -> None:
+    """Plot in-plane angle as HSV hue and overlay light-grey in-plane glyph arrows (mx,my)."""
+    mx = m[..., 0]
+    my = m[..., 1]
+
+    phi = np.arctan2(my, mx)  # [-pi, pi]
+    h = (phi + np.pi) / (2.0 * np.pi)  # [0,1)
+
+    ny, nx = h.shape
+    xs = np.arange(0, nx, stride)
+    ys = np.arange(0, ny, stride)
+    X, Y = np.meshgrid(xs, ys)
+
+    U = mx[ys[:, None], xs[None, :]]
+    V = my[ys[:, None], xs[None, :]]
+
+    cmap = plt.get_cmap("hsv")
+    rgb = cmap(h)[..., :3]
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(rgb, origin="lower")
+
+    # Normalise in-plane vectors for visual clarity
+    mag = np.sqrt(U**2 + V**2)
+    mag[mag == 0.0] = 1.0
+    U_plot = U / mag
+    V_plot = V / mag
+
+    plt.quiver(
+        X,
+        Y,
+        U_plot,
+        V_plot,
+        color="white",
+        angles="xy",
+        scale_units="xy",
+        scale=0.35,
+        width=0.004,
+        headwidth=3.5,
+        headlength=4.5,
+        headaxislength=3.5,
+        minlength=0.0,
+        pivot="mid",
     )
 
-
-def resolve_snapshot_paths(dir_path: Path) -> Dict[str, Path]:
-    """
-    Expects:
-      m000000.ovf (initial)
-      m000001.ovf (relaxed)
-    """
-    p0 = dir_path / "m000000.ovf"
-    p1 = dir_path / "m000001.ovf"
-    if not p0.exists():
-        raise FileNotFoundError(f"Missing {p0}")
-    if not p1.exists():
-        raise FileNotFoundError(f"Missing {p1}")
-    return {"init": p0, "relaxed": p1}
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
 
 
-def plot_profiles(
-    outdir: Path,
+def save_im(
+    path: Path,
+    img: np.ndarray,
     title: str,
-    mumax_init: SnapshotAnalysis,
-    mumax_rel: SnapshotAnalysis,
-    rust_init: SnapshotAnalysis,
-    rust_rel: SnapshotAnalysis,
-):
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # mz(r)
-    fig, ax = plt.subplots()
-    ax.plot(mumax_init.r_nm, mumax_init.mz_r, label="MuMax init")
-    ax.plot(mumax_rel.r_nm, mumax_rel.mz_r, label="MuMax relaxed")
-    ax.plot(rust_init.r_nm, rust_init.mz_r, label="Rust init")
-    ax.plot(rust_rel.r_nm, rust_rel.mz_r, label="Rust relaxed")
-    ax.set_xlabel("r (nm)")
-    ax.set_ylabel("<mz(r)>")
-    ax.set_title(f"{title} — radial mz")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(outdir / "sk1_radial_mz.png", dpi=300)
-    plt.close(fig)
-
-    # m_perp(r)
-    fig, ax = plt.subplots()
-    ax.plot(mumax_init.r_nm, mumax_init.mperp_r, label="MuMax init")
-    ax.plot(mumax_rel.r_nm, mumax_rel.mperp_r, label="MuMax relaxed")
-    ax.plot(rust_init.r_nm, rust_init.mperp_r, label="Rust init")
-    ax.plot(rust_rel.r_nm, rust_rel.mperp_r, label="Rust relaxed")
-    ax.set_xlabel("r (nm)")
-    ax.set_ylabel("<m_perp(r)>")
-    ax.set_title(f"{title} — radial in-plane magnitude")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(outdir / "sk1_radial_mperp.png", dpi=300)
-    plt.close(fig)
+    cmap: str | None = None,
+    vmin=None,
+    vmax=None,
+) -> None:
+    plt.figure(figsize=(6, 6))
+    if img.ndim == 3:
+        plt.imshow(img, origin="upper")
+    else:
+        plt.imshow(img, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax)
+        plt.colorbar(fraction=0.046, pad=0.04)
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
 
 
-def print_summary(tag: str, a: SnapshotAnalysis):
-    cx, cy = a.center_nm
-    print(f"[{tag}] {a.path}")
-    print(f"  Q         = {a.Q:+.6f}")
-    print(f"  center_nm = ({cx:.2f}, {cy:.2f})")
-    print(f"  mz_core   = {a.mz_core:+.4f}")
+def save_hist(path: Path, data: np.ndarray, title: str, bins: int = 200) -> None:
+    x = data[np.isfinite(data)].ravel()
+    plt.figure(figsize=(6, 4))
+    plt.hist(x, bins=bins)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mumax", type=str, required=True, help="MuMax output dir containing m000000.ovf and m000001.ovf")
-    ap.add_argument("--rust", type=str, required=True, help="Rust output dir containing m000000.ovf and m000001.ovf")
-    ap.add_argument("--outdir", type=str, default="plots/sk1_compare", help="Output directory for comparison plots")
-    ap.add_argument("--nbins", type=int, default=120, help="Number of radial bins")
+    ap.add_argument(
+        "--case",
+        required=True,
+        help="sk1 case tag, e.g. sk1a / sk1f (without _rust)",
+    )
+    ap.add_argument(
+        "--root",
+        default="runs/st_problems/sk1",
+        help="root folder containing <case>_rust directories",
+    )
     args = ap.parse_args()
 
-    mumax_dir = Path(args.mumax)
-    rust_dir = Path(args.rust)
-    outdir = Path(args.outdir)
+    case_dir = Path(args.root) / f"{args.case}_rust"
+    if not case_dir.exists():
+        raise FileNotFoundError(f"Missing: {case_dir}")
 
-    mumax_paths = resolve_snapshot_paths(mumax_dir)
-    rust_paths = resolve_snapshot_paths(rust_dir)
+    plots = case_dir / "plots"
+    plots.mkdir(parents=True, exist_ok=True)
 
-    mumax_init = analyse_snapshot(mumax_paths["init"], nbins=args.nbins)
-    mumax_rel = analyse_snapshot(mumax_paths["relaxed"], nbins=args.nbins)
-    rust_init = analyse_snapshot(rust_paths["init"], nbins=args.nbins)
-    rust_rel = analyse_snapshot(rust_paths["relaxed"], nbins=args.nbins)
+    _, m = load_ovf_text(case_dir / "m.ovf")
+    _, b_fft = load_ovf_text(case_dir / "b_fft.ovf")
+    _, b_mg = load_ovf_text(case_dir / "b_mg_env.ovf")
 
-    print("==============================================================")
-    print("SK1 comparison: MuMax vs Rust")
-    print("==============================================================")
-    print_summary("MuMax init", mumax_init)
-    print_summary("MuMax relaxed", mumax_rel)
-    print_summary("Rust init", rust_init)
-    print_summary("Rust relaxed", rust_rel)
-    print("--------------------------------------------------------------")
-    print(f"ΔQ (relaxed) = {rust_rel.Q - mumax_rel.Q:+.6f}   (Rust - MuMax)")
-    print("==============================================================")
+    diff_path = case_dir / "b_diff_env.ovf"
+    if diff_path.exists():
+        _, b_diff = load_ovf_text(diff_path)
+    else:
+        b_diff = b_mg - b_fft
 
-    plot_profiles(
-        outdir=outdir,
-        title="SK1",
-        mumax_init=mumax_init,
-        mumax_rel=mumax_rel,
-        rust_init=rust_init,
-        rust_rel=rust_rel,
-    )
+    db_mag = np.linalg.norm(b_diff, axis=-1)
 
-    print(f"Saved plots to: {outdir}")
+    # Magnetisation visuals
+    save_mz_with_glyphs(plots / "m_mz.png", m, f"{args.case}: m_z with in-plane glyphs")
+    save_angle_with_glyphs(plots / "m_angle.png", m, f"{args.case}: in-plane angle with glyphs")
+
+    # Field component maps (FFT vs MG)
+    for comp, name in [(0, "Bx"), (1, "By"), (2, "Bz")]:
+        vmin = np.nanmin(np.concatenate([b_fft[..., comp].ravel(), b_mg[..., comp].ravel()]))
+        vmax = np.nanmax(np.concatenate([b_fft[..., comp].ravel(), b_mg[..., comp].ravel()]))
+
+        save_im(
+            plots / f"fft_{name}.png",
+            b_fft[..., comp],
+            f"{args.case}: FFT {name}",
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        save_im(
+            plots / f"mg_{name}.png",
+            b_mg[..., comp],
+            f"{args.case}: MG {name}",
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        save_im(
+            plots / f"diff_{name}.png",
+            b_diff[..., comp],
+            f"{args.case}: (MG-FFT) {name}",
+            cmap="coolwarm",
+        )
+
+    # Difference magnitude + histograms
+    save_im(plots / "diff_B_mag.png", db_mag, f"{args.case}: |ΔB| (MG-FFT)", cmap="magma")
+    save_hist(plots / "hist_diff_B_mag.png", db_mag, f"{args.case}: histogram |ΔB|")
+
+    # Midline lineouts (j = ny//2)
+    j = db_mag.shape[0] // 2
+    x = np.arange(db_mag.shape[1])
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, b_fft[j, :, 2], label="FFT Bz")
+    plt.plot(x, b_mg[j, :, 2], label="MG Bz")
+    plt.plot(x, b_diff[j, :, 2], label="ΔBz (MG-FFT)")
+    plt.title(f"{args.case}: midline (y=ny//2) Bz comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plots / "lineout_mid_Bz.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, db_mag[j, :], label="|ΔB|")
+    plt.title(f"{args.case}: midline |ΔB|")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plots / "lineout_mid_diff_B_mag.png", dpi=200)
+    plt.close()
+
+    print(f"[compare_sk1] wrote plots to {plots}")
 
 
 if __name__ == "__main__":

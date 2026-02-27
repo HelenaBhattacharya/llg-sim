@@ -20,7 +20,10 @@
 
 use std::collections::VecDeque;
 
-use crate::amr::indicator::indicator_grad2_forward_geom;
+use crate::amr::indicator::{
+    indicator_grad2_forward_geom,
+    indicator_angle_max_forward_geom,
+};
 use crate::amr::rect::Rect2i;
 use crate::geometry_mask::assert_mask_len;
 use crate::vector_field::VectorField2D;
@@ -33,7 +36,14 @@ pub enum Connectivity {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterPolicy {
-    /// Threshold fraction: flag cells where indicator >= frac * max(indicator).
+    /// Refinement threshold control.
+    ///
+    /// If `indicator_frac >= 0.0`, uses grad^2 with a relative threshold:
+    ///   flag where ind >= indicator_frac * max(ind).
+    ///
+    /// If `indicator_frac < 0.0`, switches to an absolute *angle* threshold (radians):
+    ///   theta_refine = -indicator_frac,
+    ///   flag where max_neighbour_angle(i,j) >= theta_refine.
     pub indicator_frac: f64,
     /// Expand each cluster bbox by this many coarse cells.
     pub buffer_cells: usize,
@@ -158,32 +168,77 @@ pub fn compute_patch_rects_clustered_from_indicator(
         assert_mask_len(msk, &coarse.grid);
     }
 
-    // 1) max indicator
+    // 1) max indicator / threshold
+    //
+    // Two modes:
+    // - indicator_frac >= 0: grad^2 with relative threshold (frac * max)
+    // - indicator_frac < 0 : absolute angle threshold (radians)
     let mut max_ind = 0.0_f64;
-    for j in 0..ny {
-        for i in 0..nx {
-            let ind = indicator_grad2_forward_geom(coarse, i, j, geom_mask);
-            if ind > max_ind {
-                max_ind = ind;
+    let thresh: f64;
+
+    if policy.indicator_frac < 0.0 {
+        // Angle mode
+        for j in 0..ny {
+            for i in 0..nx {
+                let th = indicator_angle_max_forward_geom(coarse, i, j, geom_mask);
+                if th > max_ind {
+                    max_ind = th;
+                }
             }
         }
-    }
-    if max_ind <= 0.0 {
-        return None;
-    }
 
-    let frac = policy.indicator_frac.max(0.0).min(1.0);
-    let thresh = frac * max_ind;
+        thresh = (-policy.indicator_frac).max(0.0);
+
+        // If the requested threshold is above the max angle, nothing will be flagged.
+        if thresh > max_ind {
+            return None;
+        }
+
+        // Guard: a zero threshold would flag (nearly) everything and produce parent-sized patches.
+        // We treat this as "no refinement needed".
+        if thresh == 0.0 {
+            return None;
+        }
+    } else {
+        // grad^2 mode
+        for j in 0..ny {
+            for i in 0..nx {
+                let ind = indicator_grad2_forward_geom(coarse, i, j, geom_mask);
+                if ind > max_ind {
+                    max_ind = ind;
+                }
+            }
+        }
+        if max_ind <= 0.0 {
+            return None;
+        }
+        let frac = policy.indicator_frac.max(0.0).min(1.0);
+        thresh = frac * max_ind;
+    }
 
     // 2) flagged mask
     let mut flagged = vec![false; nx * ny];
     let mut flagged_cells = 0usize;
-    for j in 0..ny {
-        for i in 0..nx {
-            let ind = indicator_grad2_forward_geom(coarse, i, j, geom_mask);
-            if ind >= thresh {
-                flagged[idx(i, j, nx)] = true;
-                flagged_cells += 1;
+    if policy.indicator_frac < 0.0 {
+        // Angle mode
+        for j in 0..ny {
+            for i in 0..nx {
+                let th = indicator_angle_max_forward_geom(coarse, i, j, geom_mask);
+                if th >= thresh {
+                    flagged[idx(i, j, nx)] = true;
+                    flagged_cells += 1;
+                }
+            }
+        }
+    } else {
+        // grad^2 mode
+        for j in 0..ny {
+            for i in 0..nx {
+                let ind = indicator_grad2_forward_geom(coarse, i, j, geom_mask);
+                if ind >= thresh {
+                    flagged[idx(i, j, nx)] = true;
+                    flagged_cells += 1;
+                }
             }
         }
     }

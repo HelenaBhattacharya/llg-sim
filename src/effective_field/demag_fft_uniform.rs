@@ -31,6 +31,7 @@ use crate::vector_field::VectorField2D;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -40,9 +41,70 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-static DEMAG_CACHE: OnceLock<Mutex<Option<Demag2D>>> = OnceLock::new();
+/// In-process demag operator cache.
+///
+/// IMPORTANT: we cache *multiple* Demag2D instances keyed by (grid, pbc_x, pbc_y).
+/// The previous single-entry cache caused pathological rebuild thrash when callers
+/// alternated between two grids (e.g. uniform coarse + uniform fine in AMR benchmarks).
+///
+/// Each cached Demag2D is wrapped in its own Mutex because Demag2D contains scratch
+/// buffers and FFT plans reused across calls.
+static DEMAG_CACHE: OnceLock<Mutex<HashMap<DemagKey, Arc<Mutex<Demag2D>>>>> = OnceLock::new();
+
 fn demag_timing_enabled() -> bool {
     std::env::var("LLG_DEMAG_TIMING").is_ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DemagKey {
+    nx: usize,
+    ny: usize,
+    dx_bits: u64,
+    dy_bits: u64,
+    dz_bits: u64,
+    pbc_x: usize,
+    pbc_y: usize,
+}
+
+impl DemagKey {
+    #[inline]
+    fn new(grid: &Grid2D, pbc_x: usize, pbc_y: usize) -> Self {
+        Self {
+            nx: grid.nx,
+            ny: grid.ny,
+            dx_bits: grid.dx.to_bits(),
+            dy_bits: grid.dy.to_bits(),
+            dz_bits: grid.dz.to_bits(),
+            pbc_x,
+            pbc_y,
+        }
+    }
+}
+
+/// Get a cached Demag2D operator for this (grid, pbc) combination.
+/// Builds the operator once per key and reuses it in-process thereafter.
+fn get_demag_operator(grid: &Grid2D, pbc_x: usize, pbc_y: usize) -> Arc<Mutex<Demag2D>> {
+    let cache = DEMAG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = DemagKey::new(grid, pbc_x, pbc_y);
+
+    // Fast path: present.
+    {
+        let map = cache.lock().expect("DEMAG_CACHE mutex poisoned");
+        if let Some(op) = map.get(&key) {
+            return Arc::clone(op);
+        }
+    }
+
+    // Build outside the global map lock (kernel generation / FFT planning can be expensive).
+    let built = Arc::new(Mutex::new(Demag2D::new(*grid, pbc_x, pbc_y)));
+
+    // Insert with a second lock (double-check in case another thread inserted).
+    let mut map = cache.lock().expect("DEMAG_CACHE mutex poisoned");
+    if let Some(op) = map.get(&key) {
+        return Arc::clone(op);
+    }
+    map.insert(key, Arc::clone(&built));
+    built
 }
 
 // For small grids, the transpose+parallel-column FFT can be slower than the simple
@@ -104,21 +166,10 @@ pub fn add_demag_field_pbc(
         return;
     }
 
-    let cache = DEMAG_CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().expect("DEMAG_CACHE mutex poisoned");
-
-    let rebuild = match guard.as_ref() {
-        Some(d) => !same_grid_pbc(&d.grid, grid, d.pbc_x, d.pbc_y, pbc_x, pbc_y),
-        None => true,
-    };
-
-    if rebuild {
-        *guard = Some(Demag2D::new(*grid, pbc_x, pbc_y));
-    }
-
-    if let Some(d) = guard.as_mut() {
-        d.add_field(m, b_eff, mat.ms);
-    }
+    // Multi-entry cache: avoid rebuild-thrash when callers alternate between grids.
+    let op = get_demag_operator(grid, pbc_x, pbc_y);
+    let mut d = op.lock().expect("Demag2D mutex poisoned");
+    d.add_field(m, b_eff, mat.ms);
 }
 
 /// Compute demag induction B_demag (Tesla) into `out` (overwrites out), with PBC in x/y.
@@ -138,6 +189,7 @@ fn same_grid(a: &Grid2D, b: &Grid2D) -> bool {
     a.nx == b.nx && a.ny == b.ny && a.dx == b.dx && a.dy == b.dy && a.dz == b.dz
 }
 
+#[allow(dead_code)]
 fn same_grid_pbc(a: &Grid2D, b: &Grid2D, ax: usize, ay: usize, bx: usize, by: usize) -> bool {
     same_grid(a, b) && ax == bx && ay == by
 }
@@ -381,7 +433,9 @@ const DEMAG_ACCURACY: f64 = 10.0;
 
 struct Demag2D {
     grid: Grid2D,
+    #[allow(dead_code)]
     pbc_x: usize,
+    #[allow(dead_code)]
     pbc_y: usize,
 
     px: usize,
@@ -538,7 +592,10 @@ impl Demag2D {
                 println!("[demag] cached kernel to {:?}", cache_path);
             }
         } else {
-            println!("[demag] cache hit -> loaded kernel from {:?}", cache_path);
+            // Cache hits can occur frequently; only print if explicitly requested.
+            if std::env::var("LLG_DEMAG_CACHE_VERBOSE").is_ok() {
+                println!("[demag] cache hit -> loaded kernel from {:?}", cache_path);
+            }
         }
         if do_timing {
             println!(

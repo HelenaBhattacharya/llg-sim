@@ -378,7 +378,7 @@ class FrameInfo:
 # -----------------------------------------------------------------------------
 
 
-def _select_sp4_series(series: List[ovf_utils.OvfSeries], case: Optional[str]) -> ovf_utils.OvfSeries:
+def _select_sp4_series(series: List[Any], case: Optional[str]) -> Any:
     if not series:
         raise ValueError("No SP4 series found")
 
@@ -396,11 +396,11 @@ def _select_sp4_series(series: List[ovf_utils.OvfSeries], case: Optional[str]) -
 
 
 def _select_sp2_series(
-    series: List[ovf_utils.OvfSeries],
+    series: List[Any],
     d_lex: Optional[int],
     stage: str,
     tag: Optional[str],
-) -> ovf_utils.OvfSeries:
+) -> Any:
     if not series:
         raise ValueError("No SP2 series found")
 
@@ -425,9 +425,12 @@ def _select_sp2_series(
     return s
 
 
-def _build_frame_list(series: ovf_utils.OvfSeries) -> List[FrameInfo]:
+def _build_frame_list(series: Any) -> List[FrameInfo]:
     out: List[FrameInfo] = []
     for p in series.frames:
+        if series.problem not in {"sp2", "sp4"}:
+            out.append(FrameInfo(path=p, label=p.name))
+            continue
         if series.problem == "sp4":
             t_s = ovf_utils.try_parse_time_seconds_from_ovf(p)
             label = f"t={t_s * 1e9:.3f} ns" if t_s is not None else p.name
@@ -499,7 +502,7 @@ def _downsample_paired_frames_by_ns(
 
 
 def _align_for_compare(
-    series_a: ovf_utils.OvfSeries, series_b: ovf_utils.OvfSeries
+    series_a: Any, series_b: Any
 ) -> Tuple[List[FrameInfo], List[FrameInfo]]:
     fa = _build_frame_list(series_a)
     fb = _build_frame_list(series_b)
@@ -529,9 +532,9 @@ class MagViewer:
     def __init__(
         self,
         frames_a: List[FrameInfo],
-        series_a: ovf_utils.OvfSeries,
+        series_a: Any,
         frames_b: Optional[List[FrameInfo]] = None,
-        series_b: Optional[ovf_utils.OvfSeries] = None,
+        series_b: Optional[Any] = None,
         component: str = "mx",
         glyphs_on: bool = True,
         glyph_stride: int = 0,
@@ -823,11 +826,13 @@ class MagViewer:
 
         if self.series_a.problem == "sp4":
             head = f"SP4 {self.series_a.kind} ({self.series_a.source})"
-        else:
+        elif self.series_a.problem == "sp2":
             if self.series_a.kind.startswith("sweep"):
                 head = f"SP2 sweep {self.series_a.stage} ({self.series_a.source})"
             else:
                 head = f"SP2 d={self.series_a.d_lex} {self.series_a.stage} ({self.series_a.source})"
+        else:
+            head = f"CUSTOM ({self.series_a.source})"
 
         if not self.compare:
             view = "A"
@@ -1309,8 +1314,12 @@ def main() -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--qt", action="store_true", help="Use pyvistaqt BackgroundPlotter (if installed).")
-    p.add_argument("--input", required=True, help="Input root (runs/... or mumax_outputs/...).")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--input", help="Input root (runs/... or mumax_outputs/...).")
+    g.add_argument("--ovf-a", help="Path to a single OVF file to view (custom mode).")
+
     p.add_argument("--input-b", default=None, help="Optional second input root for compare mode.")
+    p.add_argument("--ovf-b", default=None, help="Optional second OVF file to compare against --ovf-a (custom mode).")
 
     p.add_argument(
         "--problem",
@@ -1353,6 +1362,114 @@ def main() -> int:
 
     args = p.parse_args()
 
+    # ------------------------------------------------------------------
+    # Custom OVF mode: bypass SP2/SP4 discovery and view explicit files.
+    # ------------------------------------------------------------------
+    if args.ovf_a:
+        from types import SimpleNamespace
+        from typing import List
+
+        ovf_a = Path(args.ovf_a)
+        if not ovf_a.exists():
+            raise SystemExit(f"OVF-A does not exist: {ovf_a}")
+
+        # If ovf_a is a directory (e.g. runs/st_problems/sk1/sk1f_rust), build a small playlist.
+        if ovf_a.is_dir():
+            # Prefer a stable, sk1-friendly ordering.
+            preferred = [
+                "m.ovf",
+                "b_fft.ovf",
+                "b_mg_env.ovf",
+                "b_diff_env.ovf",
+                "dist_to_boundary.ovf",
+            ]
+            frames: List[Path] = []
+            for name in preferred:
+                pth = ovf_a / name
+                if pth.exists() and pth.is_file():
+                    frames.append(pth)
+
+            # Add rhs slices (if present), sorted by k.
+            rhs = sorted(ovf_a.glob("rhs_k*.ovf"))
+            frames.extend([p for p in rhs if p.is_file()])
+
+            # Fallback: if none of the preferred files exist, include all .ovf in the directory.
+            if not frames:
+                frames = sorted([p for p in ovf_a.glob("*.ovf") if p.is_file()])
+
+            if not frames:
+                raise SystemExit(f"No .ovf files found in directory: {ovf_a}")
+
+            series_id = f"custom:{ovf_a.name}"
+        else:
+            frames = [ovf_a]
+            series_id = f"custom:{ovf_a.name}"
+
+        series_a = SimpleNamespace(
+            problem="custom",
+            source="custom",
+            kind="custom",
+            stage=None,
+            d_lex=None,
+            tag=None,
+            frames=frames,
+            meta={},
+            series_id=series_id,
+        )
+        frames_a = _build_frame_list(series_a)
+        if not frames_a:
+            raise SystemExit("No frames for OVF-A")
+
+        frames_b = None
+        series_b = None
+        if args.ovf_b:
+            ovf_b = Path(args.ovf_b)
+            if not ovf_b.exists():
+                raise SystemExit(f"OVF-B does not exist: {ovf_b}")
+            if ovf_b.is_dir():
+                raise SystemExit("--ovf-b must be a single OVF file (not a directory) in custom compare mode")
+
+            series_b = SimpleNamespace(
+                problem="custom",
+                source="custom",
+                kind="custom",
+                stage=None,
+                d_lex=None,
+                tag=None,
+                frames=[ovf_b],
+                meta={},
+                series_id=f"custom:{ovf_b.name}",
+            )
+            frames_b = _build_frame_list(series_b)
+
+        print("=" * 80)
+        print("Mag Viewer")
+        print("=" * 80)
+        print("Problem:   custom")
+        print(f"Series A:  {series_a.series_id}  ({len(frames_a)} frames)")
+        if series_b is not None and frames_b is not None:
+            print(f"Series B:  {series_b.series_id}  ({len(frames_b)} frames)")
+            print("Mode:      compare (press 'v' to cycle A/B/Δfixed/Δauto)")
+        else:
+            print("Mode:      single")
+        print(f"Units:     {args.units}")
+        print("=" * 80)
+
+        viewer = MagViewer(
+            frames_a=frames_a,
+            series_a=series_a,
+            frames_b=frames_b,
+            series_b=series_b,
+            component=args.component,
+            glyphs_on=(not args.no_glyphs),
+            glyph_stride=args.glyph_stride,
+            glyph_scale=args.glyph_scale,
+            units=args.units,
+            use_qt=args.qt,
+        )
+        viewer.run()
+        return 0
+
     input_a = Path(args.input)
     if not input_a.exists():
         raise SystemExit(f"Input path does not exist: {input_a}")
@@ -1381,7 +1498,7 @@ def main() -> int:
 
     # Optional compare mode
     frames_b: Optional[List[FrameInfo]] = None
-    series_b: Optional[ovf_utils.OvfSeries] = None
+    series_b: Optional[Any] = None
     if args.input_b:
         input_b = Path(args.input_b)
         if not input_b.exists():

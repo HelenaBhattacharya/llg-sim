@@ -13,26 +13,50 @@
 // - This is structurally AMR-friendly (local stencils), unlike global FFTs.
 // - Accurate open boundaries are *the* hard part. A padded Dirichlet box is a cheap
 //   approximation that can require a lot of vacuum, especially in z for thin films.
-// - **Hybrid mode (optional):** uses MG for the long-range field and a small local
-//   correction stencil ΔK = K_fft - K_mg (Newell/prism near-field) to fix the high-k
-//   / near-field operator mismatch. This is the classic particle-mesh / PPPM idea.
+//
+// - **Hybrid mode (optional, PPPM/Ewald-like):**
+//   MG computes only the *smooth/long-range* part on a *screened RHS*, and we add a local,
+//   truncatable correction stencil:
+//
+//       rhs_long = Gσ * rhs
+//       MG:  ∇² φ_long = rhs_long
+//       B_long = -μ0 ∇φ_long
+//
+//       ΔK = K_fft(full) - K_mg_long(rhs screened with same Gσ)
+//
+//   This is the essential PPPM contract: MG is *defined* to be long-range, so ΔK is truly
+//   short-range and safe to truncate.
 //
 // Hybrid controls (OFF by default):
-//   LLG_DEMAG_MG_HYBRID_ENABLE=1|0            (default 0; must be 1 to use ΔK)
+//   LLG_DEMAG_MG_HYBRID_ENABLE=1|0            (default 0)
 //   LLG_DEMAG_MG_HYBRID_RADIUS=<cells>        (default 0; >0 enables ΔK *only if* ENABLE=1)
 //   LLG_DEMAG_MG_HYBRID_DELTA_VCYCLES=<n>     (default 60; one-time build cost)
+//   LLG_DEMAG_MG_HYBRID_SIGMA=<cells>         (default 1.5; Gaussian screening width for RHS before MG solve)
+//                                            (σ<=0 disables screening and reverts to old “unscreened ΔK”)
 //   LLG_DEMAG_MG_HYBRID_CACHE=1|0             (default 1; caches ΔK in out/demag_cache)
+// Diagnostics (optional):
+//   LLG_DEMAG_MG_HYBRID_DIAG=1                (prints ΔK sum-rule / tail diagnostics when (re)building ΔK)
+//   LLG_DEMAG_MG_HYBRID_DIAG_INVAR=1          (expensive location-invariance check during ΔK build; debug only)
+//
+// - **A3/A4 operator controls (finest-grid Laplacian + MG transfer/coarse operators):**
+//   LLG_DEMAG_MG_STENCIL   = "7" | "iso9" | "iso27"     (default: "iso27")
+//   LLG_DEMAG_MG_PROLONG   = "inject" | "trilinear"     (default: "trilinear")
+//   LLG_DEMAG_MG_COARSE_OP = "rediscretize" | "galerkin" (default: "galerkin")
+//   LLG_DEMAG_MG_ISO27_FLUX_ALPHA=<alpha>  (optional, >0; overrides iso27 diagonal weight parameter)
+//
 // - This implementation supports three outer BCs:
-//     * DirichletZero     : phi = 0 on the padded box boundary (cheap, needs lots of vacuum)
-//     * DirichletDipole   : boundary phi set by a monopole+dipole far-field approximation
-//                           computed from the RHS moments (helps reduce required vacuum)
-//     * DirichletTreecode : boundary phi set by an FMM-like Barnes–Hut treecode evaluation
-//                           of the free-space Green's function (best accuracy with small padding)
+//     * DirichletZero     : phi = 0 on the padded box boundary
+//     * DirichletDipole   : boundary phi set by monopole+dipole far-field approximation
+//     * DirichletTreecode : boundary phi set by Barnes–Hut treecode evaluation (best accuracy for small padding)
 //
 // Caveat:
-// - This discretisation is a standard 7-point Laplacian with cell-centered phi.
-//   It will not exactly reproduce MuMax's prism-integrated kernel on coarse grids,
-//   but it should converge with refinement and is AMR-friendly structurally.
+// - The multigrid solve uses the chosen Laplacian stencil to get phi. The field extraction
+//   uses a robust face-gradient (average of one-sided differences) on the finest level.
+//   For iso9/iso27, the Laplacian is not exactly div(grad) of that gradient, but the approach
+//   remains consistent in the continuum limit and works well in practice.
+//
+// - Operator mismatch at near-field/high-k is handled by (i) optional iso27/iso9 stencils,
+//   and (ii) the PPPM/Ewald-style ΔK correction (screened long-range MG + local complement).
 
 use crate::grid::Grid2D;
 use crate::params::{MU0, Material};
@@ -58,27 +82,20 @@ pub enum BoundaryCondition {
 
     /// Dirichlet boundary values set from a monopole+dipole approximation of the free-space
     /// solution of ∇²phi = rhs (rhs = ∇·M).
-    ///
-    /// This reduces explicit vacuum padding, but is still only an approximation (higher
-    /// multipoles are neglected).
     DirichletDipole,
 
     /// Dirichlet boundary values set by a Barnes–Hut treecode evaluation of the free-space
     /// Green's function integral:
     ///
     ///   phi(r) = -(1/4π) ∫ rhs(r') / |r - r'| dV'
-    ///
-    /// This is "FMM-like": it hierarchically groups sources and evaluates the potential at
-    /// the outer boundary in ~O(N log N). With this BC, we can aggressively reduce explicit
-    /// vacuum padding while retaining good far-field accuracy.
     DirichletTreecode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MGSmoother {
-    /// Weighted Jacobi (parallel-friendly, but weaker than Gauss–Seidel).
+    /// Weighted Jacobi (parallel-friendly, supports general stencils).
     WeightedJacobi,
-    /// Red-black Gauss–Seidel with optional SOR over-relaxation (stronger smoother).
+    /// Red-black Gauss–Seidel with optional SOR (only valid for classic 7pt stencil path).
     RedBlackSOR,
 }
 
@@ -95,12 +112,6 @@ impl MGSmoother {
 #[derive(Debug, Clone, Copy)]
 pub struct DemagPoissonMGConfig {
     /// Minimum vacuum padding in x/y in *cells* on each side of the magnet region.
-    ///
-    /// The actual padded size is:
-    ///   px = nx + 2*pad_xy (+1 if needed to make px even for coarsening)
-    ///   py = ny + 2*pad_xy (+1 if needed to make py even for coarsening)
-    ///
-    /// This replaces the old "pad_factor_xy" approach which scaled padding with grid size.
     pub pad_xy: usize,
 
     /// Vacuum layers below and above the magnet layer (in units of dz cells).
@@ -113,13 +124,9 @@ pub struct DemagPoissonMGConfig {
     pub v_cycles_max: usize,
 
     /// Stop when max-norm residual <= tol_abs (units: A/m^2).
-    /// If None, run fixed v_cycles.
     pub tol_abs: Option<f64>,
 
-    /// Stop when max-norm residual <= tol_rel * max-norm(rhs) (dimensionless).
-    ///
-    /// This keeps the *relative* solve error roughly uniform as the RHS magnitude varies in time.
-    /// If None, no relative-tolerance stopping is used.
+    /// Stop when max-norm residual <= tol_rel * max-norm(rhs).
     pub tol_rel: Option<f64>,
 
     /// Pre-smoothing iterations.
@@ -133,7 +140,7 @@ pub struct DemagPoissonMGConfig {
     /// Weighted Jacobi relaxation parameter (0 < omega <= 1).
     pub omega: f64,
 
-    /// Red-black SOR relaxation factor (0 < sor_omega < 2). Use 1.0 for plain RBGS.
+    /// Red-black SOR relaxation factor (0 < sor_omega < 2).
     pub sor_omega: f64,
 
     /// Use previous phi as initial guess (warm start).
@@ -142,7 +149,7 @@ pub struct DemagPoissonMGConfig {
     /// Outer boundary condition on the padded box.
     pub bc: BoundaryCondition,
 
-    /// Treecode opening angle θ (smaller -> more accurate, slower). Typical 0.4..0.8.
+    /// Treecode opening angle θ (smaller -> more accurate, slower).
     pub tree_theta: f64,
 
     /// Treecode leaf size (direct evaluation threshold).
@@ -155,17 +162,15 @@ pub struct DemagPoissonMGConfig {
 impl Default for DemagPoissonMGConfig {
     fn default() -> Self {
         Self {
-            // Robust by default: moderate padding avoids near-boundary artefacts; override via env for speed.
             pad_xy: 6,
             n_vac_z: 16,
-            // Converged-by-default on typical thin-film tests; override via env for speed/accuracy tradeoffs.
-            v_cycles: 8,
+            v_cycles: 16,
             v_cycles_max: 80,
             tol_abs: None,
             tol_rel: None,
             pre_smooth: 2,
             post_smooth: 2,
-            smoother: MGSmoother::RedBlackSOR,
+            smoother: MGSmoother::WeightedJacobi,
             omega: 2.0 / 3.0,
             sor_omega: 1.0,
             warm_start: true,
@@ -178,13 +183,14 @@ impl Default for DemagPoissonMGConfig {
 }
 
 impl DemagPoissonMGConfig {
-    /// Optional: configure via env vars so you can experiment without plumbing through Material yet.
     pub fn from_env() -> Self {
         fn get_usize(name: &str) -> Option<usize> {
             std::env::var(name)
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
         }
+
+        #[inline]
         fn get_f64(name: &str) -> Option<f64> {
             std::env::var(name)
                 .ok()
@@ -193,13 +199,12 @@ impl DemagPoissonMGConfig {
 
         let mut cfg = Self::default();
 
-        // Padding: prefer PAD_XY; accept legacy PAD_FACTOR_XY as an alias for PAD_XY.
+        // Padding: prefer PAD_XY; accept legacy PAD_FACTOR_XY as alias.
         if let Some(v) =
             get_usize("LLG_DEMAG_MG_PAD_XY").or_else(|| get_usize("LLG_DEMAG_MG_PAD_FACTOR_XY"))
         {
             cfg.pad_xy = v.max(1);
         }
-
         if let Some(v) = get_usize("LLG_DEMAG_MG_NVAC_Z") {
             cfg.n_vac_z = v.max(1);
         }
@@ -213,7 +218,6 @@ impl DemagPoissonMGConfig {
             cfg.tol_abs = Some(v.max(0.0));
         }
         if let Some(v) = get_f64("LLG_DEMAG_MG_TOL_REL") {
-            // Clamp to a sensible range; tol_rel > 1.0 is effectively "no-op".
             cfg.tol_rel = Some(v.max(0.0).min(1.0));
         }
         if let Some(v) = get_usize("LLG_DEMAG_MG_PRE_SMOOTH") {
@@ -226,7 +230,6 @@ impl DemagPoissonMGConfig {
             cfg.omega = v.clamp(0.05, 1.0);
         }
         if let Some(v) = get_f64("LLG_DEMAG_MG_SOR_OMEGA") {
-            // Clamp to a conservative stable range.
             cfg.sor_omega = v.clamp(0.2, 1.95);
         }
         if let Ok(v) = std::env::var("LLG_DEMAG_MG_SMOOTHER") {
@@ -268,34 +271,20 @@ impl DemagPoissonMGConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HybridConfig {
-    /// Local correction stencil radius in cells (XY).
-    ///
-    /// 0 disables the hybrid correction and uses pure MG.
-    ///
-    /// NOTE: Even if this is set via env var, the hybrid correction is still disabled
-    /// unless `LLG_DEMAG_MG_HYBRID_ENABLE` is truthy.
-    /// Typical useful values: 2..10.
+    enabled: bool,
     radius_xy: usize,
-
-    /// When building the local correction stencil (ΔK = K_fft - K_mg),
-    /// run this many MG V-cycles per impulse solve to make the stencil
-    /// stable and not dependent on the runtime MG iteration count.
     delta_v_cycles: usize,
-
-    /// Cache the computed local correction stencil to disk (out/demag_cache).
+    sigma_cells: f64,
     cache_to_disk: bool,
 }
 
 impl Default for HybridConfig {
     fn default() -> Self {
         Self {
-            // Default to *pure* MG. If/when the local correction (ΔK) is wanted for
-            // specific problems, enable explicitly via:
-            //   LLG_DEMAG_MG_HYBRID_ENABLE=1
-            //   LLG_DEMAG_MG_HYBRID_RADIUS=<cells>
-            radius_xy: 0,
-            // A moderately-large, one-time build cost that pays off by making ΔK stable.
+            enabled: false,
+            radius_xy: 12,
             delta_v_cycles: 60,
+            sigma_cells: 1.5,
             cache_to_disk: true,
         }
     }
@@ -313,27 +302,20 @@ impl HybridConfig {
         fn get_bool(name: &str) -> bool {
             std::env::var(name)
                 .ok()
-                .map(|s| {
-                    matches!(
-                        s.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
+                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false)
+        }
+
+        fn get_f64(name: &str) -> Option<f64> {
+            std::env::var(name).ok().and_then(|s| s.trim().parse::<f64>().ok())
         }
 
         let mut cfg = Self::default();
 
-        // IMPORTANT: Hybrid ΔK is *double-gated* so it can never turn on accidentally.
-        //
-        // - By default: ENABLE=0 and radius_xy=0 -> pure MG.
-        // - Even if an old shell has LLG_DEMAG_MG_HYBRID_RADIUS lingering, ΔK is still
-        //   disabled unless LLG_DEMAG_MG_HYBRID_ENABLE is truthy.
-        if !get_bool("LLG_DEMAG_MG_HYBRID_ENABLE") {
-            // Helpful one-time hint if the user has a leftover radius var set.
-            //
-            // This makes it obvious (from stderr) that ΔK is *not* being used even if the
-            // shell environment still contains e.g. `LLG_DEMAG_MG_HYBRID_RADIUS=6`.
+        cfg.enabled = get_bool("LLG_DEMAG_MG_HYBRID_ENABLE");
+
+        // Hybrid is OFF unless explicitly enabled.
+        if !cfg.enabled {
             if let Some(v) = get_usize("LLG_DEMAG_MG_HYBRID_RADIUS") {
                 if v > 0 {
                     static WARN_ONCE: OnceLock<()> = OnceLock::new();
@@ -354,6 +336,9 @@ impl HybridConfig {
         if let Some(v) = get_usize("LLG_DEMAG_MG_HYBRID_DELTA_VCYCLES") {
             cfg.delta_v_cycles = v.max(1);
         }
+        if let Some(s) = get_f64("LLG_DEMAG_MG_HYBRID_SIGMA") {
+            cfg.sigma_cells = s.max(0.0).min(32.0);
+        }
         if let Ok(v) = std::env::var("LLG_DEMAG_MG_HYBRID_CACHE") {
             cfg.cache_to_disk = matches!(v.as_str(), "1" | "true" | "yes" | "on");
         }
@@ -362,7 +347,7 @@ impl HybridConfig {
 
     #[inline]
     fn enabled(&self) -> bool {
-        self.radius_xy > 0
+        self.enabled && self.radius_xy > 0
     }
 }
 
@@ -373,7 +358,6 @@ fn idx3(i: usize, j: usize, k: usize, nx: usize, ny: usize) -> usize {
 
 #[inline]
 fn stamp_dirichlet_bc(arr: &mut [f64], bc_phi: &[f64], nx: usize, ny: usize, nz: usize) {
-    // Copy stored Dirichlet boundary values into `arr`.
     for k in 0..nz {
         for j in 0..ny {
             let id0 = idx3(0, j, k, nx, ny);
@@ -400,16 +384,9 @@ fn stamp_dirichlet_bc(arr: &mut [f64], bc_phi: &[f64], nx: usize, ny: usize, nz:
 }
 
 // ---------------------------
-// Local correction kernel ΔK(r) = K_fft(r) - K_mg(r), truncated to a square stencil.
+// Local correction kernel ΔK(r) = K_fft(r) - K_mg_long(screened)(r)
 // ---------------------------
 
-/// Stored in real space, per unit magnetisation amplitude (Tesla per A/m).
-///
-/// The field correction is:
-///   B_corr_x = Σ [ΔKxx(r)*Mx(src) + ΔKxy(r)*My(src)]
-///   B_corr_y = Σ [ΔKxy(r)*Mx(src) + ΔKyy(r)*My(src)]
-///   B_corr_z = Σ [ΔKzz(r)*Mz(src)]
-/// with r = (target - src).
 #[derive(Debug, Clone)]
 struct DeltaKernel2D {
     radius: usize,
@@ -470,7 +447,6 @@ impl DeltaKernel2D {
                     let mut by = 0.0f64;
                     let mut bz = 0.0f64;
 
-                    // Loop over displacement r = (target - src).
                     for dy in -r..=r {
                         let sj = j_is - dy;
                         if sj < 0 || sj >= ny as isize {
@@ -499,7 +475,6 @@ impl DeltaKernel2D {
             });
     }
 
-    /// Reduce impulse-noise by enforcing basic symmetry of the measured stencil.
     fn symmetrize(&mut self, cell_dx: f64, cell_dy: f64) {
         let r = self.radius as isize;
         for dy in -r..=r {
@@ -514,7 +489,6 @@ impl DeltaKernel2D {
             }
         }
 
-        // Optional x<->y swap symmetry when cells are effectively square.
         if (cell_dx - cell_dy).abs() <= 1e-12 * cell_dx.abs().max(cell_dy.abs()).max(1.0) {
             for dy in -r..=r {
                 for dx in -r..=r {
@@ -535,7 +509,7 @@ impl DeltaKernel2D {
 }
 
 // ---------------------------
-// Barnes–Hut treecode (FMM-like) for open-boundary Dirichlet values
+// Barnes–Hut treecode for open-boundary Dirichlet values
 // ---------------------------
 
 #[derive(Clone, Copy)]
@@ -551,7 +525,6 @@ struct BhNode {
     q: f64,
     p: [f64; 3],
     children: [Option<usize>; 8],
-    // Only populated for leaf nodes (<= leaf_size). Internal nodes keep this empty.
     indices: Vec<usize>,
 }
 
@@ -668,7 +641,6 @@ impl BarnesHutTree {
             self.nodes[node_idx].indices.push(charge_idx);
 
             if self.nodes[node_idx].indices.len() > self.leaf_size {
-                // Split the leaf: redistribute all indices into children.
                 let indices = std::mem::take(&mut self.nodes[node_idx].indices);
                 for ci in indices {
                     let pos = self.charges[ci].pos;
@@ -688,7 +660,6 @@ impl BarnesHutTree {
     fn compute_moments_rec(&mut self, node_idx: usize) -> (f64, [f64; 3]) {
         let center = self.nodes[node_idx].center;
         if self.nodes[node_idx].is_leaf() {
-            // Leaf: direct moments about node center.
             let indices = self.nodes[node_idx].indices.clone();
             let mut q = 0.0f64;
             let mut p = [0.0f64; 3];
@@ -703,7 +674,6 @@ impl BarnesHutTree {
             self.nodes[node_idx].p = p;
             (q, p)
         } else {
-            // Internal: accumulate children, shifting dipoles to this center.
             let children = self.nodes[node_idx].children;
             let mut q = 0.0f64;
             let mut p = [0.0f64; 3];
@@ -740,10 +710,6 @@ impl BarnesHutTree {
         let ry = target[1] - node.center[1];
         let rz = target[2] - node.center[2];
 
-        // Barnes–Hut acceptance:
-        // Use the distance from the target point to the node's *bounding cube* (not the center).
-        // This avoids approximating a large node whose center is far away but which extends
-        // close to the target (a common source of large errors near boundaries).
         let ax = rx.abs();
         let ay = ry.abs();
         let az = rz.abs();
@@ -762,13 +728,11 @@ impl BarnesHutTree {
         } else if d > 0.0 {
             size / d < self.theta
         } else {
-            // target is inside / touching this node cube: do not approximate
             false
         };
 
         if accept {
             if node.is_leaf() {
-                // Direct sum within leaf.
                 let mut sum = 0.0f64;
                 for &ci in &node.indices {
                     let c = self.charges[ci];
@@ -782,15 +746,12 @@ impl BarnesHutTree {
                 }
                 sum
             } else {
-                // Multipole (monopole + dipole).
-                // (r should be > 0 here; for d>0, r cannot be zero.)
                 let inv_r = 1.0 / r;
                 let inv_r3 = inv_r * inv_r * inv_r;
                 let pr = node.p[0] * rx + node.p[1] * ry + node.p[2] * rz;
                 node.q * inv_r + pr * inv_r3
             }
         } else {
-            // Descend.
             let mut sum = 0.0f64;
             for &child_opt in &node.children {
                 if let Some(ci) = child_opt {
@@ -802,40 +763,9 @@ impl BarnesHutTree {
     }
 }
 
-// ---------------------------
-// Multigrid data structures
-// ---------------------------
-
 // -----------------------------------------------------------------------------
-// A3/A4 operator + multigrid hygiene upgrades
+// A3/A4 operator + multigrid hygiene upgrades (stencil/prolong/coarse-op)
 // -----------------------------------------------------------------------------
-//
-// Motivation (A3):
-//   The pure Poisson+FD demag operator can deviate from the Newell/FFT demag kernel
-//   primarily at high-|k| (near-field) and can show lattice anisotropy (axes vs diagonals).
-//   A practical, AMR-friendly lever is to improve the *discrete Laplacian* on the finest
-//   level so its symbol is closer to -|k|^2 over more of the Brillouin zone.
-//
-// Motivation (A4):
-//   Once the fine-grid operator changes, a multigrid hierarchy built by rediscretization
-//   can become inconsistent. Galerkin coarse operators A_c = R A_f P preserve the intended
-//   operator across levels. Trilinear prolongation (cell-centered) is also a significant
-//   quality upgrade over piecewise-constant injection.
-//
-// This file keeps the existing boundary-condition machinery unchanged (DirichletTreecode,
-// boundary stamping, etc.), and only modifies the bulk MG operator/smoother/transfer
-// operators.
-//
-// Optional env controls (safe defaults chosen for A3/A4 experimentation):
-//   LLG_DEMAG_MG_STENCIL   = "7" | "iso9"          (default: "iso9")
-//   LLG_DEMAG_MG_PROLONG   = "inject" | "trilinear" (default: "trilinear")
-//   LLG_DEMAG_MG_COARSE_OP = "rediscretize" | "galerkin" (default: "galerkin")
-//
-// Notes:
-//  - The "iso9" stencil is a 2D 9-point Mehrstellen Laplacian in the xy plane (requires
-//    dx≈dy) plus a standard 3-point 2nd-order Laplacian in z. This tends to reduce
-//    axis/diagonal anisotropy in thin-film problems while keeping coefficients positive.
-//  - If dx and dy differ appreciably, we fall back to the standard 7-point stencil.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaplacianStencilKind {
@@ -861,6 +791,8 @@ struct MGOperatorSettings {
     stencil: LaplacianStencilKind,
     prolong: ProlongationKind,
     coarse_op: CoarseOpKind,
+    /// Optional iso27 alpha override (bits). 0 => none.
+    iso27_alpha_bits: u64,
 }
 
 fn env_str_lower(key: &str) -> Option<String> {
@@ -883,12 +815,12 @@ impl MGOperatorSettings {
             }
             Some(other) => {
                 eprintln!(
-                    "[demag_mg] WARNING: unknown LLG_DEMAG_MG_STENCIL='{}' -> using 'iso9'",
+                    "[demag_mg] WARNING: unknown LLG_DEMAG_MG_STENCIL='{}' -> using 'iso27'",
                     other
                 );
-                LaplacianStencilKind::Iso9PlusZ
+                LaplacianStencilKind::Iso27
             }
-            None => LaplacianStencilKind::Iso9PlusZ,
+            None => LaplacianStencilKind::Iso27,
         };
 
         let prolong = match env_str_lower("LLG_DEMAG_MG_PROLONG").as_deref() {
@@ -919,18 +851,32 @@ impl MGOperatorSettings {
             None => CoarseOpKind::Galerkin,
         };
 
+        let iso27_alpha_bits: u64 = std::env::var("LLG_DEMAG_MG_ISO27_FLUX_ALPHA")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|a| a.is_finite() && *a > 0.0)
+            .map(|a| a.to_bits())
+            .unwrap_or(0);
+
         Self {
             stencil,
             prolong,
             coarse_op,
+            iso27_alpha_bits,
         }
     }
 
     fn tag(&self) -> String {
         let s = match self.stencil {
-            LaplacianStencilKind::SevenPoint => "7",
-            LaplacianStencilKind::Iso9PlusZ => "iso9",
-            LaplacianStencilKind::Iso27 => "iso27",
+            LaplacianStencilKind::SevenPoint => "7".to_string(),
+            LaplacianStencilKind::Iso9PlusZ => "iso9".to_string(),
+            LaplacianStencilKind::Iso27 => {
+                if self.iso27_alpha_bits != 0 {
+                    format!("iso27a{:016x}", self.iso27_alpha_bits)
+                } else {
+                    "iso27".to_string()
+                }
+            }
         };
         let p = match self.prolong {
             ProlongationKind::Injection => "inj",
@@ -944,12 +890,7 @@ impl MGOperatorSettings {
     }
 }
 
-/// A small constant-coefficient 3D stencil for a cell-centered Laplacian-like operator.
-/// Represents:
-///    (A φ)_c = center * φ_c + Σ_i coeffs[i] * φ_{c + offs[i]}
-///
-/// For classic Laplacians, `center` is negative and `diag = -center` is positive.
-/// We store `diag` explicitly for Weighted-Jacobi updates.
+/// Constant-coefficient 3D stencil for a cell-centered Laplacian-like operator.
 #[derive(Clone, Debug)]
 struct Stencil3D {
     center: f64,
@@ -964,20 +905,25 @@ impl Stencil3D {
         let sy = 1.0 / (dy * dy);
         let sz = 1.0 / (dz * dz);
         let center = -2.0 * (sx + sy + sz);
+
         let mut offs = Vec::with_capacity(6);
         let mut coeffs = Vec::with_capacity(6);
+
         offs.push([1, 0, 0]);
         coeffs.push(sx);
         offs.push([-1, 0, 0]);
         coeffs.push(sx);
+
         offs.push([0, 1, 0]);
         coeffs.push(sy);
         offs.push([0, -1, 0]);
         coeffs.push(sy);
+
         offs.push([0, 0, 1]);
         coeffs.push(sz);
         offs.push([0, 0, -1]);
         coeffs.push(sz);
+
         let diag = -center;
         Self {
             center,
@@ -988,27 +934,23 @@ impl Stencil3D {
     }
 
     fn iso9_plus_z(dx: f64, dy: f64, dz: f64) -> Self {
-        // 2D 9-point Mehrstellen Laplacian (requires dx≈dy) + standard z second derivative.
         let rel = (dx - dy).abs() / dx.max(dy).max(1e-30);
         if rel > 1e-6 {
-            // Conservative fallback.
             return Self::seven_point(dx, dy, dz);
         }
         let h = 0.5 * (dx + dy);
         let inv_h2 = 1.0 / (h * h);
         let cz = 1.0 / (dz * dz);
 
-        // xy plane:
-        //   (1/(6h^2)) * [ 4*(E+W+N+S) + 1*(NE+NW+SE+SW) - 20*C ]
-        let c_axis = (2.0 / 3.0) * inv_h2; // 4/(6h^2)
-        let c_diag = (1.0 / 6.0) * inv_h2; // 1/(6h^2)
+        // xy: (1/(6h^2)) [ 4*(axis) + 1*(diag) - 20*C ]
+        let c_axis = (2.0 / 3.0) * inv_h2;
+        let c_diag = (1.0 / 6.0) * inv_h2;
 
         let center = -(10.0 / 3.0) * inv_h2 - 2.0 * cz;
 
         let mut offs = Vec::with_capacity(10);
         let mut coeffs = Vec::with_capacity(10);
 
-        // axis neighbors in xy
         offs.push([1, 0, 0]);
         coeffs.push(c_axis);
         offs.push([-1, 0, 0]);
@@ -1018,7 +960,6 @@ impl Stencil3D {
         offs.push([0, -1, 0]);
         coeffs.push(c_axis);
 
-        // diagonals in xy
         offs.push([1, 1, 0]);
         coeffs.push(c_diag);
         offs.push([1, -1, 0]);
@@ -1028,7 +969,6 @@ impl Stencil3D {
         offs.push([-1, -1, 0]);
         coeffs.push(c_diag);
 
-        // z neighbors (standard 2nd order)
         offs.push([0, 0, 1]);
         coeffs.push(cz);
         offs.push([0, 0, -1]);
@@ -1042,20 +982,9 @@ impl Stencil3D {
             coeffs,
         }
     }
-    /// 27-point "isotropic" (Mehrstellen-style) Laplacian on a cell-centered grid.
-    ///
-    /// This is the classic 27-point isotropic stencil for uniform spacing, generalized
-    /// to (possibly) anisotropic spacing by using the physical squared distance for
-    /// the diagonal directions:
-    ///   - faces:   (±1,0,0), (0,±1,0), (0,0,±1)
-    ///   - edges:   (±1,±1,0), (±1,0,±1), (0,±1,±1)
-    ///   - corners: (±1,±1,±1)
-    ///
-    /// Weights are chosen so the Fourier symbol better matches -|k|^2 over more of
-    /// the Brillouin zone for nearly-isotropic grids.
-    fn iso27(dx: f64, dy: f64, dz: f64) -> Self {
-        // 1) Build diagonal weights (edges + corners) as:  w = alpha / |d|^2.
-        //    Choose alpha near the SPD limit for best near-field matching, unless overridden.
+
+    fn iso27(dx: f64, dy: f64, dz: f64, alpha_override_bits: u64) -> Self {
+        // Precompute sums over non-face diagonals for SPD limit.
         let mut sx1 = 0.0_f64;
         let mut sy1 = 0.0_f64;
         let mut sz1 = 0.0_f64;
@@ -1068,7 +997,6 @@ impl Stencil3D {
                     }
                     let nn = di.abs() + dj.abs() + dk.abs();
                     if nn == 1 {
-                        // Faces handled separately.
                         continue;
                     }
 
@@ -1088,14 +1016,17 @@ impl Stencil3D {
             }
         }
 
-        // Optional user override.
-        let alpha_env = std::env::var("LLG_DEMAG_MG_ISO27_FLUX_ALPHA")
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|a| a.is_finite() && *a > 0.0);
+        let alpha_env = if alpha_override_bits != 0 {
+            let a = f64::from_bits(alpha_override_bits);
+            if a.is_finite() && a > 0.0 {
+                Some(a)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        // Compute SPD-safe upper bound for alpha to keep all face weights non-negative (M-matrix).
-        // Since S_axis_diag = alpha * s_axis1, we need alpha <= 2 / s_axis1 for each axis.
         let mut alpha_max = f64::INFINITY;
         if sx1 > 0.0 {
             alpha_max = alpha_max.min(2.0 / sx1);
@@ -1107,11 +1038,9 @@ impl Stencil3D {
             alpha_max = alpha_max.min(2.0 / sz1);
         }
         if alpha_max.is_finite() {
-            alpha_max *= 0.999; // small margin
+            alpha_max *= 0.999;
         }
 
-        // Default: choose alpha close to the SPD limit for better near-field matching.
-        // (Env var can still override; we clamp if it exceeds alpha_max.)
         const ALPHA_DEFAULT_FRAC: f64 = 0.99;
         let alpha_default = if alpha_max.is_finite() {
             (ALPHA_DEFAULT_FRAC * alpha_max).max(0.0)
@@ -1121,7 +1050,6 @@ impl Stencil3D {
 
         let mut alpha = alpha_env.unwrap_or(alpha_default);
 
-        // Clamp env-provided alpha if needed.
         if alpha_max.is_finite() && alpha > alpha_max {
             eprintln!(
                 "[demag_mg] WARNING: LLG_DEMAG_MG_ISO27_FLUX_ALPHA={} too large (max≈{}). Clamping to keep SPD.",
@@ -1130,19 +1058,14 @@ impl Stencil3D {
             alpha = alpha_max.max(0.0);
         }
 
-        // 2) Choose face weights so that the stencil is exact on x^2, y^2, z^2:
-        //      Σ_n w_n Δx_n^2 = 2, etc.
-        //    Here the diagonal contributions are alpha*sx1, alpha*sy1, alpha*sz1 (dimensionless), so:
-        //      w_fx = (2 - alpha*sx1) / (2 dx^2), etc.
         let w_fx = (2.0 - alpha * sx1) / (2.0 * dx * dx);
         let w_fy = (2.0 - alpha * sy1) / (2.0 * dy * dy);
         let w_fz = (2.0 - alpha * sz1) / (2.0 * dz * dz);
 
-        // 3) Assemble the 26-neighbour stencil.
         let mut offs = Vec::with_capacity(26);
         let mut coeffs = Vec::with_capacity(26);
 
-        // Faces.
+        // faces
         offs.push([1, 0, 0]);
         coeffs.push(w_fx);
         offs.push([-1, 0, 0]);
@@ -1158,7 +1081,7 @@ impl Stencil3D {
         offs.push([0, 0, -1]);
         coeffs.push(w_fz);
 
-        // Edges + corners.
+        // edges + corners
         for di in -1isize..=1 {
             for dj in -1isize..=1 {
                 for dk in -1isize..=1 {
@@ -1166,8 +1089,8 @@ impl Stencil3D {
                         continue;
                     }
                     let nn = di.abs() + dj.abs() + dk.abs();
-                    if nn == 0 || nn == 1 {
-                        continue; // faces already added
+                    if nn <= 1 {
+                        continue;
                     }
 
                     let ddx = (di as f64) * dx;
@@ -1184,7 +1107,6 @@ impl Stencil3D {
             }
         }
 
-        // Center coefficient (negative), and positive diagonal magnitude for WJ updates.
         let sum_nb: f64 = coeffs.iter().copied().sum();
         let center = -sum_nb;
         let diag = sum_nb;
@@ -1197,11 +1119,11 @@ impl Stencil3D {
         }
     }
 
-    fn from_kind(kind: LaplacianStencilKind, dx: f64, dy: f64, dz: f64) -> Self {
+    fn from_kind(kind: LaplacianStencilKind, dx: f64, dy: f64, dz: f64, iso27_alpha_bits: u64) -> Self {
         match kind {
             LaplacianStencilKind::SevenPoint => Self::seven_point(dx, dy, dz),
             LaplacianStencilKind::Iso9PlusZ => Self::iso9_plus_z(dx, dy, dz),
-            LaplacianStencilKind::Iso27 => Self::iso27(dx, dy, dz),
+            LaplacianStencilKind::Iso27 => Self::iso27(dx, dy, dz, iso27_alpha_bits),
         }
     }
 
@@ -1221,17 +1143,7 @@ impl Stencil3D {
         (k * ny + j) * nx + i
     }
 
-    /// Apply the stencil at a single cell (with clamped indexing at domain edges).
-    fn apply_at(
-        &self,
-        phi: &[f64],
-        nx: usize,
-        ny: usize,
-        nz: usize,
-        i: usize,
-        j: usize,
-        k: usize,
-    ) -> f64 {
+    fn apply_at(&self, phi: &[f64], nx: usize, ny: usize, nz: usize, i: usize, j: usize, k: usize) -> f64 {
         let idc = Self::idx(nx, ny, i, j, k);
         let mut sum = self.center * phi[idc];
 
@@ -1252,17 +1164,7 @@ impl Stencil3D {
         sum
     }
 
-    /// Sum of off-diagonal contributions Σ c_n φ_n at a single cell.
-    fn offdiag_sum_at(
-        &self,
-        phi: &[f64],
-        nx: usize,
-        ny: usize,
-        nz: usize,
-        i: usize,
-        j: usize,
-        k: usize,
-    ) -> f64 {
+    fn offdiag_sum_at(&self, phi: &[f64], nx: usize, ny: usize, nz: usize, i: usize, j: usize, k: usize) -> f64 {
         let i0 = i as isize;
         let j0 = j as isize;
         let k0 = k as isize;
@@ -1281,19 +1183,7 @@ impl Stencil3D {
         sum
     }
 
-    /// Build a Galerkin coarse operator A_c = R A_f P for constant-coefficient stencils.
-    ///
-    /// We compute a *single interior row stencil* numerically on a small test grid, which is
-    /// valid for all interior cells of the real MG level (translation invariant operator).
-    fn galerkin_coarsen(
-        fine: &Stencil3D,
-        rx: usize,
-        ry: usize,
-        rz: usize,
-        prolong: ProlongationKind,
-    ) -> Self {
-        // Choose a coarse grid large enough so the central row is unaffected by clamped edges.
-        // (Support radius is small; 9^3 is cheap.)
+    fn galerkin_coarsen(fine: &Stencil3D, rx: usize, ry: usize, rz: usize, prolong: ProlongationKind) -> Self {
         let ncx: usize = 9;
         let ncy: usize = 9;
         let ncz: usize = 9;
@@ -1318,15 +1208,12 @@ impl Stencil3D {
                     phi_c.fill(0.0);
                     phi_c[Self::idx(ncx, ncy, ix, jy, kz)] = 1.0;
 
-                    // P: coarse -> fine
                     prolongate_scalar(
                         &phi_c, ncx, ncy, ncz, &mut phi_f, nfx, nfy, nfz, rx, ry, rz, prolong,
                     );
 
-                    // y_f = A_f phi_f
                     apply_stencil_to_field(fine, &phi_f, &mut y_f, nfx, nfy, nfz);
 
-                    // R: fine -> coarse (block average)
                     restrict_scalar_avg(&y_f, nfx, nfy, nfz, &mut y_c, ncx, ncy, ncz, rx, ry, rz);
 
                     let coeff = y_c[id_c0];
@@ -1342,7 +1229,6 @@ impl Stencil3D {
             }
         }
 
-        // Convert map -> sorted stencil.
         let mut keys: Vec<(isize, isize, isize)> = map.keys().cloned().collect();
         keys.sort();
 
@@ -1370,16 +1256,7 @@ impl Stencil3D {
     }
 }
 
-/// Apply a constant-coefficient stencil operator to a whole scalar field.
-/// Uses clamped indexing at edges (sufficient for Galerkin-stencil construction).
-fn apply_stencil_to_field(
-    st: &Stencil3D,
-    phi: &[f64],
-    out: &mut [f64],
-    nx: usize,
-    ny: usize,
-    nz: usize,
-) {
+fn apply_stencil_to_field(st: &Stencil3D, phi: &[f64], out: &mut [f64], nx: usize, ny: usize, nz: usize) {
     debug_assert_eq!(phi.len(), nx * ny * nz);
     debug_assert_eq!(out.len(), nx * ny * nz);
 
@@ -1392,7 +1269,6 @@ fn apply_stencil_to_field(
     }
 }
 
-/// Block-average restriction R: fine -> coarse.
 fn restrict_scalar_avg(
     fine: &[f64],
     nfx: usize,
@@ -1431,9 +1307,6 @@ fn restrict_scalar_avg(
     }
 }
 
-/// Prolongation P: coarse -> fine (scalar).
-///  - Injection replicates the coarse value across the fine block.
-///  - Trilinear uses cell-centered linear interpolation (ratio 2 only; ratio 1 = identity).
 fn prolongate_scalar(
     coarse: &[f64],
     ncx: usize,
@@ -1473,7 +1346,6 @@ fn prolongate_scalar(
             }
         }
         ProlongationKind::Trilinear => {
-            // We compute each fine cell from up to 8 coarse neighbors.
             fine.fill(0.0);
             for k in 0..nfz {
                 let kz = k / rz;
@@ -1492,7 +1364,6 @@ fn prolongate_scalar(
 
                         let mut v = 0.0;
 
-                        // 8-corner trilinear mix (some weights may be zero if r?==0 and neighbor clamped)
                         v += wi0 * wj0 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i0, j0, k0)];
                         v += wi1 * wj0 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i1, j0, k0)];
                         v += wi0 * wj1 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i0, j1, k0)];
@@ -1510,29 +1381,11 @@ fn prolongate_scalar(
     }
 }
 
-/// Cell-centered linear interpolation weights for 2:1 coarsening.
-/// Coarse index is `I = i_f / r`, with remainder `ri = i_f % r`.
-///
-/// For r==2:
-///   fine i=2I   lies 0.25H left  of coarse center -> 0.75*I + 0.25*(I-1)
-///   fine i=2I+1 lies 0.25H right of coarse center -> 0.75*I + 0.25*(I+1)
-///
-/// For r==1: identity.
-fn interp_1d_cell_centered(
-    i_coarse: usize,
-    r_i: usize,
-    n_coarse: usize,
-    r: usize,
-) -> (usize, usize, f64, f64) {
+fn interp_1d_cell_centered(i_coarse: usize, r_i: usize, n_coarse: usize, r: usize) -> (usize, usize, f64, f64) {
     if r == 1 {
-        return (
-            i_coarse.min(n_coarse - 1),
-            i_coarse.min(n_coarse - 1),
-            1.0,
-            0.0,
-        );
+        let i0 = i_coarse.min(n_coarse - 1);
+        return (i0, i0, 1.0, 0.0);
     }
-    // currently MG uses only r==2 when coarsening
     debug_assert!(r == 2);
 
     let i0 = i_coarse.min(n_coarse - 1);
@@ -1553,6 +1406,10 @@ fn interp_1d_cell_centered(
     }
 }
 
+// ---------------------------
+// Multigrid data structures
+// ---------------------------
+
 struct MGLevel {
     nx: usize,
     ny: usize,
@@ -1564,19 +1421,13 @@ struct MGLevel {
     inv_dy2: f64,
     inv_dz2: f64,
 
-    /// Discrete operator stencil used on this level.
     stencil: Stencil3D,
 
-    /// Current solution on this level.
     phi: Vec<f64>,
-    /// Right-hand side (Poisson source).
     rhs: Vec<f64>,
-    /// Residual (rhs - L phi).
     res: Vec<f64>,
-    /// Scratch array for smoothers.
     tmp: Vec<f64>,
 
-    /// Dirichlet boundary values (only boundary cells are used; interior may remain 0).
     bc_phi: Vec<f64>,
 }
 
@@ -1602,13 +1453,8 @@ impl MGLevel {
         }
     }
 
-    /// Enforce Dirichlet boundary on `self.phi`.
     fn enforce_dirichlet(&mut self) {
-        let nx = self.nx;
-        let ny = self.ny;
-        let nz = self.nz;
-        let (phi, bc_phi) = (&mut self.phi, &self.bc_phi);
-        stamp_dirichlet_bc(phi, bc_phi, nx, ny, nz);
+        stamp_dirichlet_bc(&mut self.phi, &self.bc_phi, self.nx, self.ny, self.nz);
     }
 
     #[inline]
@@ -1620,43 +1466,47 @@ impl MGLevel {
 pub struct DemagPoissonMG {
     grid: Grid2D,
     cfg: DemagPoissonMGConfig,
-
-    // Operator / multigrid settings (A3/A4). Not part of DemagPoissonMGConfig to avoid
-    // breaking external struct-literal construction; configured via env vars.
     op: MGOperatorSettings,
 
-    // padded domain size
     px: usize,
     py: usize,
     pz: usize,
 
-    // offset to embed the magnet region inside padded domain
     offx: usize,
     offy: usize,
-    offz: usize, // magnet layer index in z
+    offz: usize,
 
     levels: Vec<MGLevel>,
 }
 
-impl DemagPoissonMG {
-    pub fn new(grid: Grid2D, cfg: DemagPoissonMGConfig) -> Self {
-        let mut cfg = cfg;
+#[inline]
+fn rb_allowed_for_op(op: MGOperatorSettings) -> bool {
+    op.stencil == LaplacianStencilKind::SevenPoint
+        && op.coarse_op == CoarseOpKind::Rediscretize
+        && op.prolong == ProlongationKind::Injection
+}
 
-        // Operator / MG hierarchy settings (A3/A4), configured via env vars.
-        let op = MGOperatorSettings::from_env();
-
-        // Red-black SOR is only valid for the classic 7-point axis-only Laplacian with
-        // rediscretized coarse operators and injection prolongation.
-        let rb_allowed = op.stencil == LaplacianStencilKind::SevenPoint
-            && op.coarse_op == CoarseOpKind::Rediscretize
-            && op.prolong == ProlongationKind::Injection;
-
-        if cfg.smoother == MGSmoother::RedBlackSOR && !rb_allowed {
+#[inline]
+fn sanitize_cfg_for_op(cfg: &mut DemagPoissonMGConfig, op: MGOperatorSettings) {
+    if cfg.smoother == MGSmoother::RedBlackSOR && !rb_allowed_for_op(op) {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
             eprintln!(
                 "[demag_mg] INFO: overriding smoother RedBlackSOR -> WeightedJacobi (stencil/prolong/coarse-op requires it)."
             );
-            cfg.smoother = MGSmoother::WeightedJacobi;
-        }
+        });
+        cfg.smoother = MGSmoother::WeightedJacobi;
+    }
+}
+
+impl DemagPoissonMG {
+    pub fn new(grid: Grid2D, cfg: DemagPoissonMGConfig) -> Self {
+        let op = MGOperatorSettings::from_env();
+        Self::new_with_operator(grid, cfg, op)
+    }
+
+    fn new_with_operator(grid: Grid2D, mut cfg: DemagPoissonMGConfig, op: MGOperatorSettings) -> Self {
+        sanitize_cfg_for_op(&mut cfg, op);
 
         let nx = grid.nx.max(1);
         let ny = grid.ny.max(1);
@@ -1665,7 +1515,6 @@ impl DemagPoissonMG {
         let mut px = nx + 2 * pad;
         let mut py = ny + 2 * pad;
 
-        // Make even so we can coarsen cleanly.
         if px % 2 == 1 {
             px += 1;
         }
@@ -1673,24 +1522,16 @@ impl DemagPoissonMG {
             py += 1;
         }
 
-        // Use a 3D box: one magnet layer + vacuum above/below.
-        //
-        // IMPORTANT: For multigrid coarsening, having at least one even dimension in z helps.
-        // With the old choice pz = 1 + 2*n_vac, pz is always odd -> no z-coarsening possible.
-        // Here we pad by +1 vacuum layer so pz becomes even (still roughly symmetric).
         let n_vac = cfg.n_vac_z.max(1);
         let mut pz = 1 + 2 * n_vac;
         if pz % 2 == 1 {
-            pz += 1; // add one extra vacuum layer on top
+            pz += 1;
         }
 
         let offx = (px.saturating_sub(nx)) / 2;
         let offy = (py.saturating_sub(ny)) / 2;
         let offz = n_vac;
 
-        // Build multigrid levels by (semi-)coarsening by ~2 while possible.
-        //
-        // We allow semi-coarsening: always coarsen x/y together, and coarsen z when even/large enough.
         let mut levels: Vec<MGLevel> = Vec::new();
         let mut lx = px;
         let mut ly = py;
@@ -1722,20 +1563,14 @@ impl DemagPoissonMG {
 
             levels.push(MGLevel::new(lx, ly, lz, dx, dy, dz));
 
-            // Safety: avoid pathological level counts.
             if levels.len() > 32 {
                 break;
             }
         }
 
-        // Assign operator stencils per level.
-        //
-        // Finest level: chosen discretization. Coarse levels:
-        //  - Rediscretize: same chosen discretization on each level.
-        //  - Galerkin: A_c = R A_f P using our restriction/prolongation operators.
+        // Assign stencils per level.
         if !levels.is_empty() {
-            levels[0].stencil =
-                Stencil3D::from_kind(op.stencil, levels[0].dx, levels[0].dy, levels[0].dz);
+            levels[0].stencil = Stencil3D::from_kind(op.stencil, levels[0].dx, levels[0].dy, levels[0].dz, op.iso27_alpha_bits);
             for l in 1..levels.len() {
                 let rx = levels[l - 1].nx / levels[l].nx;
                 let ry = levels[l - 1].ny / levels[l].ny;
@@ -1743,7 +1578,7 @@ impl DemagPoissonMG {
 
                 levels[l].stencil = match op.coarse_op {
                     CoarseOpKind::Rediscretize => {
-                        Stencil3D::from_kind(op.stencil, levels[l].dx, levels[l].dy, levels[l].dz)
+                        Stencil3D::from_kind(op.stencil, levels[l].dx, levels[l].dy, levels[l].dz, op.iso27_alpha_bits)
                     }
                     CoarseOpKind::Galerkin => {
                         Stencil3D::galerkin_coarsen(&levels[l - 1].stencil, rx, ry, rz, op.prolong)
@@ -1766,7 +1601,11 @@ impl DemagPoissonMG {
         }
     }
 
-    /// Only compare settings that change the *allocation / hierarchy shape*.
+    fn apply_cfg(&mut self, mut cfg: DemagPoissonMGConfig) {
+        sanitize_cfg_for_op(&mut cfg, self.op);
+        self.cfg = cfg;
+    }
+
     fn same_structure(&self, grid: &Grid2D, cfg: &DemagPoissonMGConfig) -> bool {
         self.grid.nx == grid.nx
             && self.grid.ny == grid.ny
@@ -1782,14 +1621,6 @@ impl DemagPoissonMG {
         let finest = &mut self.levels[0];
         finest.rhs.fill(0.0);
 
-        // Discrete divergence of M on the padded grid.
-        //
-        // Key detail: handling magnet/vacuum interfaces.
-        // If we use naive face-averaging, surface "magnetic charges" (from M·n at interfaces)
-        // are under-represented (often by ~1/2). Here we use:
-        //  - average(M) on faces shared by two magnet cells
-        //  - one-sided M (from the magnet cell) on magnet-vacuum faces
-        //  - 0 on vacuum-vacuum faces
         let nx = finest.nx;
         let ny = finest.ny;
         let nz = finest.nz;
@@ -1798,7 +1629,6 @@ impl DemagPoissonMG {
         let dy = finest.dy;
         let dz = finest.dz;
 
-        // Capture embedding parameters.
         let offx = self.offx;
         let offy = self.offy;
         let offz = self.offz;
@@ -1836,7 +1666,6 @@ impl DemagPoissonMG {
                 return (false, [0.0; 3]);
             }
 
-            // Magnet exists only on one layer: pk == offz, and within magnet XY window.
             if pku != offz {
                 return (false, [0.0; 3]);
             }
@@ -1848,8 +1677,6 @@ impl DemagPoissonMG {
             let mj = pju - offy;
             let id = mj * nx_m + mi;
 
-            // Treat masked-out cells as vacuum by encoding them as m = (0,0,0).
-            // This matches MuMax-style masking where Ms=0 outside the geometry.
             let v = mdata[id];
             let n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
             if n2 < 1e-30 {
@@ -1862,23 +1689,21 @@ impl DemagPoissonMG {
         #[inline]
         fn face_val(in_a: bool, a: f64, in_b: bool, b: f64) -> f64 {
             match (in_a, in_b) {
-                (true, true) => 0.5 * (a + b), // interior magnet face
-                (true, false) => a,            // magnet-vacuum face: take magnet side
-                (false, true) => b,            // magnet-vacuum face: take magnet side
-                (false, false) => 0.0,         // vacuum-vacuum
+                (true, true) => 0.5 * (a + b),
+                (true, false) => a,
+                (false, true) => b,
+                (false, false) => 0.0,
             }
         }
 
         let rhs = &mut finest.rhs;
 
-        // Parallelise over contiguous X-rows (k,j rows). This gives good parallelism for thin films (small nz).
         rhs.par_chunks_mut(nx)
             .enumerate()
             .for_each(|(row_idx, rhs_row)| {
                 let k = row_idx / ny;
                 let j = row_idx % ny;
 
-                // Outer boundary rows are unused (Dirichlet).
                 if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
                     return;
                 }
@@ -1889,106 +1714,30 @@ impl DemagPoissonMG {
                 for i in 1..(nx - 1) {
                     let pi = i as isize;
 
-                    let (c_in, m_c) = m_at(
-                        pi, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms,
-                    );
+                    let (c_in, m_c) =
+                        m_at(pi, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
 
-                    let (xp_in, m_xp) = m_at(
-                        pi + 1,
-                        pj,
-                        pk,
-                        px,
-                        py,
-                        pz,
-                        offx,
-                        offy,
-                        offz,
-                        nx_m,
-                        ny_m,
-                        mdata,
-                        ms,
-                    );
-                    let (xm_in, m_xm) = m_at(
-                        pi - 1,
-                        pj,
-                        pk,
-                        px,
-                        py,
-                        pz,
-                        offx,
-                        offy,
-                        offz,
-                        nx_m,
-                        ny_m,
-                        mdata,
-                        ms,
-                    );
-                    let (yp_in, m_yp) = m_at(
-                        pi,
-                        pj + 1,
-                        pk,
-                        px,
-                        py,
-                        pz,
-                        offx,
-                        offy,
-                        offz,
-                        nx_m,
-                        ny_m,
-                        mdata,
-                        ms,
-                    );
-                    let (ym_in, m_ym) = m_at(
-                        pi,
-                        pj - 1,
-                        pk,
-                        px,
-                        py,
-                        pz,
-                        offx,
-                        offy,
-                        offz,
-                        nx_m,
-                        ny_m,
-                        mdata,
-                        ms,
-                    );
-                    let (zp_in, m_zp) = m_at(
-                        pi,
-                        pj,
-                        pk + 1,
-                        px,
-                        py,
-                        pz,
-                        offx,
-                        offy,
-                        offz,
-                        nx_m,
-                        ny_m,
-                        mdata,
-                        ms,
-                    );
-                    let (zm_in, m_zm) = m_at(
-                        pi,
-                        pj,
-                        pk - 1,
-                        px,
-                        py,
-                        pz,
-                        offx,
-                        offy,
-                        offz,
-                        nx_m,
-                        ny_m,
-                        mdata,
-                        ms,
-                    );
+                    let (xp_in, m_xp) =
+                        m_at(pi + 1, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (xm_in, m_xm) =
+                        m_at(pi - 1, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
 
-                    // Face values (x+, x-, y+, y-, z+, z-)
+                    let (yp_in, m_yp) =
+                        m_at(pi, pj + 1, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (ym_in, m_ym) =
+                        m_at(pi, pj - 1, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+
+                    let (zp_in, m_zp) =
+                        m_at(pi, pj, pk + 1, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (zm_in, m_zm) =
+                        m_at(pi, pj, pk - 1, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+
                     let mx_p = face_val(c_in, m_c[0], xp_in, m_xp[0]);
                     let mx_m = face_val(xm_in, m_xm[0], c_in, m_c[0]);
+
                     let my_p = face_val(c_in, m_c[1], yp_in, m_yp[1]);
                     let my_m = face_val(ym_in, m_ym[1], c_in, m_c[1]);
+
                     let mz_p = face_val(c_in, m_c[2], zp_in, m_zp[2]);
                     let mz_m = face_val(zm_in, m_zm[2], c_in, m_c[2]);
 
@@ -1998,25 +1747,13 @@ impl DemagPoissonMG {
             });
     }
 
-    /// Update outer Dirichlet boundary values on the finest level.
-    ///
-    /// For `DirichletZero` this is all zeros.
-    /// For `DirichletDipole` we compute a monopole+dipole approximation from the RHS moments.
     fn update_finest_boundary_bc(&mut self) {
         let finest = &mut self.levels[0];
         finest.bc_phi.fill(0.0);
 
         match self.cfg.bc {
-            BoundaryCondition::DirichletZero => {
-                // bc_phi already zero
-            }
+            BoundaryCondition::DirichletZero => {}
             BoundaryCondition::DirichletDipole => {
-                // Compute monopole and dipole moments of rhs: q = ∫rhs dV, p = ∫rhs r dV
-                //
-                // Free-space solution of ∇²phi = rhs:
-                //   phi(r) = -(1/4π) ∫ rhs(r') / |r - r'| dV'
-                // Far-field multipole approximation (about origin):
-                //   phi(r) ≈ -(1/4π) ( q/r + (p·r)/r^3 + ... )
                 let dx = finest.dx;
                 let dy = finest.dy;
                 let dz = finest.dz;
@@ -2031,7 +1768,6 @@ impl DemagPoissonMG {
                 let mut pym = 0.0f64;
                 let mut pzm = 0.0f64;
 
-                // Sequential moment accumulation (cheap relative to the solve).
                 for k in 0..finest.nz {
                     let z = (k as f64 + 0.5 - cz) * dz;
                     for j in 0..finest.ny {
@@ -2051,7 +1787,6 @@ impl DemagPoissonMG {
 
                 let inv4pi = 1.0 / (4.0 * PI);
 
-                // Set boundary cell-centered values.
                 let nx = finest.nx;
                 let ny = finest.ny;
                 let nz = finest.nz;
@@ -2061,7 +1796,6 @@ impl DemagPoissonMG {
                     for j in 0..ny {
                         let y = (j as f64 + 0.5 - cy) * dy;
 
-                        // i = 0
                         {
                             let i = 0usize;
                             let x = (i as f64 + 0.5 - cx) * dx;
@@ -2073,7 +1807,6 @@ impl DemagPoissonMG {
                                     -inv4pi * (q / r + pr / (r * r * r));
                             }
                         }
-                        // i = nx-1
                         {
                             let i = nx - 1;
                             let x = (i as f64 + 0.5 - cx) * dx;
@@ -2090,7 +1823,6 @@ impl DemagPoissonMG {
                     for i in 0..nx {
                         let x = (i as f64 + 0.5 - cx) * dx;
 
-                        // j = 0
                         {
                             let j = 0usize;
                             let y = (j as f64 + 0.5 - cy) * dy;
@@ -2102,7 +1834,6 @@ impl DemagPoissonMG {
                                     -inv4pi * (q / r + pr / (r * r * r));
                             }
                         }
-                        // j = ny-1
                         {
                             let j = ny - 1;
                             let y = (j as f64 + 0.5 - cy) * dy;
@@ -2122,7 +1853,6 @@ impl DemagPoissonMG {
                     for i in 0..nx {
                         let x = (i as f64 + 0.5 - cx) * dx;
 
-                        // k = 0
                         {
                             let k = 0usize;
                             let z = (k as f64 + 0.5 - cz) * dz;
@@ -2134,7 +1864,6 @@ impl DemagPoissonMG {
                                     -inv4pi * (q / r + pr / (r * r * r));
                             }
                         }
-                        // k = nz-1
                         {
                             let k = nz - 1;
                             let z = (k as f64 + 0.5 - cz) * dz;
@@ -2151,12 +1880,6 @@ impl DemagPoissonMG {
             }
 
             BoundaryCondition::DirichletTreecode => {
-                // Barnes–Hut treecode evaluation of the free-space boundary potential.
-                //
-                // phi(r) = -(1/4π) ∫ rhs(r') / |r-r'| dV'
-                //
-                // We treat each cell as a point source with strength q = rhs * dV located at the
-                // cell center. This is consistent with our cell-centered Laplacian discretisation.
                 let dx = finest.dx;
                 let dy = finest.dy;
                 let dz = finest.dz;
@@ -2166,7 +1889,6 @@ impl DemagPoissonMG {
                 let cy = (finest.ny as f64) * 0.5;
                 let cz = (finest.nz as f64) * 0.5;
 
-                // Build the source list (charges).
                 let mut charges: Vec<Charge> = Vec::new();
                 charges.reserve(finest.rhs.len() / 8);
 
@@ -2208,7 +1930,6 @@ impl DemagPoissonMG {
                     let ny = finest.ny;
                     let nz = finest.nz;
 
-                    // Parallelise over (k,j) rows to get good parallelism for thin-film domains (small nz).
                     finest
                         .bc_phi
                         .par_chunks_mut(nx)
@@ -2221,13 +1942,11 @@ impl DemagPoissonMG {
                             let y = (j as f64 + 0.5 - cy) * dy;
 
                             if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                                // Entire row lies on a boundary face (y or z face): all i are boundary cells.
                                 for i in 0..nx {
                                     let x = (i as f64 + 0.5 - cx) * dx;
                                     bc_row[i] = tree.eval_phi([x, y, z]);
                                 }
                             } else {
-                                // Interior row: only i = 0 and i = nx-1 are boundary cells.
                                 let i0 = 0usize;
                                 let x0 = (i0 as f64 + 0.5 - cx) * dx;
                                 bc_row[i0] = tree.eval_phi([x0, y, z]);
@@ -2241,7 +1960,6 @@ impl DemagPoissonMG {
             }
         }
 
-        // Ensure the current phi respects the boundary.
         finest.enforce_dirichlet();
     }
 
@@ -2250,24 +1968,16 @@ impl DemagPoissonMG {
         let ny = level.ny;
         let nz = level.nz;
 
-        // IMPORTANT (borrow checker): do NOT hold `&level.stencil` across `level.enforce_dirichlet()`.
-        // Clone once; the stencil is small (<= 26 neighbors) and constant within this call.
         let st = level.stencil.clone();
 
-        // Weighted Jacobi:
-        //   φ^{new} = (1-ω) φ^{old} + ω * ( (Σ offdiag c_n φ_n) - rhs ) / diag
-        // where diag = -center (positive for Laplacian-like stencils).
         for _ in 0..iters {
-            // tmp = old phi (read-only snapshot)
             level.tmp.copy_from_slice(&level.phi);
 
-            // Limit the lifetime of `tmp`/`rhs` borrows so we can call `enforce_dirichlet()` afterwards.
             {
                 let tmp: &[f64] = &level.tmp;
                 let rhs: &[f64] = &level.rhs;
                 let st_ref = &st;
 
-                // Update interior in parallel: each (k,j) row writes to a disjoint `phi_row`.
                 level
                     .phi
                     .par_chunks_mut(nx)
@@ -2276,7 +1986,6 @@ impl DemagPoissonMG {
                         let k = row_idx / ny;
                         let j = row_idx % ny;
 
-                        // Skip boundary planes/rows (Dirichlet)
                         if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
                             return;
                         }
@@ -2291,15 +2000,10 @@ impl DemagPoissonMG {
                     });
             }
 
-            // Keep Dirichlet boundaries pinned (cheap, correctness-critical)
             level.enforce_dirichlet();
         }
     }
 
-    /// Parallel red-black Gauss–Seidel / SOR update.
-    ///
-    /// Key property: within each colour sweep, updates are independent (depend only on opposite colour).
-    /// We exploit this by computing new values into `tmp` in parallel, then applying them back to `phi`.
     fn smooth_rb_sor(level: &mut MGLevel, iters: usize, omega: f64) {
         let nx = level.nx;
         let ny = level.ny;
@@ -2314,7 +2018,6 @@ impl DemagPoissonMG {
 
         for _ in 0..iters {
             for color in 0..2usize {
-                // Compute updated values for this colour into tmp.
                 let phi_ro: &[f64] = &level.phi;
                 let rhs_ro: &[f64] = &level.rhs;
 
@@ -2354,7 +2057,6 @@ impl DemagPoissonMG {
                         }
                     });
 
-                // Apply updates back into phi for this colour.
                 let tmp_ro: &[f64] = &level.tmp;
                 level
                     .phi
@@ -2380,7 +2082,6 @@ impl DemagPoissonMG {
                     });
             }
 
-            // Keep Dirichlet boundaries pinned after each full red+black sweep.
             level.enforce_dirichlet();
         }
     }
@@ -2402,7 +2103,6 @@ impl DemagPoissonMG {
                 let k = row_idx / ny;
                 let j = row_idx % ny;
 
-                // Boundary planes: homogeneous residual (Dirichlet).
                 if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
                     res_row.fill(0.0);
                     return 0.0f64;
@@ -2411,14 +2111,11 @@ impl DemagPoissonMG {
                 let base = row_idx * nx;
                 let mut max_abs: f64 = 0.0;
 
-                // Boundary cells in the row.
                 res_row[0] = 0.0;
                 res_row[nx - 1] = 0.0;
 
                 for i in 1..(nx - 1) {
                     let id = base + i;
-
-                    // r = rhs - A phi
                     let aphi = st.apply_at(phi, nx, ny, nz, i, j, k);
                     let r = rhs[id] - aphi;
 
@@ -2509,7 +2206,6 @@ impl DemagPoissonMG {
                         for i in 1..(nfx - 1) {
                             let ic = i / rx;
 
-                            // Match old behaviour: only prolongate from coarse interior cells
                             if ic == 0
                                 || ic + 1 >= coarse.nx
                                 || jc == 0
@@ -2580,27 +2276,20 @@ impl DemagPoissonMG {
         let omega_sor = self.cfg.sor_omega;
 
         if l == self.levels.len() - 1 {
-            // Coarsest: do extra smoothing (acts as a cheap coarse solve).
             match smoother {
-                MGSmoother::WeightedJacobi => {
-                    Self::smooth_weighted_jacobi(&mut self.levels[l], 80, omega_j)
-                }
+                MGSmoother::WeightedJacobi => Self::smooth_weighted_jacobi(&mut self.levels[l], 80, omega_j),
                 MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], 80, omega_sor),
             }
             return;
         }
 
         match smoother {
-            MGSmoother::WeightedJacobi => {
-                Self::smooth_weighted_jacobi(&mut self.levels[l], pre, omega_j)
-            }
+            MGSmoother::WeightedJacobi => Self::smooth_weighted_jacobi(&mut self.levels[l], pre, omega_j),
             MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], pre, omega_sor),
         }
 
-        // residual on level l
         Self::compute_residual(&mut self.levels[l]);
 
-        // restrict residual to rhs on level l+1
         {
             let (fine, coarse) = {
                 let (a, b) = self.levels.split_at_mut(l + 1);
@@ -2609,10 +2298,8 @@ impl DemagPoissonMG {
             Self::restrict_residual(fine, coarse);
         }
 
-        // recurse on coarse
         self.v_cycle(l + 1);
 
-        // prolongate correction back
         {
             let (fine, coarse) = {
                 let (a, b) = self.levels.split_at_mut(l + 1);
@@ -2622,18 +2309,16 @@ impl DemagPoissonMG {
         }
 
         match smoother {
-            MGSmoother::WeightedJacobi => {
-                Self::smooth_weighted_jacobi(&mut self.levels[l], post, omega_j)
-            }
+            MGSmoother::WeightedJacobi => Self::smooth_weighted_jacobi(&mut self.levels[l], post, omega_j),
             MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], post, omega_sor),
         }
     }
+
     fn solve_with_timing(&mut self) -> (u64, u64) {
         if !self.cfg.warm_start {
             self.levels[0].phi.fill(0.0);
         }
 
-        // Update and enforce Dirichlet boundary values on the finest level.
         let t_bc = Instant::now();
         self.update_finest_boundary_bc();
         let bc_ns = t_bc.elapsed().as_nanos() as u64;
@@ -2642,18 +2327,10 @@ impl DemagPoissonMG {
 
         let t_solve = Instant::now();
 
-        // Iteration strategy:
-        // - Default: fixed number of V-cycles (cfg.v_cycles).
-        // - If cfg.tol_abs and/or cfg.tol_rel is set: run up to cfg.v_cycles_max V-cycles,
-        //   but *at least* cfg.v_cycles, stopping when the max-norm residual meets the target.
-        //
-        // The "at least cfg.v_cycles" floor keeps the solve quality more uniform in time (reduces
-        // time-dependent solve noise), while the residual stop prevents runaway runtimes.
         let tol_abs = self.cfg.tol_abs;
         let tol_rel = self.cfg.tol_rel;
         let use_tol = tol_abs.is_some() || tol_rel.is_some();
 
-        // Relative tolerance target is scaled by max-norm(rhs) on the finest grid.
         let rhs_max = if use_tol && tol_rel.is_some() {
             let finest = &self.levels[0];
             let nx = finest.nx;
@@ -2702,7 +2379,6 @@ impl DemagPoissonMG {
 
         for iter in 0..max_cycles {
             self.v_cycle(0);
-            // Keep boundary pinned (defensive).
             self.levels[0].enforce_dirichlet();
 
             if use_tol && (iter + 1) >= min_cycles {
@@ -2713,7 +2389,6 @@ impl DemagPoissonMG {
             }
         }
 
-        // Final BC enforcement.
         self.levels[0].enforce_dirichlet();
 
         let solve_ns = t_solve.elapsed().as_nanos() as u64;
@@ -2732,35 +2407,20 @@ impl DemagPoissonMG {
     fn solve(&mut self) {
         let _ = self.solve_with_timing();
     }
-    fn add_b_from_phi_on_magnet_layer(
-        &self,
-        m: &VectorField2D,
-        _ms: f64,
-        b_eff: &mut VectorField2D,
-    ) {
+
+    fn add_b_from_phi_on_magnet_layer(&self, m: &VectorField2D, _ms: f64, b_eff: &mut VectorField2D) {
         self.add_b_from_phi_on_magnet_layer_impl(Some(&m.data), b_eff);
     }
 
-    /// Like `add_b_from_phi_on_magnet_layer`, but computes the field for *all* cells in the
-    /// magnet XY window, regardless of whether `m` is zero there.
-    ///
-    /// This is used for ΔK impulse-response building, where we want the operator's response
-    /// at neighbouring target cells even though the impulse magnetisation is nonzero only at
-    /// a single source cell.
     fn add_b_from_phi_on_magnet_layer_all(&self, b_eff: &mut VectorField2D) {
         self.add_b_from_phi_on_magnet_layer_impl(None, b_eff);
     }
 
-    fn add_b_from_phi_on_magnet_layer_impl(
-        &self,
-        mdata_opt: Option<&[[f64; 3]]>,
-        b_eff: &mut VectorField2D,
-    ) {
+    fn add_b_from_phi_on_magnet_layer_impl(&self, mdata_opt: Option<&[[f64; 3]]>, b_eff: &mut VectorField2D) {
         let finest = &self.levels[0];
         let phi = &finest.phi;
 
         let nx_m = self.grid.nx;
-        let _ny_m = self.grid.ny;
 
         let dx = finest.dx;
         let dy = finest.dy;
@@ -2774,17 +2434,6 @@ impl DemagPoissonMG {
             n2 > 1e-30
         }
 
-        // Discrete consistency note:
-        //
-        // We extract H = -∇φ using the *mimetic* (finite-volume) face-gradient: average of the
-        // forward/backward one-sided differences (which reduces to a central difference away
-        // from boundaries). This makes the grad/div pair compatible with the Laplacian stencil
-        // used in the multigrid residual, and avoids the "half-gradient" artefact at padded
-        // boundaries.
-        //
-        // IMPORTANT: For magnet-vacuum interfaces, the potential already encodes the correct
-        // jump conditions via the RHS construction (one-sided face flux). Do *not* add an
-        // explicit ±(M·n)/2 correction term here.
         b_eff
             .data
             .par_chunks_mut(nx_m)
@@ -2802,7 +2451,6 @@ impl DemagPoissonMG {
                     let pi = self.offx + i;
                     let phi_c = phi[idx3(pi, pj, k, self.px, self.py)];
 
-                    // Average of one-sided face gradients (mimetic / adjoint-friendly).
                     let mut dphi_dx = 0.0;
                     let mut wdx = 0.0;
                     if pi + 1 < self.px {
@@ -2851,7 +2499,6 @@ impl DemagPoissonMG {
                         dphi_dz /= wdz;
                     }
 
-                    // B = μ0 H = -μ0 ∇φ
                     row[i][0] += -MU0 * dphi_dx;
                     row[i][1] += -MU0 * dphi_dy;
                     row[i][2] += -MU0 * dphi_dz;
@@ -2863,25 +2510,6 @@ impl DemagPoissonMG {
         self.build_rhs_from_m(m, ms);
         self.solve();
         self.add_b_from_phi_on_magnet_layer(m, ms, b_eff);
-    }
-
-    fn add_field_timed(
-        &mut self,
-        m: &VectorField2D,
-        b_eff: &mut VectorField2D,
-        ms: f64,
-    ) -> (u64, u64, u64, u64) {
-        let t_rhs = Instant::now();
-        self.build_rhs_from_m(m, ms);
-        let rhs_ns = t_rhs.elapsed().as_nanos() as u64;
-
-        let (bc_ns, solve_ns) = self.solve_with_timing();
-
-        let t_grad = Instant::now();
-        self.add_b_from_phi_on_magnet_layer(m, ms, b_eff);
-        let grad_ns = t_grad.elapsed().as_nanos() as u64;
-
-        (rhs_ns, bc_ns, solve_ns, grad_ns)
     }
 }
 
@@ -2898,24 +2526,27 @@ struct DeltaKernelKey {
     dz_bits: u64,
     pad_xy: usize,
     n_vac_z: usize,
-    // MG operator settings that affect the resulting ΔK (stencil/prolong/coarse-op).
+
     op: MGOperatorSettings,
+
     bc: BoundaryCondition,
-    // Only relevant for DirichletTreecode, but included so disk caches are safe.
     tree_theta_bits: u64,
     tree_leaf: usize,
     tree_max_depth: usize,
+
+    pre_smooth: usize,
+    post_smooth: usize,
+    smoother: MGSmoother,
+    omega_bits: u64,
+    sor_omega_bits: u64,
+
+    sigma_bits: u64,
     radius_xy: usize,
     delta_v_cycles: usize,
 }
 
 impl DeltaKernelKey {
-    fn new(
-        grid: &Grid2D,
-        mg_cfg: &DemagPoissonMGConfig,
-        hyb: &HybridConfig,
-        op: MGOperatorSettings,
-    ) -> Self {
+    fn new(grid: &Grid2D, mg_cfg: &DemagPoissonMGConfig, hyb: &HybridConfig, op: MGOperatorSettings) -> Self {
         Self {
             nx: grid.nx,
             ny: grid.ny,
@@ -2929,6 +2560,12 @@ impl DeltaKernelKey {
             tree_theta_bits: mg_cfg.tree_theta.to_bits(),
             tree_leaf: mg_cfg.tree_leaf,
             tree_max_depth: mg_cfg.tree_max_depth,
+            pre_smooth: mg_cfg.pre_smooth,
+            post_smooth: mg_cfg.post_smooth,
+            smoother: mg_cfg.smoother,
+            omega_bits: mg_cfg.omega.to_bits(),
+            sor_omega_bits: mg_cfg.sor_omega.to_bits(),
+            sigma_bits: hyb.sigma_cells.to_bits(),
             radius_xy: hyb.radius_xy,
             delta_v_cycles: hyb.delta_v_cycles,
         }
@@ -2944,8 +2581,13 @@ impl DeltaKernelKey {
         let dy = f64::from_bits(self.dy_bits);
         let dz = f64::from_bits(self.dz_bits);
         let tree_theta = f64::from_bits(self.tree_theta_bits);
+        let sm_tag = match self.smoother {
+            MGSmoother::WeightedJacobi => "wj",
+            MGSmoother::RedBlackSOR => "rb",
+        };
+
         let fname = format!(
-            "demag_mg_hybrid_dk_nx{}_ny{}_dx{:.3e}_dy{:.3e}_dz{:.3e}_pad{}_nvacz{}_op{}_bc{}_th{:.3e}_leaf{}_dep{}_r{}_dv{}.bin",
+            "demag_mg_hybrid_dk_nx{}_ny{}_dx{:.3e}_dy{:.3e}_dz{:.3e}_pad{}_nvacz{}_op{}_bc{}_th{:.3e}_leaf{}_dep{}_sm{}_pre{}_post{}_om{:016x}_som{:016x}_sig{:016x}_r{}_dv{}.bin",
             self.nx,
             self.ny,
             dx,
@@ -2958,6 +2600,12 @@ impl DeltaKernelKey {
             tree_theta,
             self.tree_leaf,
             self.tree_max_depth,
+            sm_tag,
+            self.pre_smooth,
+            self.post_smooth,
+            self.omega_bits,
+            self.sor_omega_bits,
+            self.sigma_bits,
             self.radius_xy,
             self.delta_v_cycles
         );
@@ -2969,15 +2617,18 @@ struct DemagPoissonMGHybrid {
     mg: DemagPoissonMG,
     hyb: HybridConfig,
 
-    // cached ΔK stencil
     dk_key: Option<DeltaKernelKey>,
     dk: Option<DeltaKernel2D>,
 }
 
 impl DemagPoissonMGHybrid {
-    fn new(grid: Grid2D, mg_cfg: DemagPoissonMGConfig, hyb: HybridConfig) -> Self {
+    fn new(grid: Grid2D, mut mg_cfg: DemagPoissonMGConfig, hyb: HybridConfig) -> Self {
+        let op = MGOperatorSettings::from_env();
+        sanitize_cfg_for_op(&mut mg_cfg, op);
+        let mg = DemagPoissonMG::new_with_operator(grid, mg_cfg, op);
+
         Self {
-            mg: DemagPoissonMG::new(grid, mg_cfg),
+            mg,
             hyb,
             dk_key: None,
             dk: None,
@@ -2995,7 +2646,6 @@ impl DemagPoissonMGHybrid {
             return;
         }
 
-        // Clamp radius so the impulse stencil fits within the grid.
         let max_r_x = self.mg.grid.nx.saturating_sub(2) / 2;
         let max_r_y = self.mg.grid.ny.saturating_sub(2) / 2;
         let r_eff = self.hyb.radius_xy.min(max_r_x).min(max_r_y);
@@ -3007,13 +2657,13 @@ impl DemagPoissonMGHybrid {
 
         let mut hyb_eff = self.hyb;
         hyb_eff.radius_xy = r_eff;
+
         let key = DeltaKernelKey::new(&self.mg.grid, &self.mg.cfg, &hyb_eff, self.mg.op);
 
         if self.dk_key == Some(key) && self.dk.is_some() {
             return;
         }
 
-        // Try disk cache.
         if hyb_eff.cache_to_disk {
             if let Some(dk) = load_delta_kernel_from_disk(&key) {
                 eprintln!(
@@ -3025,16 +2675,14 @@ impl DemagPoissonMGHybrid {
                 return;
             }
             eprintln!(
-                "[demag_mg] hybrid cache miss -> building ΔK stencil (r={}, dv={}) ...",
-                hyb_eff.radius_xy, hyb_eff.delta_v_cycles
+                "[demag_mg] hybrid cache miss -> building ΔK stencil (r={}, dv={}, sigma_cells={:.3}) ...",
+                hyb_eff.radius_xy, hyb_eff.delta_v_cycles, hyb_eff.sigma_cells
             );
         }
 
-        // Build ΔK by impulse response: ΔK = K_fft - K_mg.
-        let dk = build_delta_kernel_impulse(&self.mg.grid, &self.mg.cfg, &hyb_eff, mat);
+        let dk = build_delta_kernel_impulse(&self.mg.grid, &self.mg.cfg, &hyb_eff, mat, self.mg.op);
 
         if hyb_eff.cache_to_disk {
-            // Best-effort: ignore IO errors.
             if save_delta_kernel_to_disk(&key, &dk).is_ok() {
                 eprintln!(
                     "[demag_mg] hybrid cached ΔK stencil to \"{}\"",
@@ -3048,17 +2696,30 @@ impl DemagPoissonMGHybrid {
     }
 
     fn add_field(&mut self, m: &VectorField2D, b_eff: &mut VectorField2D, mat: &Material) {
-        // One-time, user-visible confirmation of whether the hybrid ΔK path is enabled.
-        // (This makes it easy to verify we're running *pure MG* during debugging.)
         mg_hybrid_notice_once(&self.hyb);
 
         if mg_timing_enabled() {
             let t_total = Instant::now();
 
-            // MG far field (timed)
-            let (rhs_ns, bc_ns, solve_ns, grad_ns) = self.mg.add_field_timed(m, b_eff, mat.ms);
+            let t_rhs = Instant::now();
+            self.mg.build_rhs_from_m(m, mat.ms);
+            if self.hyb.enabled() && (self.hyb.sigma_cells > 0.0) {
+                screen_rhs_gaussian_xy(&mut self.mg.levels[0], self.hyb.sigma_cells);
+            }
+            let rhs_ns = t_rhs.elapsed().as_nanos() as u64;
 
-            // Local near-field correction (timed)
+            if self.hyb.enabled() && self.mg.cfg.warm_start {
+                for lev in &mut self.mg.levels {
+                    lev.phi.fill(0.0);
+                }
+            }
+
+            let (bc_ns, solve_ns) = self.mg.solve_with_timing();
+
+            let t_grad = Instant::now();
+            self.mg.add_b_from_phi_on_magnet_layer(m, mat.ms, b_eff);
+            let grad_ns = t_grad.elapsed().as_nanos() as u64;
+
             let t_h = Instant::now();
             if self.hyb.enabled() {
                 self.ensure_delta_kernel(mat);
@@ -3069,41 +2730,183 @@ impl DemagPoissonMGHybrid {
             let hybrid_ns = t_h.elapsed().as_nanos() as u64;
 
             let total_ns = t_total.elapsed().as_nanos() as u64;
-
             mg_timing_record(rhs_ns, bc_ns, solve_ns, grad_ns, hybrid_ns, total_ns);
-        } else {
-            // MG far field
-            self.mg.add_field(m, b_eff, mat.ms);
+            return;
+        }
 
-            // Local near-field correction
-            if self.hyb.enabled() {
-                self.ensure_delta_kernel(mat);
-                if let Some(dk) = &self.dk {
-                    dk.add_correction(m, b_eff, mat.ms);
-                }
+        if !self.hyb.enabled() {
+            self.mg.add_field(m, b_eff, mat.ms);
+            return;
+        }
+
+        self.ensure_delta_kernel(mat);
+        self.mg.build_rhs_from_m(m, mat.ms);
+        if self.hyb.sigma_cells > 0.0 {
+            screen_rhs_gaussian_xy(&mut self.mg.levels[0], self.hyb.sigma_cells);
+        }
+        if self.mg.cfg.warm_start {
+            for lev in &mut self.mg.levels {
+                lev.phi.fill(0.0);
             }
+        }
+        self.mg.solve();
+        self.mg.add_b_from_phi_on_magnet_layer(m, mat.ms, b_eff);
+        if let Some(dk) = &self.dk {
+            dk.add_correction(m, b_eff, mat.ms);
         }
     }
 }
 
-/// Print a one-time notice about whether the hybrid ΔK correction is enabled.
-///
-/// This is intentionally a one-time log to avoid spamming long runs.
 #[inline]
 fn mg_hybrid_notice_once(hyb: &HybridConfig) {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         if hyb.enabled() {
             eprintln!(
-                "[demag_mg] hybrid ΔK ENABLED (radius_xy={}, delta_v_cycles={}, cache_to_disk={})",
-                hyb.radius_xy, hyb.delta_v_cycles, hyb.cache_to_disk
+                "[demag_mg] hybrid ΔK ENABLED (radius_xy={}, delta_v_cycles={}, sigma_cells={:.3}, cache_to_disk={})",
+                hyb.radius_xy, hyb.delta_v_cycles, hyb.sigma_cells, hyb.cache_to_disk
             );
+            if !(hyb.sigma_cells > 0.0) {
+                eprintln!(
+                    "[demag_mg] warning: hybrid ΔK is UNSCREENED (LLG_DEMAG_MG_HYBRID_SIGMA<=0). \
+                     This usually leaves long-range tails/DC leak and can worsen errors. \
+                     Recommended: set LLG_DEMAG_MG_HYBRID_SIGMA=1.0..2.0"
+                );
+            }
         } else {
             eprintln!(
                 "[demag_mg] hybrid ΔK DISABLED (pure MG). To enable: set LLG_DEMAG_MG_HYBRID_ENABLE=1 and LLG_DEMAG_MG_HYBRID_RADIUS>0"
             );
         }
     });
+}
+
+// ---------------------------
+// Hybrid diagnostics (opt-in via env vars)
+// ---------------------------
+
+#[inline]
+fn mg_hybrid_diag_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LLG_DEMAG_MG_HYBRID_DIAG").is_ok())
+}
+
+#[inline]
+fn mg_hybrid_diag_invar_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LLG_DEMAG_MG_HYBRID_DIAG_INVAR").is_ok())
+}
+
+// ---------------------------
+// PPPM/Ewald-style screening: Gaussian smoothing of RHS in XY
+// ---------------------------
+
+fn gaussian_kernel_1d(sigma_cells: f64) -> (Vec<f64>, isize) {
+    if !(sigma_cells > 0.0) {
+        return (vec![1.0], 0);
+    }
+    let r = (3.0 * sigma_cells).ceil() as isize;
+    if r <= 0 {
+        return (vec![1.0], 0);
+    }
+    let mut w = Vec::with_capacity((2 * r + 1) as usize);
+    let inv2s2 = 1.0 / (2.0 * sigma_cells * sigma_cells);
+    for i in -r..=r {
+        let x = i as f64;
+        w.push((-x * x * inv2s2).exp());
+    }
+    let sum: f64 = w.iter().sum();
+    if sum > 0.0 {
+        for wi in &mut w {
+            *wi /= sum;
+        }
+    }
+    (w, r)
+}
+
+fn screen_rhs_gaussian_xy(level: &mut MGLevel, sigma_cells: f64) {
+    if !(sigma_cells > 0.0) {
+        return;
+    }
+
+    let (w, r) = gaussian_kernel_1d(sigma_cells);
+    if r <= 0 {
+        return;
+    }
+
+    let nx = level.nx;
+    let ny = level.ny;
+    let nz = level.nz;
+
+    if nx < 3 || ny < 3 || nz < 3 {
+        return;
+    }
+
+    // Pass 1: X convolution (rhs -> tmp)
+    {
+        let rhs = &level.rhs;
+        let tmp = &mut level.tmp;
+        tmp.par_chunks_mut(nx)
+            .enumerate()
+            .for_each(|(row, tmp_row)| {
+                let k = row / ny;
+                let j = row - k * ny;
+                if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
+                    tmp_row.fill(0.0);
+                    return;
+                }
+                let base = row * nx;
+                tmp_row[0] = 0.0;
+                tmp_row[nx - 1] = 0.0;
+                for i in 1..(nx - 1) {
+                    let mut acc = 0.0;
+                    let ii = i as isize;
+                    for (t, wi) in (-r..=r).zip(w.iter()) {
+                        let mut x = ii + t;
+                        if x < 0 {
+                            x = 0;
+                        } else if x > (nx as isize - 1) {
+                            x = nx as isize - 1;
+                        }
+                        acc += wi * rhs[base + x as usize];
+                    }
+                    tmp_row[i] = acc;
+                }
+            });
+    }
+
+    // Pass 2: Y convolution (tmp -> rhs)
+    {
+        let tmp = &level.tmp;
+        let rhs = &mut level.rhs;
+        rhs.par_chunks_mut(nx)
+            .enumerate()
+            .for_each(|(row, rhs_row)| {
+                let k = row / ny;
+                let j = row - k * ny;
+                if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
+                    rhs_row.fill(0.0);
+                    return;
+                }
+                rhs_row[0] = 0.0;
+                rhs_row[nx - 1] = 0.0;
+                let jj = j as isize;
+                for i in 1..(nx - 1) {
+                    let mut acc = 0.0;
+                    for (t, wi) in (-r..=r).zip(w.iter()) {
+                        let mut y = jj + t;
+                        if y < 0 {
+                            y = 0;
+                        } else if y > (ny as isize - 1) {
+                            y = ny as isize - 1;
+                        }
+                        let src_row = k * ny + y as usize;
+                        acc += wi * tmp[src_row * nx + i];
+                    }
+                    rhs_row[i] = acc;
+                }
+            });
+    }
 }
 
 // ---------------------------
@@ -3137,14 +2940,7 @@ static MG_TIMING_HYBRID_NS: AtomicU64 = AtomicU64::new(0);
 static MG_TIMING_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-fn mg_timing_record(
-    rhs_ns: u64,
-    bc_ns: u64,
-    solve_ns: u64,
-    grad_ns: u64,
-    hybrid_ns: u64,
-    total_ns: u64,
-) {
+fn mg_timing_record(rhs_ns: u64, bc_ns: u64, solve_ns: u64, grad_ns: u64, hybrid_ns: u64, total_ns: u64) {
     let c = MG_TIMING_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     MG_TIMING_RHS_NS.fetch_add(rhs_ns, Ordering::Relaxed);
     MG_TIMING_BC_NS.fetch_add(bc_ns, Ordering::Relaxed);
@@ -3175,9 +2971,8 @@ fn mg_timing_record(
 // ΔK disk cache + builder
 // ---------------------------
 
-// Bump this if the MG operator / hybrid stencil definition changes in a way that should
-// invalidate on-disk cached ΔK files.
-const DK_CACHE_MAGIC: &[u8; 8] = b"LLGDKH4\x00";
+// New file format (includes op + sigma + MG iteration params). Bump if layout changes.
+const DK_CACHE_MAGIC: &[u8; 8] = b"LLGDKH6\x00";
 
 fn ensure_cache_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -3196,7 +2991,6 @@ fn load_delta_kernel_from_disk(key: &DeltaKernelKey) -> Option<DeltaKernel2D> {
         return None;
     }
 
-    // Helper to read little-endian u64.
     fn read_u64<R: Read>(r: &mut R) -> Option<u64> {
         let mut buf = [0u8; 8];
         r.read_exact(&mut buf).ok()?;
@@ -3210,17 +3004,60 @@ fn load_delta_kernel_from_disk(key: &DeltaKernelKey) -> Option<DeltaKernel2D> {
     let dz_bits = read_u64(&mut f)?;
     let pad_xy = read_u64(&mut f)? as usize;
     let n_vac_z = read_u64(&mut f)? as usize;
+
+    let op_stencil_u = read_u64(&mut f)? as u32;
+    let op_prolong_u = read_u64(&mut f)? as u32;
+    let op_coarse_u = read_u64(&mut f)? as u32;
+    let op_iso27_alpha_bits = read_u64(&mut f)?;
+
     let bc_u = read_u64(&mut f)? as u32;
     let tree_theta_bits = read_u64(&mut f)?;
     let tree_leaf = read_u64(&mut f)? as usize;
     let tree_max_depth = read_u64(&mut f)? as usize;
+
+    let pre_smooth = read_u64(&mut f)? as usize;
+    let post_smooth = read_u64(&mut f)? as usize;
+    let smoother_u = read_u64(&mut f)? as u32;
+    let omega_bits = read_u64(&mut f)?;
+    let sor_omega_bits = read_u64(&mut f)?;
+
+    let sigma_bits = read_u64(&mut f)?;
     let radius_xy = read_u64(&mut f)? as usize;
     let delta_v_cycles = read_u64(&mut f)? as usize;
+
+    let op_stencil = match op_stencil_u {
+        0 => LaplacianStencilKind::SevenPoint,
+        1 => LaplacianStencilKind::Iso9PlusZ,
+        2 => LaplacianStencilKind::Iso27,
+        _ => return None,
+    };
+    let op_prolong = match op_prolong_u {
+        0 => ProlongationKind::Injection,
+        1 => ProlongationKind::Trilinear,
+        _ => return None,
+    };
+    let op_coarse = match op_coarse_u {
+        0 => CoarseOpKind::Rediscretize,
+        1 => CoarseOpKind::Galerkin,
+        _ => return None,
+    };
+    let op = MGOperatorSettings {
+        stencil: op_stencil,
+        prolong: op_prolong,
+        coarse_op: op_coarse,
+        iso27_alpha_bits: op_iso27_alpha_bits,
+    };
 
     let bc = match bc_u {
         0 => BoundaryCondition::DirichletZero,
         1 => BoundaryCondition::DirichletDipole,
         2 => BoundaryCondition::DirichletTreecode,
+        _ => return None,
+    };
+
+    let smoother = match smoother_u {
+        0 => MGSmoother::WeightedJacobi,
+        1 => MGSmoother::RedBlackSOR,
         _ => return None,
     };
 
@@ -3232,11 +3069,17 @@ fn load_delta_kernel_from_disk(key: &DeltaKernelKey) -> Option<DeltaKernel2D> {
         dz_bits,
         pad_xy,
         n_vac_z,
-        op: key.op,
+        op,
         bc,
         tree_theta_bits,
         tree_leaf,
         tree_max_depth,
+        pre_smooth,
+        post_smooth,
+        smoother,
+        omega_bits,
+        sor_omega_bits,
+        sigma_bits,
         radius_xy,
         delta_v_cycles,
     };
@@ -3293,6 +3136,25 @@ fn save_delta_kernel_to_disk(key: &DeltaKernelKey, dk: &DeltaKernel2D) -> std::i
     write_u64(&mut f, key.dz_bits)?;
     write_u64(&mut f, key.pad_xy as u64)?;
     write_u64(&mut f, key.n_vac_z as u64)?;
+
+    let op_stencil_u: u64 = match key.op.stencil {
+        LaplacianStencilKind::SevenPoint => 0,
+        LaplacianStencilKind::Iso9PlusZ => 1,
+        LaplacianStencilKind::Iso27 => 2,
+    };
+    let op_prolong_u: u64 = match key.op.prolong {
+        ProlongationKind::Injection => 0,
+        ProlongationKind::Trilinear => 1,
+    };
+    let op_coarse_u: u64 = match key.op.coarse_op {
+        CoarseOpKind::Rediscretize => 0,
+        CoarseOpKind::Galerkin => 1,
+    };
+    write_u64(&mut f, op_stencil_u)?;
+    write_u64(&mut f, op_prolong_u)?;
+    write_u64(&mut f, op_coarse_u)?;
+    write_u64(&mut f, key.op.iso27_alpha_bits)?;
+
     let bc_u: u64 = match key.bc {
         BoundaryCondition::DirichletZero => 0,
         BoundaryCondition::DirichletDipole => 1,
@@ -3302,6 +3164,18 @@ fn save_delta_kernel_to_disk(key: &DeltaKernelKey, dk: &DeltaKernel2D) -> std::i
     write_u64(&mut f, key.tree_theta_bits)?;
     write_u64(&mut f, key.tree_leaf as u64)?;
     write_u64(&mut f, key.tree_max_depth as u64)?;
+
+    write_u64(&mut f, key.pre_smooth as u64)?;
+    write_u64(&mut f, key.post_smooth as u64)?;
+    let smoother_u: u64 = match key.smoother {
+        MGSmoother::WeightedJacobi => 0,
+        MGSmoother::RedBlackSOR => 1,
+    };
+    write_u64(&mut f, smoother_u)?;
+    write_u64(&mut f, key.omega_bits)?;
+    write_u64(&mut f, key.sor_omega_bits)?;
+
+    write_u64(&mut f, key.sigma_bits)?;
     write_u64(&mut f, key.radius_xy as u64)?;
     write_u64(&mut f, key.delta_v_cycles as u64)?;
 
@@ -3324,6 +3198,7 @@ fn build_delta_kernel_impulse(
     mg_cfg: &DemagPoissonMGConfig,
     hyb: &HybridConfig,
     mat: &Material,
+    op: MGOperatorSettings,
 ) -> DeltaKernel2D {
     let nx = grid.nx;
     let ny = grid.ny;
@@ -3333,27 +3208,67 @@ fn build_delta_kernel_impulse(
     let ms = mat.ms;
     let ms_inv = if ms.abs() > 0.0 { 1.0 / ms } else { 0.0 };
 
-    // When building an impulse-response kernel we still want the *geometry* to be the full
-    // magnet window (all cells treated as "magnet" for face interpolation), even though the
-    // impulse magnetisation is nonzero only at one cell. We achieve this by adding a tiny
-    // nonzero marker to every cell so the is_mag() tests treat them as magnet, without
-    // materially affecting the field.
     let geom_eps = 1e-14;
 
-    // Use a dedicated MG solver for building ΔK. We want this to be a stable, repeatable
-    // impulse-response measurement, so disable warm-starting and use a fixed (possibly larger)
-    // number of V-cycles.
     let mut cfg_imp = *mg_cfg;
     cfg_imp.warm_start = false;
     cfg_imp.tol_abs = None;
     cfg_imp.tol_rel = None;
     cfg_imp.v_cycles = hyb.delta_v_cycles;
     cfg_imp.v_cycles_max = hyb.delta_v_cycles.max(1);
-    let mut mg = DemagPoissonMG::new(*grid, cfg_imp);
+
+    let mut mg = DemagPoissonMG::new_with_operator(*grid, cfg_imp, op);
 
     let r = hyb.radius_xy;
     let stride = 2 * r + 1;
     let nst = stride * stride;
+
+    let diag = mg_hybrid_diag_enabled();
+    let invar = mg_hybrid_diag_invar_enabled();
+
+    let max_r_x = cx.min(nx - 1 - cx);
+    let max_r_y = cy.min(ny - 1 - cy);
+    let max_r = max_r_x.min(max_r_y);
+    let r_big = if diag && r > 0 { ((r * 2).max(r + 4)).min(max_r) } else { 0 };
+
+    let mut tail_xx: Option<f64> = None;
+    let mut tail_yy: Option<f64> = None;
+    let mut tail_zz: Option<f64> = None;
+
+    let tail_fraction = |b_fft: &VectorField2D, b_mg: &VectorField2D, comp: usize| -> f64 {
+        if r_big <= r || ms_inv == 0.0 {
+            return 0.0;
+        }
+        let mut tot = 0.0;
+        let mut inside = 0.0;
+        let cx_i = cx as isize;
+        let cy_i = cy as isize;
+        let nx_i = nx as isize;
+        let ny_i = ny as isize;
+        let r_i = r as isize;
+        let rb_i = r_big as isize;
+        for dy in -rb_i..=rb_i {
+            for dx in -rb_i..=rb_i {
+                let tx = cx_i + dx;
+                let ty = cy_i + dy;
+                if tx < 0 || tx >= nx_i || ty < 0 || ty >= ny_i {
+                    continue;
+                }
+                let id = (ty as usize) * nx + (tx as usize);
+                let d = (b_fft.data[id][comp] - b_mg.data[id][comp]) * ms_inv;
+                let d2 = d * d;
+                tot += d2;
+                if dx.abs() <= r_i && dy.abs() <= r_i {
+                    inside += d2;
+                }
+            }
+        }
+        if tot > 0.0 {
+            ((tot - inside) / tot).max(0.0).sqrt()
+        } else {
+            0.0
+        }
+    };
 
     let mut dk = DeltaKernel2D::new(r);
     let mut dkxy_from_x = vec![0.0; nst];
@@ -3367,30 +3282,32 @@ fn build_delta_kernel_impulse(
     let mut b_fft = VectorField2D::new(*grid);
     let mut b_mg = VectorField2D::new(*grid);
 
-    // ----------------
     // X impulse
-    // ----------------
     {
-        // Magnetisation impulse at the centre cell (Mx = 1).
         for v in &mut m_imp.data {
             *v = [geom_eps, 0.0, 0.0];
         }
         let center = m_imp.idx(cx, cy);
         m_imp.data[center] = [1.0 + geom_eps, 0.0, 0.0];
 
-        // FFT reference (Newell).
         for v in &mut b_fft.data {
-            *v = [0.0, 0.0, 0.0];
+            *v = [0.0; 3];
         }
         demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
 
-        // MG response (compute field everywhere in the magnet window, even where m=0).
         for v in &mut b_mg.data {
-            *v = [0.0, 0.0, 0.0];
+            *v = [0.0; 3];
         }
         mg.build_rhs_from_m(&m_imp, ms);
+        if hyb.sigma_cells > 0.0 {
+            screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells);
+        }
         mg.solve();
         mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+
+        if diag && r_big > r {
+            tail_xx = Some(tail_fraction(&b_fft, &b_mg, 0));
+        }
 
         for dy in -(r as isize)..=(r as isize) {
             for dx in -(r as isize)..=(r as isize) {
@@ -3399,16 +3316,13 @@ fn build_delta_kernel_impulse(
                 let id = m_imp.idx(tx, ty);
                 let k = dk.idx(dx, dy);
 
-                // For an x-impulse: Bx gives ΔKxx, By gives ΔKxy.
                 dk.dkxx[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
                 dkxy_from_x[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
             }
         }
     }
 
-    // ----------------
     // Y impulse
-    // ----------------
     {
         for v in &mut m_imp.data {
             *v = [geom_eps, 0.0, 0.0];
@@ -3417,16 +3331,23 @@ fn build_delta_kernel_impulse(
         m_imp.data[center] = [geom_eps, 1.0, 0.0];
 
         for v in &mut b_fft.data {
-            *v = [0.0, 0.0, 0.0];
+            *v = [0.0; 3];
         }
         demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
 
         for v in &mut b_mg.data {
-            *v = [0.0, 0.0, 0.0];
+            *v = [0.0; 3];
         }
         mg.build_rhs_from_m(&m_imp, ms);
+        if hyb.sigma_cells > 0.0 {
+            screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells);
+        }
         mg.solve();
         mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+
+        if diag && r_big > r {
+            tail_yy = Some(tail_fraction(&b_fft, &b_mg, 1));
+        }
 
         for dy in -(r as isize)..=(r as isize) {
             for dx in -(r as isize)..=(r as isize) {
@@ -3435,16 +3356,13 @@ fn build_delta_kernel_impulse(
                 let id = m_imp.idx(tx, ty);
                 let k = dk.idx(dx, dy);
 
-                // For a y-impulse: By gives ΔKyy, Bx gives ΔKyx.
                 dk.dkyy[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
                 dkxy_from_y[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
             }
         }
     }
 
-    // ----------------
     // Z impulse
-    // ----------------
     {
         for v in &mut m_imp.data {
             *v = [geom_eps, 0.0, 0.0];
@@ -3453,16 +3371,23 @@ fn build_delta_kernel_impulse(
         m_imp.data[center] = [geom_eps, 0.0, 1.0];
 
         for v in &mut b_fft.data {
-            *v = [0.0, 0.0, 0.0];
+            *v = [0.0; 3];
         }
         demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
 
         for v in &mut b_mg.data {
-            *v = [0.0, 0.0, 0.0];
+            *v = [0.0; 3];
         }
         mg.build_rhs_from_m(&m_imp, ms);
+        if hyb.sigma_cells > 0.0 {
+            screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells);
+        }
         mg.solve();
         mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+
+        if diag && r_big > r {
+            tail_zz = Some(tail_fraction(&b_fft, &b_mg, 2));
+        }
 
         for dy in -(r as isize)..=(r as isize) {
             for dx in -(r as isize)..=(r as isize) {
@@ -3471,13 +3396,12 @@ fn build_delta_kernel_impulse(
                 let id = m_imp.idx(tx, ty);
                 let k = dk.idx(dx, dy);
 
-                // For a z-impulse: Bz gives ΔKzz.
                 dk.dkzz[k] = (b_fft.data[id][2] - b_mg.data[id][2]) * ms_inv;
             }
         }
     }
 
-    // Symmetrise xy cross-term and reduce noise by averaging the two measurements.
+    // Average cross-term from x- and y-impulses.
     for dy in -(r as isize)..=(r as isize) {
         for dx in -(r as isize)..=(r as isize) {
             let k = dk.idx(dx, dy);
@@ -3485,8 +3409,179 @@ fn build_delta_kernel_impulse(
         }
     }
 
-    // Enforce symmetry constraints (helps reduce impulse noise and tiny directional bias).
+    // Optional invariance diagnostic (debug).
+    if invar && r > 0 {
+        let r_i = r as isize;
+        let nx_i = nx as isize;
+        let ny_i = ny as isize;
+
+        let sh = 10isize;
+        let mut sx = cx as isize + sh;
+        let mut sy = cy as isize;
+        if sx - r_i < 0 || sx + r_i >= nx_i {
+            sx = cx as isize - sh;
+        }
+        if sx - r_i < 0 || sx + r_i >= nx_i {
+            sx = cx as isize;
+        }
+        if sy - r_i < 0 || sy + r_i >= ny_i {
+            sy = cy as isize;
+        }
+
+        if sx != cx as isize || sy != cy as isize {
+            let sidx = (sy as usize) * nx + (sx as usize);
+
+            let mut dkxx_s = vec![0.0f64; nst];
+            let mut dkyy_s = vec![0.0f64; nst];
+            let mut dkzz_s = vec![0.0f64; nst];
+            let mut dkxy_x_s = vec![0.0f64; nst];
+            let mut dkxy_y_s = vec![0.0f64; nst];
+
+            // Shifted x-impulse
+            for v in &mut m_imp.data {
+                *v = [geom_eps, geom_eps, geom_eps];
+            }
+            m_imp.data[sidx] = [1.0, 0.0, 0.0];
+            for v in &mut b_fft.data { *v = [0.0; 3]; }
+            demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
+            b_mg.data.iter_mut().for_each(|v| *v = [0.0; 3]);
+            mg.build_rhs_from_m(&m_imp, ms);
+            if hyb.sigma_cells > 0.0 { screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells); }
+            mg.solve();
+            mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+            for dy in -(r_i)..=r_i {
+                for dx in -(r_i)..=r_i {
+                    let tx = (sx + dx) as usize;
+                    let ty = (sy + dy) as usize;
+                    let id = m_imp.idx(tx, ty);
+                    let k = dk.idx(dx, dy);
+                    dkxx_s[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
+                    dkxy_x_s[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
+                }
+            }
+
+            // Shifted y-impulse
+            for v in &mut m_imp.data { *v = [geom_eps, geom_eps, geom_eps]; }
+            m_imp.data[sidx] = [0.0, 1.0, 0.0];
+            for v in &mut b_fft.data { *v = [0.0; 3]; }
+            demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
+            b_mg.data.iter_mut().for_each(|v| *v = [0.0; 3]);
+            mg.build_rhs_from_m(&m_imp, ms);
+            if hyb.sigma_cells > 0.0 { screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells); }
+            mg.solve();
+            mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+            for dy in -(r_i)..=r_i {
+                for dx in -(r_i)..=r_i {
+                    let tx = (sx + dx) as usize;
+                    let ty = (sy + dy) as usize;
+                    let id = m_imp.idx(tx, ty);
+                    let k = dk.idx(dx, dy);
+                    dkyy_s[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
+                    dkxy_y_s[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
+                }
+            }
+
+            // Shifted z-impulse
+            for v in &mut m_imp.data { *v = [geom_eps, geom_eps, geom_eps]; }
+            m_imp.data[sidx] = [0.0, 0.0, 1.0];
+            for v in &mut b_fft.data { *v = [0.0; 3]; }
+            demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
+            b_mg.data.iter_mut().for_each(|v| *v = [0.0; 3]);
+            mg.build_rhs_from_m(&m_imp, ms);
+            if hyb.sigma_cells > 0.0 { screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells); }
+            mg.solve();
+            mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
+            for dy in -(r_i)..=r_i {
+                for dx in -(r_i)..=r_i {
+                    let tx = (sx + dx) as usize;
+                    let ty = (sy + dy) as usize;
+                    let id = m_imp.idx(tx, ty);
+                    let k = dk.idx(dx, dy);
+                    dkzz_s[k] = (b_fft.data[id][2] - b_mg.data[id][2]) * ms_inv;
+                }
+            }
+
+            let mut dkxy_s = vec![0.0f64; nst];
+            for i in 0..nst {
+                dkxy_s[i] = 0.5 * (dkxy_x_s[i] + dkxy_y_s[i]);
+            }
+
+            let metrics = |a: &[f64], b: &[f64]| -> (f64, f64) {
+                let mut num = 0.0;
+                let mut den = 0.0;
+                let mut max_abs: f64 = 0.0;
+                for i in 0..a.len() {
+                    let d = a[i] - b[i];
+                    num += d * d;
+                    den += a[i] * a[i];
+                    max_abs = max_abs.max(d.abs());
+                }
+                let rel = if den > 0.0 { (num / den).sqrt() } else { 0.0 };
+                (rel, max_abs)
+            };
+
+            let (rel_xx, max_xx) = metrics(&dk.dkxx, &dkxx_s);
+            let (rel_yy, max_yy) = metrics(&dk.dkyy, &dkyy_s);
+            let (rel_zz, max_zz) = metrics(&dk.dkzz, &dkzz_s);
+            let (rel_xy, max_xy) = metrics(&dk.dkxy, &dkxy_s);
+
+            eprintln!(
+                "[demag_mg] ΔK invariance check: shift=({:+},{:+}) rel_L2 dkxx={:.3e} dkyy={:.3e} dkzz={:.3e} dkxy={:.3e}",
+                sx - cx as isize, sy - cy as isize, rel_xx, rel_yy, rel_zz, rel_xy
+            );
+            eprintln!(
+                "[demag_mg] ΔK invariance check: shift=({:+},{:+}) max_abs dkxx={:.3e} dkyy={:.3e} dkzz={:.3e} dkxy={:.3e}",
+                sx - cx as isize, sy - cy as isize, max_xx, max_yy, max_zz, max_xy
+            );
+        } else {
+            eprintln!("[demag_mg] ΔK invariance check skipped: insufficient interior margin for shift");
+        }
+    }
+
     dk.symmetrize(grid.dx, grid.dy);
+
+    // DC leak fix: enforce zero-sum on diagonal terms by adjusting only (0,0).
+    let center = r * stride + r;
+    let sxx0: f64 = dk.dkxx.iter().sum();
+    let syy0: f64 = dk.dkyy.iter().sum();
+    let szz0: f64 = dk.dkzz.iter().sum();
+    let sxy0: f64 = dk.dkxy.iter().sum();
+
+    dk.dkxx[center] -= sxx0;
+    dk.dkyy[center] -= syy0;
+    dk.dkzz[center] -= szz0;
+
+    let sxx1: f64 = dk.dkxx.iter().sum();
+    let syy1: f64 = dk.dkyy.iter().sum();
+    let szz1: f64 = dk.dkzz.iter().sum();
+    let sxy1: f64 = dk.dkxy.iter().sum();
+
+    if diag {
+        eprintln!(
+            "[demag_mg] ΔK diagnostics: r={}  sigma_cells={:.3}  r_big={}",
+            r, hyb.sigma_cells, r_big
+        );
+        eprintln!(
+            "[demag_mg]   uniform-bias sums (pre-fix):  Sxx={:.3e}  Syy={:.3e}  Szz={:.3e}  Sxy={:.3e}",
+            sxx0, syy0, szz0, sxy0
+        );
+        eprintln!(
+            "[demag_mg]   uniform-bias sums (post-fix): Sxx={:.3e}  Syy={:.3e}  Szz={:.3e}  Sxy={:.3e}",
+            sxx1, syy1, szz1, sxy1
+        );
+
+        if r_big > r {
+            if let Some(f) = tail_xx {
+                eprintln!("[demag_mg]   tail-mass frac (xx, outside r): {:.3e}", f);
+            }
+            if let Some(f) = tail_yy {
+                eprintln!("[demag_mg]   tail-mass frac (yy, outside r): {:.3e}", f);
+            }
+            if let Some(f) = tail_zz {
+                eprintln!("[demag_mg]   tail-mass frac (zz, outside r): {:.3e}", f);
+            }
+        }
+    }
 
     dk
 }
@@ -3494,9 +3589,6 @@ fn build_delta_kernel_impulse(
 // Cache a solver instance so we don’t rebuild hierarchies every field evaluation.
 static DEMAG_MG_CACHE: OnceLock<Mutex<Option<DemagPoissonMGHybrid>>> = OnceLock::new();
 
-/// Add demag field using Poisson+MG alternative.
-///
-/// This is intended to be called by a demag dispatcher (demag.rs) based on a method option.
 pub fn add_demag_field_poisson_mg(
     grid: &Grid2D,
     m: &VectorField2D,
@@ -3523,14 +3615,13 @@ pub fn add_demag_field_poisson_mg(
     }
 
     if let Some(s) = guard.as_mut() {
-        // Even if we didn't rebuild the hierarchy, update runtime knobs.
-        s.mg.cfg = cfg;
+        // Apply runtime knobs safely (including smoothing/smoother sanitization).
+        s.mg.apply_cfg(cfg);
         s.hyb = hyb;
         s.add_field(m, b_eff, mat);
     }
 }
 
-/// Compute demag B field using Poisson+MG into `out` (overwrites out).
 pub fn compute_demag_field_poisson_mg(
     grid: &Grid2D,
     m: &VectorField2D,
