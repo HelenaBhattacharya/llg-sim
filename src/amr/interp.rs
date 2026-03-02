@@ -82,3 +82,53 @@ pub fn sample_bilinear_unit(field: &VectorField2D, x: f64, y: f64) -> [f64; 3] {
     }
     normalize(v)
 }
+
+// ---------------------------------------------------------------------------
+// Temporal interpolation helpers (for Berger–Colella subcycling)
+// ---------------------------------------------------------------------------
+
+/// Bilinear spatial sample + linear temporal interpolation between two field snapshots.
+///
+/// `field_old` and `field_new` represent the same spatial field at two points in time.
+/// `alpha` is the fractional time: 0.0 → old, 1.0 → new.
+///
+/// Returns the *raw interpolated vector* (no normalisation).
+///
+/// Use this for fields where magnitude is physically meaningful (B_eff, B_demag).
+pub fn sample_bilinear_temporal(
+    field_old: &VectorField2D,
+    field_new: &VectorField2D,
+    x: f64,
+    y: f64,
+    alpha: f64,
+) -> [f64; 3] {
+    let v_old = sample_bilinear(field_old, x, y);
+    let v_new = sample_bilinear(field_new, x, y);
+    let one_minus_a = 1.0 - alpha;
+    [
+        one_minus_a * v_old[0] + alpha * v_new[0],
+        one_minus_a * v_old[1] + alpha * v_new[1],
+        one_minus_a * v_old[2] + alpha * v_new[2],
+    ]
+}
+
+/// Bilinear spatial sample + linear temporal interpolation, returning a *renormalised* unit vector.
+///
+/// Use this for unit-magnetisation fields `m` (ghost-cell temporal interpolation).
+///
+/// At alpha=0.0: returns sample from field_old (renormalised).
+/// At alpha=1.0: returns sample from field_new (renormalised).
+/// At alpha=0.5: returns the midpoint direction between old and new.
+pub fn sample_bilinear_temporal_unit(
+    field_old: &VectorField2D,
+    field_new: &VectorField2D,
+    x: f64,
+    y: f64,
+    alpha: f64,
+) -> [f64; 3] {
+    let v = sample_bilinear_temporal(field_old, field_new, x, y, alpha);
+    if v[0] == 0.0 && v[1] == 0.0 && v[2] == 0.0 {
+        return [0.0, 0.0, 1.0];
+    }
+    normalize(v)
+}

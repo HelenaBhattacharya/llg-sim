@@ -13,6 +13,8 @@ use crate::params::{LLGParams, Material};
 use crate::vec3::{cross, normalize};
 use crate::vector_field::VectorField2D;
 
+use rayon::prelude::*;
+
 use crate::amr::hierarchy::AmrHierarchy2D;
 use crate::amr::interp::sample_bilinear;
 
@@ -32,9 +34,17 @@ impl AmrDemagMode {
         // Backward-compatible aliases are accepted.
         let v = std::env::var("LLG_AMR_DEMAG_MODE").ok();
         match v.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
-            Some(ref s) if s == "all_fft" || s == "fft" || s == "bridgeb_fft" || s == "bridgeb" => Self::AllFft,
-            Some(ref s) if s == "mix" || s == "mg_coarse_only" || s == "mg_coarse" => Self::MixMgCoarseOnly,
-            Some(ref s) if s == "all_mg" || s == "mg" || s == "mg_uniform" || s == "mg_uniform_fine" => Self::AllMgUniformFine,
+            Some(ref s) if s == "all_fft" || s == "fft" || s == "bridgeb_fft" || s == "bridgeb" => {
+                Self::AllFft
+            }
+            Some(ref s) if s == "mix" || s == "mg_coarse_only" || s == "mg_coarse" => {
+                Self::MixMgCoarseOnly
+            }
+            Some(ref s)
+                if s == "all_mg" || s == "mg" || s == "mg_uniform" || s == "mg_uniform_fine" =>
+            {
+                Self::AllMgUniformFine
+            }
             _ => Self::AllFft,
         }
     }
@@ -134,6 +144,7 @@ fn combo_rk4(k1: [f64; 3], k2: [f64; 3], k3: [f64; 3], k4: [f64; 3]) -> [f64; 3]
     ]
 }
 
+#[cfg(debug_assertions)]
 #[inline]
 fn assert_field_finite(name: &str, f: &VectorField2D) {
     for (idx, v) in f.data.iter().enumerate() {
@@ -145,6 +156,10 @@ fn assert_field_finite(name: &str, f: &VectorField2D) {
         }
     }
 }
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn assert_field_finite(_name: &str, _f: &VectorField2D) {}
 
 /// Patch RK4 step where we only advance cells listed in `active`.
 ///
@@ -347,6 +362,34 @@ pub struct AmrStepperRK4 {
     pub b_demag_coarse: VectorField2D,
     demag_mode: AmrDemagMode,
     pub relax: bool,
+
+    // ---- Subcycling state (Berger–Colella) ----
+
+    /// Whether subcycling is enabled (env `LLG_AMR_SUBCYCLE=1`).
+    subcycle: bool,
+
+    /// Maximum subcycle ratio (env `LLG_AMR_MAX_SUBCYCLE_RATIO`).
+    /// Caps the effective subcycle ratio regardless of the number of levels.
+    /// Default: usize::MAX (no cap).
+    max_subcycle_ratio: usize,
+
+    /// Saved coarse state *before* the coarse step (for temporal ghost interpolation).
+    coarse_old: VectorField2D,
+
+    /// Saved coarse state *after* the coarse step (for temporal ghost interpolation).
+    /// Cloned from `h.coarse` post-step to avoid borrow conflicts during fine stepping.
+    coarse_new: VectorField2D,
+
+    /// Per-level old-state snapshots for parent-level temporal ghost interpolation.
+    ///
+    /// `level_old_m[0]` = saved L1 patch states (one `Vec<[f64; 3]>` per L1 patch).
+    /// `level_old_m[1]` = saved L2 patch states.
+    /// etc.
+    ///
+    /// Before stepping level L, we clone each patch's m.data into level_old_m[L-1].
+    /// After stepping, the current patch m.data serves as the "new" state.
+    /// Child-level ghosts then interpolate between old and new.
+    level_old_m: Vec<Vec<Vec<[f64; 3]>>>,
 }
 
 impl AmrStepperRK4 {
@@ -371,6 +414,21 @@ impl AmrStepperRK4 {
             h.base_grid.dz,
         );
         let b_demag_fine = VectorField2D::new(fine_grid);
+
+        // Subcycling is ON by default. Set LLG_AMR_SUBCYCLE=0 to disable.
+        let subcycle = std::env::var("LLG_AMR_SUBCYCLE")
+            .ok()
+            .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off")))
+            .unwrap_or(true);
+
+        let max_subcycle_ratio = std::env::var("LLG_AMR_MAX_SUBCYCLE_RATIO")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+
+        let coarse_old = VectorField2D::new(h.base_grid);
+        let coarse_new = VectorField2D::new(h.base_grid);
+
         Self {
             coarse_scratch,
             patch_scratch,
@@ -379,6 +437,11 @@ impl AmrStepperRK4 {
             b_demag_coarse,
             demag_mode: AmrDemagMode::from_env(),
             relax,
+            subcycle,
+            max_subcycle_ratio,
+            coarse_old,
+            coarse_new,
+            level_old_m: Vec::new(),
         }
     }
 
@@ -433,7 +496,74 @@ impl AmrStepperRK4 {
         mat: &Material,
         mask: FieldMask,
     ) {
+        let n_levels = h.num_levels();
+        if self.subcycle && n_levels > 1 {
+            self.step_subcycled(h, params, mat, mask);
+        } else {
+            self.step_flat(h, params, mat, mask);
+        }
+    }
+
+    /// Return the effective coarse time step for the current hierarchy depth.
+    ///
+    /// When subcycling is active, one call to `step()` advances by this amount.
+    /// When subcycling is off, `step()` advances by `params.dt` (the finest dt).
+    ///
+    /// Respects `LLG_AMR_MAX_SUBCYCLE_RATIO` if set: the effective ratio is capped
+    /// so `dt_coarse` never exceeds `params.dt * max_ratio`.
+    pub fn coarse_dt(&self, params: &LLGParams, h: &AmrHierarchy2D) -> f64 {
+        if !self.subcycle {
+            return params.dt;
+        }
+        let n_levels = h.num_levels();
+        let r_sq = (h.ratio * h.ratio) as f64;
+        let natural_ratio = r_sq.powi((n_levels as i32) - 1) as usize;
+        let effective_ratio = natural_ratio.min(self.max_subcycle_ratio);
+        params.dt * effective_ratio as f64
+    }
+
+    /// Query whether subcycling is active.
+    #[inline]
+    pub fn is_subcycling(&self) -> bool {
+        self.subcycle
+    }
+
+    /// Enable or disable subcycling programmatically.
+    ///
+    /// This overrides the `LLG_AMR_SUBCYCLE` env var that was read at construction time.
+    /// Useful for tests and for benchmark runners that want to switch at runtime.
+    #[inline]
+    pub fn set_subcycle(&mut self, enabled: bool) {
+        self.subcycle = enabled;
+    }
+
+    /// Set maximum subcycle ratio programmatically.
+    ///
+    /// Overrides the `LLG_AMR_MAX_SUBCYCLE_RATIO` env var. Set to `usize::MAX` to disable.
+    #[inline]
+    pub fn set_max_subcycle_ratio(&mut self, max_ratio: usize) {
+        self.max_subcycle_ratio = max_ratio;
+    }
+
+    // ================================================================
+    //  Flat stepping (original algorithm — no subcycling)
+    // ================================================================
+
+    fn step_flat(
+        &mut self,
+        h: &mut AmrHierarchy2D,
+        params: &LLGParams,
+        mat: &Material,
+        mask: FieldMask,
+    ) {
         self.sync_with_hierarchy(h);
+
+        // Trim active-cell lists so that level-L patches skip cells covered
+        // by level-(L+1) patches — those cells will be computed at the finer
+        // level and restricted back, so updating them here is wasted work.
+        // This is idempotent; the first call after a regrid does the real work,
+        // subsequent calls within the same regrid epoch are a cheap no-op.
+        h.trim_active_for_nesting();
 
         // Phase-2 Bridge B: build the flattened *uniform fine composite* magnetisation.
         //
@@ -458,191 +588,101 @@ impl AmrStepperRK4 {
         // interiors, rather than falling back to coarse.
         h.fill_patch_ghosts_from_uniform_fine(&m_fine);
 
-        let use_fine_demag_sampling = matches!(self.demag_mode, AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine);
+        let use_fine_demag_sampling = matches!(
+            self.demag_mode,
+            AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine
+        );
 
-        match self.demag_mode {
-            AmrDemagMode::AllFft => {
-                // Ensure our cached fine demag buffer matches the fine grid.
-                if self.b_demag_fine.grid.nx != m_fine.grid.nx
-                    || self.b_demag_fine.grid.ny != m_fine.grid.ny
-                    || self.b_demag_fine.grid.dx != m_fine.grid.dx
-                    || self.b_demag_fine.grid.dy != m_fine.grid.dy
-                    || self.b_demag_fine.grid.dz != m_fine.grid.dz
-                {
-                    self.b_demag_fine = VectorField2D::new(m_fine.grid);
-                }
+        // 1) Compute demag
+        self.compute_demag(h, &mut m_fine, fine_mask.as_deref(), mat);
 
-                self.b_demag_fine.set_uniform(0.0, 0.0, 0.0);
-                demag_fft_uniform::compute_demag_field_pbc(
-                    &m_fine.grid,
-                    &m_fine,
-                    &mut self.b_demag_fine,
-                    mat,
-                    0,
-                    0,
-                );
-
-                // Zero demag in vacuum cells if we have a mask.
-                if let Some(fm) = fine_mask.as_deref() {
-                    for idx in 0..m_fine.grid.n_cells() {
-                        if !fm[idx] {
-                            self.b_demag_fine.data[idx] = [0.0, 0.0, 0.0];
-                        }
-                    }
-                }
-
-                // Build a coarse-grid addend by sampling the fine demag field at coarse cell centres.
-                self.b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
-                for j in 0..h.base_grid.ny {
-                    let y = (j as f64 + 0.5) * h.base_grid.dy;
-                    for i in 0..h.base_grid.nx {
-                        let x = (i as f64 + 0.5) * h.base_grid.dx;
-                        let v = sample_bilinear(&self.b_demag_fine, x, y);
-                        let idx = h.base_grid.idx(i, j);
-                        self.b_demag_coarse.data[idx] = v;
-                    }
-                }
-            }
-            AmrDemagMode::MixMgCoarseOnly => {
-                // Stage 3A: compute demag only on the coarse grid using Poisson-MG.
-                assert_field_finite("h.coarse before MG coarse demag", &h.coarse);
-                demag_poisson_mg::compute_demag_field_poisson_mg(
-                    &h.base_grid,
-                    &h.coarse,
-                    &mut self.b_demag_coarse,
-                    mat,
-                );
-
-                // If a geometry mask is present, zero demag in vacuum.
-                if let Some(gm) = h.geom_mask.as_deref() {
-                    for idx in 0..h.base_grid.n_cells() {
-                        if !gm[idx] {
-                            self.b_demag_coarse.data[idx] = [0.0, 0.0, 0.0];
-                        }
-                    }
-                }
-                assert_field_finite("b_demag_coarse (MG coarse)", &self.b_demag_coarse);
-            }
-            AmrDemagMode::AllMgUniformFine => {
-                // Stage 3B: compute demag on the flattened uniform-fine composite using Poisson-MG,
-                // then sample back like Bridge-B.
-
-                // Ensure our cached fine demag buffer matches the fine grid.
-                if self.b_demag_fine.grid.nx != m_fine.grid.nx
-                    || self.b_demag_fine.grid.ny != m_fine.grid.ny
-                    || self.b_demag_fine.grid.dx != m_fine.grid.dx
-                    || self.b_demag_fine.grid.dy != m_fine.grid.dy
-                    || self.b_demag_fine.grid.dz != m_fine.grid.dz
-                {
-                    self.b_demag_fine = VectorField2D::new(m_fine.grid);
-                }
-
-                assert_field_finite("m_fine before MG uniform-fine demag", &m_fine);
-                demag_poisson_mg::compute_demag_field_poisson_mg(
-                    &m_fine.grid,
-                    &m_fine,
-                    &mut self.b_demag_fine,
-                    mat,
-                );
-
-                // Zero demag in vacuum cells if we have a mask.
-                if let Some(fm) = fine_mask.as_deref() {
-                    for idx in 0..m_fine.grid.n_cells() {
-                        if !fm[idx] {
-                            self.b_demag_fine.data[idx] = [0.0, 0.0, 0.0];
-                        }
-                    }
-                }
-                assert_field_finite("b_demag_fine (MG uniform fine)", &self.b_demag_fine);
-
-                // Build coarse addend by sampling the fine demag field at coarse cell centres.
-                self.b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
-                for j in 0..h.base_grid.ny {
-                    let y = (j as f64 + 0.5) * h.base_grid.dy;
-                    for i in 0..h.base_grid.nx {
-                        let x = (i as f64 + 0.5) * h.base_grid.dx;
-                        let v = sample_bilinear(&self.b_demag_fine, x, y);
-                        let idx = h.base_grid.idx(i, j);
-                        self.b_demag_coarse.data[idx] = v;
-                    }
-                }
-                assert_field_finite("b_demag_coarse (sampled from MG fine)", &self.b_demag_coarse);
-            }
-        }
-
-        // 2) Step fine patches (active interior only)
-        for (p, s) in h.patches.iter_mut().zip(self.patch_scratch.iter_mut()) {
-            let geom_mask = p.geom_mask_fine.as_deref();
-            let nxp = p.grid.nx;
-            let nyp = p.grid.ny;
-
-            if use_fine_demag_sampling {
-                // Build patch-local demag addend by sampling the fine demag field.
-                for j in 0..nyp {
-                    for i in 0..nxp {
-                        let (x, y) = p.cell_center_xy(i, j);
-                        let v = sample_bilinear(&self.b_demag_fine, x, y);
-                        let idx = p.grid.idx(i, j);
-                        s.b_add.data[idx] = v;
-
-                        if let Some(gm) = geom_mask {
-                            if !gm[idx] {
-                                s.b_add.data[idx] = [0.0, 0.0, 0.0];
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Mix mode: patches are stepped without demag (exchange/anis/etc only).
-                s.b_add.set_uniform(0.0, 0.0, 0.0);
-            }
-
-            let active = p.active.as_slice();
-            let m = &mut p.m;
-
-            step_patch_rk4_recompute_field_masked_active(
-                m, active, params, mat, s, mask, geom_mask, self.relax,
-            );
-        }
-
-        // 2b) Step level-2+ patches (active interior only)
-        for (patches_lvl, scratch_lvl) in h
-            .patches_l2plus
-            .iter_mut()
-            .zip(self.patch_scratch_l2plus.iter_mut())
+        // 2) Step fine patches (active interior only) — PARALLEL
         {
-            for (p, s) in patches_lvl.iter_mut().zip(scratch_lvl.iter_mut()) {
-                let geom_mask = p.geom_mask_fine.as_deref();
-                let nxp = p.grid.nx;
-                let nyp = p.grid.ny;
+            let b_demag_fine = &self.b_demag_fine;
+            let relax = self.relax;
+            h.patches
+                .par_iter_mut()
+                .zip(self.patch_scratch.par_iter_mut())
+                .for_each(|(p, s)| {
+                    let geom_mask = p.geom_mask_fine.as_deref();
+                    let nxp = p.grid.nx;
+                    let nyp = p.grid.ny;
 
-                if use_fine_demag_sampling {
-                    // Build patch-local demag addend by sampling the fine demag field.
-                    for j in 0..nyp {
-                        for i in 0..nxp {
-                            let (x, y) = p.cell_center_xy(i, j);
-                            let v = sample_bilinear(&self.b_demag_fine, x, y);
-                            let idx = p.grid.idx(i, j);
-                            s.b_add.data[idx] = v;
+                    if use_fine_demag_sampling {
+                        // Build patch-local demag addend by sampling the fine demag field.
+                        for j in 0..nyp {
+                            for i in 0..nxp {
+                                let (x, y) = p.cell_center_xy(i, j);
+                                let v = sample_bilinear(b_demag_fine, x, y);
+                                let idx = p.grid.idx(i, j);
+                                s.b_add.data[idx] = v;
 
-                            if let Some(gm) = geom_mask {
-                                if !gm[idx] {
-                                    s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                                if let Some(gm) = geom_mask {
+                                    if !gm[idx] {
+                                        s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                                    }
                                 }
                             }
                         }
+                    } else {
+                        // Mix mode: patches are stepped without demag (exchange/anis/etc only).
+                        s.b_add.set_uniform(0.0, 0.0, 0.0);
                     }
-                } else {
-                    // Mix mode: patches are stepped without demag (exchange/anis/etc only).
-                    s.b_add.set_uniform(0.0, 0.0, 0.0);
-                }
 
-                let active = p.active.as_slice();
-                let m = &mut p.m;
+                    let active = p.active.as_slice();
+                    let m = &mut p.m;
 
-                step_patch_rk4_recompute_field_masked_active(
-                    m, active, params, mat, s, mask, geom_mask, self.relax,
-                );
+                    step_patch_rk4_recompute_field_masked_active(
+                        m, active, params, mat, s, mask, geom_mask, relax,
+                    );
+                });
+        }
+
+        // 2b) Step level-2+ patches (active interior only) — PARALLEL per level
+        {
+            let b_demag_fine = &self.b_demag_fine;
+            let relax = self.relax;
+            for (patches_lvl, scratch_lvl) in h
+                .patches_l2plus
+                .iter_mut()
+                .zip(self.patch_scratch_l2plus.iter_mut())
+            {
+                patches_lvl
+                    .par_iter_mut()
+                    .zip(scratch_lvl.par_iter_mut())
+                    .for_each(|(p, s)| {
+                        let geom_mask = p.geom_mask_fine.as_deref();
+                        let nxp = p.grid.nx;
+                        let nyp = p.grid.ny;
+
+                        if use_fine_demag_sampling {
+                            // Build patch-local demag addend by sampling the fine demag field.
+                            for j in 0..nyp {
+                                for i in 0..nxp {
+                                    let (x, y) = p.cell_center_xy(i, j);
+                                    let v = sample_bilinear(b_demag_fine, x, y);
+                                    let idx = p.grid.idx(i, j);
+                                    s.b_add.data[idx] = v;
+
+                                    if let Some(gm) = geom_mask {
+                                        if !gm[idx] {
+                                            s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Mix mode: patches are stepped without demag (exchange/anis/etc only).
+                            s.b_add.set_uniform(0.0, 0.0, 0.0);
+                        }
+
+                        let active = p.active.as_slice();
+                        let m = &mut p.m;
+
+                        step_patch_rk4_recompute_field_masked_active(
+                            m, active, params, mat, s, mask, geom_mask, relax,
+                        );
+                    });
             }
         }
 
@@ -696,5 +736,557 @@ impl AmrStepperRK4 {
 
         // 4) Fine→coarse restriction under patches
         h.restrict_patches_to_coarse();
+    }
+
+    // ================================================================
+    //  Demag computation (shared between flat and subcycled paths)
+    // ================================================================
+
+    fn compute_demag(
+        &mut self,
+        h: &AmrHierarchy2D,
+        m_fine: &mut VectorField2D,
+        fine_mask: Option<&[bool]>,
+        mat: &Material,
+    ) {
+        match self.demag_mode {
+            AmrDemagMode::AllFft => {
+                // Ensure our cached fine demag buffer matches the fine grid.
+                if self.b_demag_fine.grid.nx != m_fine.grid.nx
+                    || self.b_demag_fine.grid.ny != m_fine.grid.ny
+                    || self.b_demag_fine.grid.dx != m_fine.grid.dx
+                    || self.b_demag_fine.grid.dy != m_fine.grid.dy
+                    || self.b_demag_fine.grid.dz != m_fine.grid.dz
+                {
+                    self.b_demag_fine = VectorField2D::new(m_fine.grid);
+                }
+
+                self.b_demag_fine.set_uniform(0.0, 0.0, 0.0);
+                demag_fft_uniform::compute_demag_field_pbc(
+                    &m_fine.grid,
+                    m_fine,
+                    &mut self.b_demag_fine,
+                    mat,
+                    0,
+                    0,
+                );
+
+                // Zero demag in vacuum cells if we have a mask.
+                if let Some(fm) = fine_mask {
+                    for idx in 0..m_fine.grid.n_cells() {
+                        if !fm[idx] {
+                            self.b_demag_fine.data[idx] = [0.0, 0.0, 0.0];
+                        }
+                    }
+                }
+
+                // Build a coarse-grid addend by sampling the fine demag field at coarse cell centres.
+                self.b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
+                for j in 0..h.base_grid.ny {
+                    let y = (j as f64 + 0.5) * h.base_grid.dy;
+                    for i in 0..h.base_grid.nx {
+                        let x = (i as f64 + 0.5) * h.base_grid.dx;
+                        let v = sample_bilinear(&self.b_demag_fine, x, y);
+                        let idx = h.base_grid.idx(i, j);
+                        self.b_demag_coarse.data[idx] = v;
+                    }
+                }
+            }
+            AmrDemagMode::MixMgCoarseOnly => {
+                // Stage 3A: compute demag only on the coarse grid using Poisson-MG.
+                assert_field_finite("h.coarse before MG coarse demag", &h.coarse);
+                demag_poisson_mg::compute_demag_field_poisson_mg(
+                    &h.base_grid,
+                    &h.coarse,
+                    &mut self.b_demag_coarse,
+                    mat,
+                );
+
+                // If a geometry mask is present, zero demag in vacuum.
+                if let Some(gm) = h.geom_mask.as_deref() {
+                    for idx in 0..h.base_grid.n_cells() {
+                        if !gm[idx] {
+                            self.b_demag_coarse.data[idx] = [0.0, 0.0, 0.0];
+                        }
+                    }
+                }
+                assert_field_finite("b_demag_coarse (MG coarse)", &self.b_demag_coarse);
+            }
+            AmrDemagMode::AllMgUniformFine => {
+                // Stage 3B: compute demag on the flattened uniform-fine composite using Poisson-MG.
+                if self.b_demag_fine.grid.nx != m_fine.grid.nx
+                    || self.b_demag_fine.grid.ny != m_fine.grid.ny
+                    || self.b_demag_fine.grid.dx != m_fine.grid.dx
+                    || self.b_demag_fine.grid.dy != m_fine.grid.dy
+                    || self.b_demag_fine.grid.dz != m_fine.grid.dz
+                {
+                    self.b_demag_fine = VectorField2D::new(m_fine.grid);
+                }
+
+                assert_field_finite("m_fine before MG uniform-fine demag", m_fine);
+                demag_poisson_mg::compute_demag_field_poisson_mg(
+                    &m_fine.grid,
+                    m_fine,
+                    &mut self.b_demag_fine,
+                    mat,
+                );
+
+                // Zero demag in vacuum cells if we have a mask.
+                if let Some(fm) = fine_mask {
+                    for idx in 0..m_fine.grid.n_cells() {
+                        if !fm[idx] {
+                            self.b_demag_fine.data[idx] = [0.0, 0.0, 0.0];
+                        }
+                    }
+                }
+                assert_field_finite("b_demag_fine (MG uniform fine)", &self.b_demag_fine);
+
+                // Build coarse addend by sampling the fine demag field at coarse cell centres.
+                self.b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
+                for j in 0..h.base_grid.ny {
+                    let y = (j as f64 + 0.5) * h.base_grid.dy;
+                    for i in 0..h.base_grid.nx {
+                        let x = (i as f64 + 0.5) * h.base_grid.dx;
+                        let v = sample_bilinear(&self.b_demag_fine, x, y);
+                        let idx = h.base_grid.idx(i, j);
+                        self.b_demag_coarse.data[idx] = v;
+                    }
+                }
+                assert_field_finite(
+                    "b_demag_coarse (sampled from MG fine)",
+                    &self.b_demag_coarse,
+                );
+            }
+        }
+    }
+
+    // ================================================================
+    //  Subcycled stepping (Berger–Colella)
+    // ================================================================
+
+    /// Berger–Colella subcycled time integration (v2).
+    ///
+    /// One call advances the simulation by `dt_coarse = params.dt * effective_ratio`.
+    /// Each level runs at its natural CFL time step: level L takes r^(2*L) substeps of
+    /// `dt_coarse / r^(2*L)`.
+    ///
+    /// v2 improvements over v1:
+    /// - **Intermediate restriction**: after child level completes its substeps,
+    ///   restrict child → parent before the parent's next substep (Berger–Colella §3).
+    /// - **Parent-level temporal ghost fill**: L2+ ghosts interpolate from their direct
+    ///   parent level's old/new states, not from L0. L1 ghosts still from L0.
+    /// - **Max subcycle ratio cap**: `LLG_AMR_MAX_SUBCYCLE_RATIO` limits dt_coarse.
+    fn step_subcycled(
+        &mut self,
+        h: &mut AmrHierarchy2D,
+        params: &LLGParams,
+        mat: &Material,
+        mask: FieldMask,
+    ) {
+        self.sync_with_hierarchy(h);
+        h.trim_active_for_nesting();
+
+        let n_levels = h.num_levels();
+        let r_sq = (h.ratio * h.ratio) as f64;
+        let r_sq_u = h.ratio * h.ratio;
+
+        // Phase 3: respect max subcycle ratio
+        let natural_ratio = r_sq.powi((n_levels as i32) - 1) as usize;
+        let effective_ratio = natural_ratio.min(self.max_subcycle_ratio);
+        let dt_coarse = params.dt * effective_ratio as f64;
+
+        // ----------------------------------------------------------
+        // 1) Save old coarse state for temporal ghost interpolation
+        // ----------------------------------------------------------
+        self.coarse_old.data.clone_from(&h.coarse.data);
+
+        // ----------------------------------------------------------
+        // 2) Compute demag ONCE on the flattened composite (Strategy A)
+        // ----------------------------------------------------------
+        let mut m_fine = h.flatten_to_uniform_fine();
+        let fine_mask = h.build_uniform_fine_mask();
+        if let Some(fm) = fine_mask.as_deref() {
+            for idx in 0..m_fine.grid.n_cells() {
+                if !fm[idx] {
+                    m_fine.data[idx] = [0.0, 0.0, 0.0];
+                }
+            }
+        }
+
+        // Initial ghost fill at t=0 (using the composite — same as flat path).
+        h.fill_patch_ghosts_from_uniform_fine(&m_fine);
+
+        let use_fine_demag_sampling = matches!(
+            self.demag_mode,
+            AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine
+        );
+
+        self.compute_demag(h, &mut m_fine, fine_mask.as_deref(), mat);
+
+        // ----------------------------------------------------------
+        // 3) Set up frozen demag addends for ALL patches (once)
+        // ----------------------------------------------------------
+        self.setup_patch_demag_addends(h, use_fine_demag_sampling);
+
+        // ----------------------------------------------------------
+        // 4) Advance coarse for ONE step of dt_coarse
+        // ----------------------------------------------------------
+        {
+            let mut params_coarse = *params;
+            params_coarse.dt = dt_coarse;
+            let geom_mask = h.geom_mask.as_deref();
+            if self.relax {
+                if let Some(gm) = geom_mask {
+                    step_llg_rk4_recompute_field_masked_relax_geom_add(
+                        &mut h.coarse,
+                        &params_coarse,
+                        mat,
+                        &mut self.coarse_scratch,
+                        mask,
+                        Some(gm),
+                        Some(&self.b_demag_coarse),
+                    );
+                } else {
+                    step_llg_rk4_recompute_field_masked_relax_add(
+                        &mut h.coarse,
+                        &params_coarse,
+                        mat,
+                        &mut self.coarse_scratch,
+                        mask,
+                        Some(&self.b_demag_coarse),
+                    );
+                }
+            } else {
+                if let Some(gm) = geom_mask {
+                    step_llg_rk4_recompute_field_masked_geom_add(
+                        &mut h.coarse,
+                        &params_coarse,
+                        mat,
+                        &mut self.coarse_scratch,
+                        mask,
+                        Some(gm),
+                        Some(&self.b_demag_coarse),
+                    );
+                } else {
+                    step_llg_rk4_recompute_field_masked_add(
+                        &mut h.coarse,
+                        &params_coarse,
+                        mat,
+                        &mut self.coarse_scratch,
+                        mask,
+                        Some(&self.b_demag_coarse),
+                    );
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 5) Save coarse_new (post-step) for temporal interpolation
+        // ----------------------------------------------------------
+        self.coarse_new.data.clone_from(&h.coarse.data);
+
+        // ----------------------------------------------------------
+        // 6) Prepare per-level old-state storage (Phase 2)
+        // ----------------------------------------------------------
+        // Ensure level_old_m has entries for each patch level.
+        // level_old_m[0] = L1 snapshots, level_old_m[1] = L2, etc.
+        {
+            let n_patch_levels = if n_levels > 1 { n_levels - 1 } else { 0 };
+            self.level_old_m.resize(n_patch_levels, Vec::new());
+
+            // L1 patches
+            if n_patch_levels >= 1 {
+                let n_l1 = h.patches.len();
+                self.level_old_m[0].resize(n_l1, Vec::new());
+            }
+            // L2+ patches
+            for k in 0..h.patches_l2plus.len() {
+                let lvl_idx = k + 1; // level_old_m index (L2 = idx 1)
+                if lvl_idx < n_patch_levels {
+                    let n_patches = h.patches_l2plus[k].len();
+                    self.level_old_m[lvl_idx].resize(n_patches, Vec::new());
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 7) Recursively advance fine levels (Berger–Colella §3 v2)
+        // ----------------------------------------------------------
+        // Recursive driver — implemented as a stack-based loop.
+        // When a Frame pops (all substeps done), intermediate restriction fires.
+        {
+            let max_level = n_levels - 1; // 0-based, highest active level
+
+            struct Frame {
+                level: usize,
+                k: usize,
+                n_substeps: usize,
+                dt_level: f64,
+                /// Fractional time within the coarse step at the start of this level's substeps.
+                t_start_frac: f64,
+                /// dt of the PARENT level (for computing local alpha in parent-level ghost fill).
+                dt_parent: f64,
+            }
+
+            let mut stack: Vec<Frame> = Vec::with_capacity(max_level);
+
+            // Compute the number of fine substeps for level 1 based on effective ratio.
+            // With max_subcycle_ratio, the effective ratio may be less than the natural ratio.
+            // Level 1 takes `effective_ratio / (natural_ratio / r²)` substeps if capped,
+            // but more precisely: dt_L1 = params.dt * r^(2*(n_levels-2)) (natural for L1).
+            // n_L1_substeps = dt_coarse / dt_L1.
+            // But dt_L1 must remain the natural CFL-limited dt for level 1.
+            let dt_l1 = if n_levels > 2 {
+                // L1's natural dt = params.dt * r^(2*(n_levels-2))
+                params.dt * r_sq.powi((n_levels as i32) - 2)
+            } else {
+                // Only 2 levels: L1 dt = params.dt
+                params.dt
+            };
+            let n_l1_substeps = (dt_coarse / dt_l1).round() as usize;
+
+            if max_level >= 1 && n_l1_substeps > 0 {
+                stack.push(Frame {
+                    level: 1,
+                    k: 0,
+                    n_substeps: n_l1_substeps,
+                    dt_level: dt_l1,
+                    t_start_frac: 0.0,
+                    dt_parent: dt_coarse,
+                });
+            }
+
+            while let Some(frame) = stack.last_mut() {
+                if frame.k >= frame.n_substeps {
+                    // All substeps at this level done.
+                    let finished_level = frame.level;
+                    stack.pop();
+
+                    // Phase 1: Intermediate restriction — child → parent
+                    h.restrict_level_to_parent(finished_level);
+
+                    continue;
+                }
+
+                let level = frame.level;
+                let k = frame.k;
+                let dt_level = frame.dt_level;
+                let dt_parent = frame.dt_parent;
+                let t_start_frac = frame.t_start_frac;
+
+                // Alpha relative to the COARSE step (for L1 ghost fill from L0)
+                let alpha_coarse = t_start_frac + (k as f64) * dt_level / dt_coarse;
+
+                // Alpha LOCAL to the parent's substep (for L2+ ghost fill from parent)
+                let alpha_local = k as f64 * dt_level / dt_parent;
+
+                // Advance substep counter NOW (before any child push).
+                frame.k += 1;
+
+                // a) Phase 2: Save old state for this level's patches
+                //    (so children can interpolate ghosts temporally from this level)
+                {
+                    let lom_idx = level - 1; // level_old_m index
+                    match level {
+                        1 => {
+                            for (pidx, p) in h.patches.iter().enumerate() {
+                                if pidx < self.level_old_m[lom_idx].len() {
+                                    self.level_old_m[lom_idx][pidx]
+                                        .clone_from(&p.m.data);
+                                }
+                            }
+                        }
+                        l if l >= 2 => {
+                            let h_idx = l - 2;
+                            if let Some(patches_lvl) = h.patches_l2plus.get(h_idx) {
+                                for (pidx, p) in patches_lvl.iter().enumerate() {
+                                    if lom_idx < self.level_old_m.len()
+                                        && pidx < self.level_old_m[lom_idx].len()
+                                    {
+                                        self.level_old_m[lom_idx][pidx]
+                                            .clone_from(&p.m.data);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // b) Temporal ghost fill for this level
+                //    Phase 2: L1 uses coarse old/new; L2+ uses parent-level old/new
+                if level == 1 {
+                    // L1 ghosts from coarse (L0) temporal interpolation
+                    h.fill_ghosts_time_interpolated(
+                        level,
+                        &self.coarse_old,
+                        &self.coarse_new,
+                        alpha_coarse,
+                    );
+                } else {
+                    // L2+ ghosts from parent level patches (Phase 2)
+                    let parent_lom_idx = level - 2; // parent's level_old_m index
+                    let empty_parent: Vec<Vec<[f64; 3]>> = Vec::new();
+                    let parent_old: &[Vec<[f64; 3]>] = if parent_lom_idx < self.level_old_m.len() {
+                        &self.level_old_m[parent_lom_idx]
+                    } else {
+                        &empty_parent
+                    };
+                    h.fill_ghosts_from_parent_temporal(
+                        level,
+                        parent_old,
+                        &self.coarse_old,
+                        &self.coarse_new,
+                        alpha_local,
+                        alpha_coarse,
+                    );
+                }
+
+                // c) Step all patches at this level with dt_level
+                {
+                    let mut params_level = *params;
+                    params_level.dt = dt_level;
+                    let relax = self.relax;
+
+                    match level {
+                        1 => {
+                            h.patches
+                                .par_iter_mut()
+                                .zip(self.patch_scratch.par_iter_mut())
+                                .for_each(|(p, s)| {
+                                    step_patch_rk4_recompute_field_masked_active(
+                                        &mut p.m,
+                                        p.active.as_slice(),
+                                        &params_level,
+                                        mat,
+                                        s,
+                                        mask,
+                                        p.geom_mask_fine.as_deref(),
+                                        relax,
+                                    );
+                                });
+                        }
+                        l if l >= 2 => {
+                            let idx_lvl = l - 2;
+                            if let (Some(patches_lvl), Some(scratch_lvl)) = (
+                                h.patches_l2plus.get_mut(idx_lvl),
+                                self.patch_scratch_l2plus.get_mut(idx_lvl),
+                            ) {
+                                patches_lvl
+                                    .par_iter_mut()
+                                    .zip(scratch_lvl.par_iter_mut())
+                                    .for_each(|(p, s)| {
+                                        step_patch_rk4_recompute_field_masked_active(
+                                            &mut p.m,
+                                            p.active.as_slice(),
+                                            &params_level,
+                                            mat,
+                                            s,
+                                            mask,
+                                            p.geom_mask_fine.as_deref(),
+                                            relax,
+                                        );
+                                    });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // d) Push child level (if it exists) for recursive advance.
+                //    The child covers the SAME time interval as the parent substep
+                //    just completed, but at finer temporal resolution.
+                if level < max_level {
+                    let child_dt = dt_level / r_sq;
+                    let child_n = r_sq_u;
+                    stack.push(Frame {
+                        level: level + 1,
+                        k: 0,
+                        n_substeps: child_n,
+                        dt_level: child_dt,
+                        // Child's t_start_frac = alpha_coarse at the start of the
+                        // parent substep that just completed.
+                        t_start_frac: alpha_coarse,
+                        dt_parent: dt_level,
+                    });
+                }
+                // Intermediate restriction happens when the child Frame pops (above).
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 8) Final restriction: ensure coarse is fully up to date
+        // ----------------------------------------------------------
+        // The intermediate restrictions above already restricted each level
+        // to its parent. But as a safety measure, do a final full restriction
+        // so the coarse grid reflects the finest data everywhere.
+        h.restrict_patches_to_coarse();
+    }
+
+    /// Pre-compute and store frozen demag addends in all patch scratch buffers.
+    ///
+    /// Called once per coarse step before the substep loop.
+    fn setup_patch_demag_addends(
+        &mut self,
+        h: &AmrHierarchy2D,
+        use_fine_demag_sampling: bool,
+    ) {
+        let b_demag_fine = &self.b_demag_fine;
+
+        // Level-1 patches
+        for (p, s) in h.patches.iter().zip(self.patch_scratch.iter_mut()) {
+            let geom_mask = p.geom_mask_fine.as_deref();
+            let nxp = p.grid.nx;
+            let nyp = p.grid.ny;
+
+            if use_fine_demag_sampling {
+                for j in 0..nyp {
+                    for i in 0..nxp {
+                        let (x, y) = p.cell_center_xy(i, j);
+                        let v = sample_bilinear(b_demag_fine, x, y);
+                        let idx = p.grid.idx(i, j);
+                        s.b_add.data[idx] = v;
+                        if let Some(gm) = geom_mask {
+                            if !gm[idx] {
+                                s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                            }
+                        }
+                    }
+                }
+            } else {
+                s.b_add.set_uniform(0.0, 0.0, 0.0);
+            }
+        }
+
+        // Level-2+ patches
+        for (patches_lvl, scratch_lvl) in h
+            .patches_l2plus
+            .iter()
+            .zip(self.patch_scratch_l2plus.iter_mut())
+        {
+            for (p, s) in patches_lvl.iter().zip(scratch_lvl.iter_mut()) {
+                let geom_mask = p.geom_mask_fine.as_deref();
+                let nxp = p.grid.nx;
+                let nyp = p.grid.ny;
+
+                if use_fine_demag_sampling {
+                    for j in 0..nyp {
+                        for i in 0..nxp {
+                            let (x, y) = p.cell_center_xy(i, j);
+                            let v = sample_bilinear(b_demag_fine, x, y);
+                            let idx = p.grid.idx(i, j);
+                            s.b_add.data[idx] = v;
+                            if let Some(gm) = geom_mask {
+                                if !gm[idx] {
+                                    s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    s.b_add.set_uniform(0.0, 0.0, 0.0);
+                }
+            }
+        }
     }
 }

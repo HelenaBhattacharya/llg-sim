@@ -302,12 +302,19 @@ impl HybridConfig {
         fn get_bool(name: &str) -> bool {
             std::env::var(name)
                 .ok()
-                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .map(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
                 .unwrap_or(false)
         }
 
         fn get_f64(name: &str) -> Option<f64> {
-            std::env::var(name).ok().and_then(|s| s.trim().parse::<f64>().ok())
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
         }
 
         let mut cfg = Self::default();
@@ -1119,7 +1126,13 @@ impl Stencil3D {
         }
     }
 
-    fn from_kind(kind: LaplacianStencilKind, dx: f64, dy: f64, dz: f64, iso27_alpha_bits: u64) -> Self {
+    fn from_kind(
+        kind: LaplacianStencilKind,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        iso27_alpha_bits: u64,
+    ) -> Self {
         match kind {
             LaplacianStencilKind::SevenPoint => Self::seven_point(dx, dy, dz),
             LaplacianStencilKind::Iso9PlusZ => Self::iso9_plus_z(dx, dy, dz),
@@ -1143,7 +1156,16 @@ impl Stencil3D {
         (k * ny + j) * nx + i
     }
 
-    fn apply_at(&self, phi: &[f64], nx: usize, ny: usize, nz: usize, i: usize, j: usize, k: usize) -> f64 {
+    fn apply_at(
+        &self,
+        phi: &[f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        i: usize,
+        j: usize,
+        k: usize,
+    ) -> f64 {
         let idc = Self::idx(nx, ny, i, j, k);
         let mut sum = self.center * phi[idc];
 
@@ -1164,7 +1186,16 @@ impl Stencil3D {
         sum
     }
 
-    fn offdiag_sum_at(&self, phi: &[f64], nx: usize, ny: usize, nz: usize, i: usize, j: usize, k: usize) -> f64 {
+    fn offdiag_sum_at(
+        &self,
+        phi: &[f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        i: usize,
+        j: usize,
+        k: usize,
+    ) -> f64 {
         let i0 = i as isize;
         let j0 = j as isize;
         let k0 = k as isize;
@@ -1183,7 +1214,13 @@ impl Stencil3D {
         sum
     }
 
-    fn galerkin_coarsen(fine: &Stencil3D, rx: usize, ry: usize, rz: usize, prolong: ProlongationKind) -> Self {
+    fn galerkin_coarsen(
+        fine: &Stencil3D,
+        rx: usize,
+        ry: usize,
+        rz: usize,
+        prolong: ProlongationKind,
+    ) -> Self {
         let ncx: usize = 9;
         let ncy: usize = 9;
         let ncz: usize = 9;
@@ -1256,7 +1293,14 @@ impl Stencil3D {
     }
 }
 
-fn apply_stencil_to_field(st: &Stencil3D, phi: &[f64], out: &mut [f64], nx: usize, ny: usize, nz: usize) {
+fn apply_stencil_to_field(
+    st: &Stencil3D,
+    phi: &[f64],
+    out: &mut [f64],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+) {
     debug_assert_eq!(phi.len(), nx * ny * nz);
     debug_assert_eq!(out.len(), nx * ny * nz);
 
@@ -1381,7 +1425,12 @@ fn prolongate_scalar(
     }
 }
 
-fn interp_1d_cell_centered(i_coarse: usize, r_i: usize, n_coarse: usize, r: usize) -> (usize, usize, f64, f64) {
+fn interp_1d_cell_centered(
+    i_coarse: usize,
+    r_i: usize,
+    n_coarse: usize,
+    r: usize,
+) -> (usize, usize, f64, f64) {
     if r == 1 {
         let i0 = i_coarse.min(n_coarse - 1);
         return (i0, i0, 1.0, 0.0);
@@ -1505,7 +1554,11 @@ impl DemagPoissonMG {
         Self::new_with_operator(grid, cfg, op)
     }
 
-    fn new_with_operator(grid: Grid2D, mut cfg: DemagPoissonMGConfig, op: MGOperatorSettings) -> Self {
+    fn new_with_operator(
+        grid: Grid2D,
+        mut cfg: DemagPoissonMGConfig,
+        op: MGOperatorSettings,
+    ) -> Self {
         sanitize_cfg_for_op(&mut cfg, op);
 
         let nx = grid.nx.max(1);
@@ -1570,16 +1623,26 @@ impl DemagPoissonMG {
 
         // Assign stencils per level.
         if !levels.is_empty() {
-            levels[0].stencil = Stencil3D::from_kind(op.stencil, levels[0].dx, levels[0].dy, levels[0].dz, op.iso27_alpha_bits);
+            levels[0].stencil = Stencil3D::from_kind(
+                op.stencil,
+                levels[0].dx,
+                levels[0].dy,
+                levels[0].dz,
+                op.iso27_alpha_bits,
+            );
             for l in 1..levels.len() {
                 let rx = levels[l - 1].nx / levels[l].nx;
                 let ry = levels[l - 1].ny / levels[l].ny;
                 let rz = levels[l - 1].nz / levels[l].nz;
 
                 levels[l].stencil = match op.coarse_op {
-                    CoarseOpKind::Rediscretize => {
-                        Stencil3D::from_kind(op.stencil, levels[l].dx, levels[l].dy, levels[l].dz, op.iso27_alpha_bits)
-                    }
+                    CoarseOpKind::Rediscretize => Stencil3D::from_kind(
+                        op.stencil,
+                        levels[l].dx,
+                        levels[l].dy,
+                        levels[l].dz,
+                        op.iso27_alpha_bits,
+                    ),
                     CoarseOpKind::Galerkin => {
                         Stencil3D::galerkin_coarsen(&levels[l - 1].stencil, rx, ry, rz, op.prolong)
                     }
@@ -1714,23 +1777,102 @@ impl DemagPoissonMG {
                 for i in 1..(nx - 1) {
                     let pi = i as isize;
 
-                    let (c_in, m_c) =
-                        m_at(pi, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (c_in, m_c) = m_at(
+                        pi, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms,
+                    );
 
-                    let (xp_in, m_xp) =
-                        m_at(pi + 1, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
-                    let (xm_in, m_xm) =
-                        m_at(pi - 1, pj, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (xp_in, m_xp) = m_at(
+                        pi + 1,
+                        pj,
+                        pk,
+                        px,
+                        py,
+                        pz,
+                        offx,
+                        offy,
+                        offz,
+                        nx_m,
+                        ny_m,
+                        mdata,
+                        ms,
+                    );
+                    let (xm_in, m_xm) = m_at(
+                        pi - 1,
+                        pj,
+                        pk,
+                        px,
+                        py,
+                        pz,
+                        offx,
+                        offy,
+                        offz,
+                        nx_m,
+                        ny_m,
+                        mdata,
+                        ms,
+                    );
 
-                    let (yp_in, m_yp) =
-                        m_at(pi, pj + 1, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
-                    let (ym_in, m_ym) =
-                        m_at(pi, pj - 1, pk, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (yp_in, m_yp) = m_at(
+                        pi,
+                        pj + 1,
+                        pk,
+                        px,
+                        py,
+                        pz,
+                        offx,
+                        offy,
+                        offz,
+                        nx_m,
+                        ny_m,
+                        mdata,
+                        ms,
+                    );
+                    let (ym_in, m_ym) = m_at(
+                        pi,
+                        pj - 1,
+                        pk,
+                        px,
+                        py,
+                        pz,
+                        offx,
+                        offy,
+                        offz,
+                        nx_m,
+                        ny_m,
+                        mdata,
+                        ms,
+                    );
 
-                    let (zp_in, m_zp) =
-                        m_at(pi, pj, pk + 1, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
-                    let (zm_in, m_zm) =
-                        m_at(pi, pj, pk - 1, px, py, pz, offx, offy, offz, nx_m, ny_m, mdata, ms);
+                    let (zp_in, m_zp) = m_at(
+                        pi,
+                        pj,
+                        pk + 1,
+                        px,
+                        py,
+                        pz,
+                        offx,
+                        offy,
+                        offz,
+                        nx_m,
+                        ny_m,
+                        mdata,
+                        ms,
+                    );
+                    let (zm_in, m_zm) = m_at(
+                        pi,
+                        pj,
+                        pk - 1,
+                        px,
+                        py,
+                        pz,
+                        offx,
+                        offy,
+                        offz,
+                        nx_m,
+                        ny_m,
+                        mdata,
+                        ms,
+                    );
 
                     let mx_p = face_val(c_in, m_c[0], xp_in, m_xp[0]);
                     let mx_m = face_val(xm_in, m_xm[0], c_in, m_c[0]);
@@ -2277,14 +2419,18 @@ impl DemagPoissonMG {
 
         if l == self.levels.len() - 1 {
             match smoother {
-                MGSmoother::WeightedJacobi => Self::smooth_weighted_jacobi(&mut self.levels[l], 80, omega_j),
+                MGSmoother::WeightedJacobi => {
+                    Self::smooth_weighted_jacobi(&mut self.levels[l], 80, omega_j)
+                }
                 MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], 80, omega_sor),
             }
             return;
         }
 
         match smoother {
-            MGSmoother::WeightedJacobi => Self::smooth_weighted_jacobi(&mut self.levels[l], pre, omega_j),
+            MGSmoother::WeightedJacobi => {
+                Self::smooth_weighted_jacobi(&mut self.levels[l], pre, omega_j)
+            }
             MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], pre, omega_sor),
         }
 
@@ -2309,7 +2455,9 @@ impl DemagPoissonMG {
         }
 
         match smoother {
-            MGSmoother::WeightedJacobi => Self::smooth_weighted_jacobi(&mut self.levels[l], post, omega_j),
+            MGSmoother::WeightedJacobi => {
+                Self::smooth_weighted_jacobi(&mut self.levels[l], post, omega_j)
+            }
             MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], post, omega_sor),
         }
     }
@@ -2408,7 +2556,12 @@ impl DemagPoissonMG {
         let _ = self.solve_with_timing();
     }
 
-    fn add_b_from_phi_on_magnet_layer(&self, m: &VectorField2D, _ms: f64, b_eff: &mut VectorField2D) {
+    fn add_b_from_phi_on_magnet_layer(
+        &self,
+        m: &VectorField2D,
+        _ms: f64,
+        b_eff: &mut VectorField2D,
+    ) {
         self.add_b_from_phi_on_magnet_layer_impl(Some(&m.data), b_eff);
     }
 
@@ -2416,7 +2569,11 @@ impl DemagPoissonMG {
         self.add_b_from_phi_on_magnet_layer_impl(None, b_eff);
     }
 
-    fn add_b_from_phi_on_magnet_layer_impl(&self, mdata_opt: Option<&[[f64; 3]]>, b_eff: &mut VectorField2D) {
+    fn add_b_from_phi_on_magnet_layer_impl(
+        &self,
+        mdata_opt: Option<&[[f64; 3]]>,
+        b_eff: &mut VectorField2D,
+    ) {
         let finest = &self.levels[0];
         let phi = &finest.phi;
 
@@ -2546,7 +2703,12 @@ struct DeltaKernelKey {
 }
 
 impl DeltaKernelKey {
-    fn new(grid: &Grid2D, mg_cfg: &DemagPoissonMGConfig, hyb: &HybridConfig, op: MGOperatorSettings) -> Self {
+    fn new(
+        grid: &Grid2D,
+        mg_cfg: &DemagPoissonMGConfig,
+        hyb: &HybridConfig,
+        op: MGOperatorSettings,
+    ) -> Self {
         Self {
             nx: grid.nx,
             ny: grid.ny,
@@ -2940,7 +3102,14 @@ static MG_TIMING_HYBRID_NS: AtomicU64 = AtomicU64::new(0);
 static MG_TIMING_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-fn mg_timing_record(rhs_ns: u64, bc_ns: u64, solve_ns: u64, grad_ns: u64, hybrid_ns: u64, total_ns: u64) {
+fn mg_timing_record(
+    rhs_ns: u64,
+    bc_ns: u64,
+    solve_ns: u64,
+    grad_ns: u64,
+    hybrid_ns: u64,
+    total_ns: u64,
+) {
     let c = MG_TIMING_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     MG_TIMING_RHS_NS.fetch_add(rhs_ns, Ordering::Relaxed);
     MG_TIMING_BC_NS.fetch_add(bc_ns, Ordering::Relaxed);
@@ -3229,7 +3398,11 @@ fn build_delta_kernel_impulse(
     let max_r_x = cx.min(nx - 1 - cx);
     let max_r_y = cy.min(ny - 1 - cy);
     let max_r = max_r_x.min(max_r_y);
-    let r_big = if diag && r > 0 { ((r * 2).max(r + 4)).min(max_r) } else { 0 };
+    let r_big = if diag && r > 0 {
+        ((r * 2).max(r + 4)).min(max_r)
+    } else {
+        0
+    };
 
     let mut tail_xx: Option<f64> = None;
     let mut tail_yy: Option<f64> = None;
@@ -3442,11 +3615,15 @@ fn build_delta_kernel_impulse(
                 *v = [geom_eps, geom_eps, geom_eps];
             }
             m_imp.data[sidx] = [1.0, 0.0, 0.0];
-            for v in &mut b_fft.data { *v = [0.0; 3]; }
+            for v in &mut b_fft.data {
+                *v = [0.0; 3];
+            }
             demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
             b_mg.data.iter_mut().for_each(|v| *v = [0.0; 3]);
             mg.build_rhs_from_m(&m_imp, ms);
-            if hyb.sigma_cells > 0.0 { screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells); }
+            if hyb.sigma_cells > 0.0 {
+                screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells);
+            }
             mg.solve();
             mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
             for dy in -(r_i)..=r_i {
@@ -3461,13 +3638,19 @@ fn build_delta_kernel_impulse(
             }
 
             // Shifted y-impulse
-            for v in &mut m_imp.data { *v = [geom_eps, geom_eps, geom_eps]; }
+            for v in &mut m_imp.data {
+                *v = [geom_eps, geom_eps, geom_eps];
+            }
             m_imp.data[sidx] = [0.0, 1.0, 0.0];
-            for v in &mut b_fft.data { *v = [0.0; 3]; }
+            for v in &mut b_fft.data {
+                *v = [0.0; 3];
+            }
             demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
             b_mg.data.iter_mut().for_each(|v| *v = [0.0; 3]);
             mg.build_rhs_from_m(&m_imp, ms);
-            if hyb.sigma_cells > 0.0 { screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells); }
+            if hyb.sigma_cells > 0.0 {
+                screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells);
+            }
             mg.solve();
             mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
             for dy in -(r_i)..=r_i {
@@ -3482,13 +3665,19 @@ fn build_delta_kernel_impulse(
             }
 
             // Shifted z-impulse
-            for v in &mut m_imp.data { *v = [geom_eps, geom_eps, geom_eps]; }
+            for v in &mut m_imp.data {
+                *v = [geom_eps, geom_eps, geom_eps];
+            }
             m_imp.data[sidx] = [0.0, 0.0, 1.0];
-            for v in &mut b_fft.data { *v = [0.0; 3]; }
+            for v in &mut b_fft.data {
+                *v = [0.0; 3];
+            }
             demag_fft_uniform::compute_demag_field(grid, &m_imp, &mut b_fft, mat);
             b_mg.data.iter_mut().for_each(|v| *v = [0.0; 3]);
             mg.build_rhs_from_m(&m_imp, ms);
-            if hyb.sigma_cells > 0.0 { screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells); }
+            if hyb.sigma_cells > 0.0 {
+                screen_rhs_gaussian_xy(&mut mg.levels[0], hyb.sigma_cells);
+            }
             mg.solve();
             mg.add_b_from_phi_on_magnet_layer_all(&mut b_mg);
             for dy in -(r_i)..=r_i {
@@ -3527,14 +3716,26 @@ fn build_delta_kernel_impulse(
 
             eprintln!(
                 "[demag_mg] ΔK invariance check: shift=({:+},{:+}) rel_L2 dkxx={:.3e} dkyy={:.3e} dkzz={:.3e} dkxy={:.3e}",
-                sx - cx as isize, sy - cy as isize, rel_xx, rel_yy, rel_zz, rel_xy
+                sx - cx as isize,
+                sy - cy as isize,
+                rel_xx,
+                rel_yy,
+                rel_zz,
+                rel_xy
             );
             eprintln!(
                 "[demag_mg] ΔK invariance check: shift=({:+},{:+}) max_abs dkxx={:.3e} dkyy={:.3e} dkzz={:.3e} dkxy={:.3e}",
-                sx - cx as isize, sy - cy as isize, max_xx, max_yy, max_zz, max_xy
+                sx - cx as isize,
+                sy - cy as isize,
+                max_xx,
+                max_yy,
+                max_zz,
+                max_xy
             );
         } else {
-            eprintln!("[demag_mg] ΔK invariance check skipped: insufficient interior margin for shift");
+            eprintln!(
+                "[demag_mg] ΔK invariance check skipped: insufficient interior margin for shift"
+            );
         }
     }
 

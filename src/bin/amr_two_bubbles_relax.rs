@@ -34,16 +34,16 @@ use std::time::Instant;
 
 use plotters::prelude::*;
 
+use llg_sim::amr::indicator::{IndicatorKind, indicator_grad2_forward};
+use llg_sim::amr::interp::sample_bilinear;
+use llg_sim::amr::regrid::maybe_regrid_nested_levels;
 use llg_sim::amr::{
     AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i, RegridPolicy,
 };
-use llg_sim::amr::indicator::indicator_grad2_forward;
-use llg_sim::amr::interp::sample_bilinear;
-use llg_sim::amr::regrid::maybe_regrid_nested_levels;
-use llg_sim::effective_field::{demag_fft_uniform, FieldMask};
+use llg_sim::effective_field::{FieldMask, demag_fft_uniform};
 use llg_sim::grid::Grid2D;
 use llg_sim::initial_states::seed_smooth_bubbles;
-use llg_sim::llg::{step_llg_rk4_recompute_field_masked_relax_add, RK4Scratch};
+use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax_add};
 use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
@@ -137,8 +137,49 @@ fn write_midline_y(path: &str, m: &VectorField2D) {
 }
 
 fn append_line(path: &str, line: &str) {
-    let mut f = OpenOptions::new().create(true).append(true).open(path).unwrap();
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
     f.write_all(line.as_bytes()).unwrap();
+}
+
+fn append_regrid_patches_csv(path: &str, h: &AmrHierarchy2D, max_level: usize, step: usize) {
+    // One row per patch per level (coarse-grid coordinates).
+    // CSV columns: step,level,patch_id,i0,j0,nx,ny
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+
+    // Level 1
+    for (pid, p) in h.patches.iter().enumerate() {
+        let r = p.coarse_rect;
+        writeln!(
+            f,
+            "{},{},{},{},{},{},{}",
+            step, 1, pid, r.i0, r.j0, r.nx, r.ny
+        )
+        .unwrap();
+    }
+
+    // Levels 2+
+    for lvl in 2..=max_level {
+        let li = lvl - 2;
+        if let Some(patches) = h.patches_l2plus.get(li) {
+            for (pid, p) in patches.iter().enumerate() {
+                let r = p.coarse_rect;
+                writeln!(
+                    f,
+                    "{},{},{},{},{},{},{}",
+                    step, lvl, pid, r.i0, r.j0, r.nx, r.ny
+                )
+                .unwrap();
+            }
+        }
+    }
 }
 
 fn rmse_and_max_delta(a: &VectorField2D, b: &VectorField2D) -> (f64, f64) {
@@ -209,21 +250,27 @@ fn union_rect(rects: &[Rect2i]) -> Option<Rect2i> {
         j1 = j1.max(r.j0 + r.ny);
         j1 = j1.max(r.j0 + r.ny);
     }
-    Some(Rect2i { i0, j0, nx: i1 - i0, ny: j1 - j0 })
+    Some(Rect2i {
+        i0,
+        j0,
+        nx: i1 - i0,
+        ny: j1 - j0,
+    })
 }
 
 fn union_rect_or_zero(rects: &[Rect2i]) -> Rect2i {
-    union_rect(rects).unwrap_or(Rect2i { i0: 0, j0: 0, nx: 0, ny: 0 })
+    union_rect(rects).unwrap_or(Rect2i {
+        i0: 0,
+        j0: 0,
+        nx: 0,
+        ny: 0,
+    })
 }
 
 fn level_patch_count(h: &AmrHierarchy2D, level: usize) -> usize {
     match level {
         1 => h.patches.len(),
-        l if l >= 2 => h
-            .patches_l2plus
-            .get(l - 2)
-            .map(|v| v.len())
-            .unwrap_or(0),
+        l if l >= 2 => h.patches_l2plus.get(l - 2).map(|v| v.len()).unwrap_or(0),
         _ => 0,
     }
 }
@@ -356,7 +403,12 @@ fn save_mesh_zoom_multilevel(
     } else if !levels.is_empty() && !levels[0].is_empty() {
         levels[0].as_slice()
     } else {
-        levels.iter().rev().find(|v| !v.is_empty()).map(|v| v.as_slice()).unwrap_or(&[])
+        levels
+            .iter()
+            .rev()
+            .find(|v| !v.is_empty())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     };
 
     let u = match union_rect(target) {
@@ -418,7 +470,9 @@ fn save_mesh_zoom_multilevel(
             RGBColor(180, 180, 180).stroke_width(1),
         )))?;
         xx = xx.saturating_add(s0);
-        if s0 == 0 { break; }
+        if s0 == 0 {
+            break;
+        }
     }
     let mut yy = ((y0 + s0 - 1) / s0) * s0;
     while yy <= y1 {
@@ -427,12 +481,17 @@ fn save_mesh_zoom_multilevel(
             RGBColor(180, 180, 180).stroke_width(1),
         )))?;
         yy = yy.saturating_add(s0);
-        if s0 == 0 { break; }
+        if s0 == 0 {
+            break;
+        }
     }
 
     // Helpers to draw solid and dashed grids per patch
     {
-        let mut draw_grid_for_level = |rects: &[Rect2i], lvl: usize, style: ShapeStyle| -> Result<(), Box<dyn std::error::Error>> {
+        let mut draw_grid_for_level = |rects: &[Rect2i],
+                                       lvl: usize,
+                                       style: ShapeStyle|
+         -> Result<(), Box<dyn std::error::Error>> {
             let s = level_spacing(lvl);
             for r in rects {
                 let gi0 = r.i0 * ref_ratio_total;
@@ -444,10 +503,18 @@ fn save_mesh_zoom_multilevel(
                 let yi0 = gj0.max(y0);
                 let xi1 = gi1.min(x1);
                 let yi1 = gj1.min(y1);
-                if xi1 <= xi0 || yi1 <= yi0 { continue; }
+                if xi1 <= xi0 || yi1 <= yi0 {
+                    continue;
+                }
 
                 chart.draw_series(std::iter::once(PathElement::new(
-                    vec![(xi0 as i32, yi0 as i32), (xi1 as i32, yi0 as i32), (xi1 as i32, yi1 as i32), (xi0 as i32, yi1 as i32), (xi0 as i32, yi0 as i32)],
+                    vec![
+                        (xi0 as i32, yi0 as i32),
+                        (xi1 as i32, yi0 as i32),
+                        (xi1 as i32, yi1 as i32),
+                        (xi0 as i32, yi1 as i32),
+                        (xi0 as i32, yi0 as i32),
+                    ],
                     style.clone().stroke_width(3),
                 )))?;
 
@@ -458,7 +525,9 @@ fn save_mesh_zoom_multilevel(
                         style.clone().stroke_width(1),
                     )))?;
                     xg = xg.saturating_add(s);
-                    if s == 0 { break; }
+                    if s == 0 {
+                        break;
+                    }
                 }
 
                 let mut yg = yi0;
@@ -468,7 +537,9 @@ fn save_mesh_zoom_multilevel(
                         style.clone().stroke_width(1),
                     )))?;
                     yg = yg.saturating_add(s);
-                    if s == 0 { break; }
+                    if s == 0 {
+                        break;
+                    }
                 }
             }
             Ok(())
@@ -487,31 +558,44 @@ fn save_mesh_zoom_multilevel(
 
     // L3+ dashed outlines only (light)
     {
-        let mut draw_outline_dashed = |rects: &[Rect2i], color: RGBColor| -> Result<(), Box<dyn std::error::Error>> {
-            for r in rects {
-                let gi0 = r.i0 * ref_ratio_total;
-                let gj0 = r.j0 * ref_ratio_total;
-                let gi1 = gi0 + r.nx * ref_ratio_total;
-                let gj1 = gj0 + r.ny * ref_ratio_total;
+        let mut draw_outline_dashed =
+            |rects: &[Rect2i], color: RGBColor| -> Result<(), Box<dyn std::error::Error>> {
+                for r in rects {
+                    let gi0 = r.i0 * ref_ratio_total;
+                    let gj0 = r.j0 * ref_ratio_total;
+                    let gi1 = gi0 + r.nx * ref_ratio_total;
+                    let gj1 = gj0 + r.ny * ref_ratio_total;
 
-                let xi0 = gi0.max(x0);
-                let yi0 = gj0.max(y0);
-                let xi1 = gi1.min(x1);
-                let yi1 = gj1.min(y1);
-                if xi1 <= xi0 || yi1 <= yi0 { continue; }
+                    let xi0 = gi0.max(x0);
+                    let yi0 = gj0.max(y0);
+                    let xi1 = gi1.min(x1);
+                    let yi1 = gj1.min(y1);
+                    if xi1 <= xi0 || yi1 <= yi0 {
+                        continue;
+                    }
 
-                chart.draw_series(std::iter::once(PathElement::new(
-                    vec![(xi0 as i32, yi0 as i32), (xi1 as i32, yi0 as i32), (xi1 as i32, yi1 as i32), (xi0 as i32, yi1 as i32), (xi0 as i32, yi0 as i32)],
-                    color.stroke_width(2),
-                )))?;
-            }
-            Ok(())
-        };
+                    chart.draw_series(std::iter::once(PathElement::new(
+                        vec![
+                            (xi0 as i32, yi0 as i32),
+                            (xi1 as i32, yi0 as i32),
+                            (xi1 as i32, yi1 as i32),
+                            (xi0 as i32, yi1 as i32),
+                            (xi0 as i32, yi0 as i32),
+                        ],
+                        color.stroke_width(2),
+                    )))?;
+                }
+                Ok(())
+            };
 
         for (k, rects) in levels.iter().enumerate() {
             let lvl = k + 1;
             if lvl >= 3 {
-                let c = if lvl == 3 { RGBColor(0, 120, 255) } else { RGBColor(160, 80, 255) };
+                let c = if lvl == 3 {
+                    RGBColor(0, 120, 255)
+                } else {
+                    RGBColor(160, 80, 255)
+                };
                 draw_outline_dashed(rects, c)?;
             }
         }
@@ -541,7 +625,7 @@ fn main() {
     let amr_max_level: usize = std::env::var("LLG_AMR_MAX_LEVEL")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1);
+        .unwrap_or(3);
 
     let out_dir = "out/amr_two_bubbles_relax";
     ensure_dir(out_dir);
@@ -560,10 +644,10 @@ fn main() {
         base_grid.dz,
     );
 
-    let steps = 2000usize;
+    let steps_base = 2000usize;
     let dt = 5e-14;
-    let out_every = 100usize;
-    let regrid_every = 100usize;
+    let out_every_base = 100usize;
+    let regrid_every_base = 100usize;
 
     // Material + params (demag ON)
     let mat = Material {
@@ -592,29 +676,68 @@ fn main() {
 
     // Initial states
     let mut m_coarse = VectorField2D::new(base_grid);
-    seed_smooth_bubbles(&mut m_coarse, &base_grid, &centers, bubble_radius, wall_width, helicity, 1.0, None);
+    seed_smooth_bubbles(
+        &mut m_coarse,
+        &base_grid,
+        &centers,
+        bubble_radius,
+        wall_width,
+        helicity,
+        1.0,
+        None,
+    );
 
     let mut m_coarse_amr = VectorField2D::new(base_grid);
-    seed_smooth_bubbles(&mut m_coarse_amr, &base_grid, &centers, bubble_radius, wall_width, helicity, 1.0, None);
+    seed_smooth_bubbles(
+        &mut m_coarse_amr,
+        &base_grid,
+        &centers,
+        bubble_radius,
+        wall_width,
+        helicity,
+        1.0,
+        None,
+    );
 
     let mut m_fine = VectorField2D::new(fine_grid);
-    seed_smooth_bubbles(&mut m_fine, &fine_grid, &centers, bubble_radius, wall_width, helicity, 1.0, None);
+    seed_smooth_bubbles(
+        &mut m_fine,
+        &fine_grid,
+        &centers,
+        bubble_radius,
+        wall_width,
+        helicity,
+        1.0,
+        None,
+    );
 
     // AMR hierarchy
     let mut h = AmrHierarchy2D::new(base_grid, m_coarse_amr, ratio, ghost);
 
-    // Policies (relative threshold in grad^2 space)
+    // Policies — default grad² relative mode, overridable via env.
+    let indicator_kind = IndicatorKind::from_env(); // defaults to Composite { frac: 0.10 }
+    let boundary_layer: usize = std::env::var("LLG_AMR_BOUNDARY_LAYER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+
+    let buffer_cells = 6usize;
     let cluster_policy = ClusterPolicy {
-        indicator_frac: 0.25,
-        buffer_cells: 6,
+        indicator: indicator_kind,
+        buffer_cells,
+        boundary_layer,
         connectivity: Connectivity::Eight,
         merge_distance: 4,
-        min_patch_area: 16,
-        max_patches: 8,
+        min_patch_area: 64,  // filter tiny slivers (< 8×8 coarse cells)
+        max_patches: 0,      // no limit — let bisection + efficiency control count
+        min_efficiency: 0.70,
+        max_flagged_fraction: 0.50,
     };
     let regrid_policy = RegridPolicy {
-        indicator_frac: cluster_policy.indicator_frac,
-        buffer_cells: cluster_policy.buffer_cells,
+        indicator: indicator_kind,
+        buffer_cells,
+        boundary_layer,
         min_change_cells: 2,
         min_area_change_frac: 0.05,
     };
@@ -624,6 +747,7 @@ fn main() {
     let regrid_levels_path = format!("{out_dir}/regrid_levels.csv");
     let regrid_attempts_path = format!("{out_dir}/regrid_attempts.csv");
     let rmse_log_path = format!("{out_dir}/rmse_log.csv");
+    let regrid_patches_path = format!("{out_dir}/regrid_patches.csv");
 
     {
         let mut f = File::create(&regrid_log_path).unwrap();
@@ -636,7 +760,9 @@ fn main() {
         let mut f2 = File::create(&regrid_levels_path).unwrap();
         let mut hdr = String::from("step");
         for lvl in 1..=amr_max_level {
-            hdr.push_str(&format!(",l{lvl}_count,l{lvl}_i0,l{lvl}_j0,l{lvl}_nx,l{lvl}_ny"));
+            hdr.push_str(&format!(
+                ",l{lvl}_count,l{lvl}_i0,l{lvl}_j0,l{lvl}_nx,l{lvl}_ny"
+            ));
         }
         hdr.push('\n');
         f2.write_all(hdr.as_bytes()).unwrap();
@@ -651,16 +777,31 @@ fn main() {
 
         let mut f4 = File::create(&rmse_log_path).unwrap();
         writeln!(f4, "step,rmse,max_delta,patches").unwrap();
+
+        let mut f5 = File::create(&regrid_patches_path).unwrap();
+        writeln!(f5, "step,level,patch_id,i0,j0,nx,ny").unwrap();
     }
 
     // Initial nested regrid
     let mut current_patches: Vec<Rect2i> = Vec::new();
-    if let Some((new_rects, stats)) = maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy) {
+    if let Some((new_rects, stats)) =
+        maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy)
+    {
         current_patches = new_rects;
         let u = union_rect_or_zero(&current_patches);
         append_line(
             &regrid_log_path,
-            &format!("0,{:.8e},{:.8e},{},{},{},{},{},{}\n", stats.max_indicator, stats.threshold, stats.flagged_cells, current_patches.len(), u.i0, u.j0, u.nx, u.ny),
+            &format!(
+                "0,{:.8e},{:.8e},{},{},{},{},{},{}\n",
+                stats.max_indicator,
+                stats.threshold,
+                stats.flagged_cells,
+                current_patches.len(),
+                u.i0,
+                u.j0,
+                u.nx,
+                u.ny
+            ),
         );
 
         // levels row
@@ -668,14 +809,44 @@ fn main() {
         for lvl in 1..=amr_max_level {
             let rects = level_rects(&h, lvl);
             let u = union_rect_or_zero(&rects);
-            row.push_str(&format!(",{},{},{},{},{}", rects.len(), u.i0, u.j0, u.nx, u.ny));
+            row.push_str(&format!(
+                ",{},{},{},{},{}",
+                rects.len(),
+                u.i0,
+                u.j0,
+                u.nx,
+                u.ny
+            ));
         }
         row.push('\n');
         append_line(&regrid_levels_path, &row);
+        // Per-patch rectangles by level (step 0)
+        append_regrid_patches_csv(&regrid_patches_path, &h, amr_max_level, 0);
     }
 
     // Stepper
     let mut stepper = AmrStepperRK4::new(&h, true);
+
+    // Subcycling awareness
+    let subcycle_active = stepper.is_subcycling();
+    let subcycle_ratio: usize = if subcycle_active {
+        (stepper.coarse_dt(&llg, &h) / llg.dt).round() as usize
+    } else {
+        1
+    };
+    let snap_up = |v: usize, r: usize| -> usize {
+        if r <= 1 { v } else { ((v + r - 1) / r) * r }
+    };
+    let steps = snap_up(steps_base, subcycle_ratio);
+    let out_every = snap_up(out_every_base, subcycle_ratio);
+    let regrid_every = snap_up(regrid_every_base, subcycle_ratio);
+    if subcycle_active {
+        eprintln!(
+            "[amr_two_bubbles_relax] SUBCYCLING ACTIVE: n_levels={}, subcycle_ratio={}, steps={}, out_every={}, regrid_every={}",
+            h.num_levels(), subcycle_ratio, steps, out_every, regrid_every
+        );
+    }
+
     let mut scratch_fine = RK4Scratch::new(fine_grid);
     let mut scratch_coarse = RK4Scratch::new(base_grid);
     let mut b_fine = VectorField2D::new(fine_grid);
@@ -697,18 +868,47 @@ fn main() {
         let m_amr_comp = h.flatten_to_uniform_fine();
         let m_amr_fine = ensure_grid(&m_amr_comp, fine_grid);
         let (rmse, maxd) = rmse_and_max_delta(&m_amr_fine, &m_fine);
-        append_line(&rmse_log_path, &format!("0,{:.8e},{:.8e},{}\n", rmse, maxd, current_patches.len()));
+        append_line(
+            &rmse_log_path,
+            &format!("0,{:.8e},{:.8e},{}\n", rmse, maxd, current_patches.len()),
+        );
 
         if do_ovf {
-            write_ovf_text(&format!("{out_dir}/ovf_coarse/m0000000.ovf"), &m_coarse, "m_coarse");
-            write_ovf_text(&format!("{out_dir}/ovf_fine/m0000000.ovf"), &m_fine, "m_fine");
-            write_ovf_text(&format!("{out_dir}/ovf_amr/m0000000.ovf"), &m_amr_fine, "m_amr");
+            write_ovf_text(
+                &format!("{out_dir}/ovf_coarse/m0000000.ovf"),
+                &m_coarse,
+                "m_coarse",
+            );
+            write_ovf_text(
+                &format!("{out_dir}/ovf_fine/m0000000.ovf"),
+                &m_fine,
+                "m_fine",
+            );
+            write_ovf_text(
+                &format!("{out_dir}/ovf_amr/m0000000.ovf"),
+                &m_amr_fine,
+                "m_amr",
+            );
         }
 
         if do_plots {
             let levels = all_level_rects(&h, amr_max_level);
-            let _ = save_patch_map(&base_grid, &levels, &format!("{out_dir}/patch_map_step0000.png"), "Patch map (L1..Lmax)");
-            let _ = save_mesh_zoom_multilevel(&m_amr_fine, &base_grid, ratio, amr_max_level, &levels, &format!("{out_dir}/mesh_zoom_step0000.png"), "Zoom mesh: in-plane angle + multi-level grid", 30);
+            let _ = save_patch_map(
+                &base_grid,
+                &levels,
+                &format!("{out_dir}/patch_map_step0000.png"),
+                "Patch map (L1..Lmax)",
+            );
+            let _ = save_mesh_zoom_multilevel(
+                &m_amr_fine,
+                &base_grid,
+                ratio,
+                amr_max_level,
+                &levels,
+                &format!("{out_dir}/mesh_zoom_step0000.png"),
+                "Zoom mesh: in-plane angle + multi-level grid",
+                30,
+            );
         }
     }
 
@@ -725,22 +925,46 @@ fn main() {
         b_fine.set_uniform(0.0, 0.0, 0.0);
         demag_fft_uniform::compute_demag_field_pbc(&fine_grid, &m_fine, &mut b_fine, &mat, 0, 0);
         t_demag_fine += t1.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(&mut m_fine, &llg, &mat, &mut scratch_fine, local_mask, Some(&b_fine));
+        step_llg_rk4_recompute_field_masked_relax_add(
+            &mut m_fine,
+            &llg,
+            &mat,
+            &mut scratch_fine,
+            local_mask,
+            Some(&b_fine),
+        );
 
         // Uniform coarse
         let t2 = Instant::now();
         b_coarse.set_uniform(0.0, 0.0, 0.0);
-        demag_fft_uniform::compute_demag_field_pbc(&base_grid, &m_coarse, &mut b_coarse, &mat, 0, 0);
+        demag_fft_uniform::compute_demag_field_pbc(
+            &base_grid,
+            &m_coarse,
+            &mut b_coarse,
+            &mat,
+            0,
+            0,
+        );
         t_demag_coarse += t2.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(&mut m_coarse, &llg, &mat, &mut scratch_coarse, local_mask, Some(&b_coarse));
+        step_llg_rk4_recompute_field_masked_relax_add(
+            &mut m_coarse,
+            &llg,
+            &mat,
+            &mut scratch_coarse,
+            local_mask,
+            Some(&b_coarse),
+        );
 
         // AMR
-        let t3 = Instant::now();
-        stepper.step(&mut h, &llg, &mat, local_mask);
-        t_amr_step += t3.elapsed().as_secs_f64();
+        let amr_due = step % subcycle_ratio == 0;
+        if amr_due {
+            let t3 = Instant::now();
+            stepper.step(&mut h, &llg, &mat, local_mask);
+            t_amr_step += t3.elapsed().as_secs_f64();
+        }
 
         // Regrid
-        if regrid_every > 0 && step % regrid_every == 0 {
+        if amr_due && regrid_every > 0 && step % regrid_every == 0 {
             let max_ind = max_indicator_coarse(&h.coarse);
             {
                 let mut row = format!("{},{:.8e}", step, max_ind);
@@ -751,22 +975,44 @@ fn main() {
                 append_line(&regrid_attempts_path, &row);
             }
 
-            if let Some((new_rects, stats)) = maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy) {
+            if let Some((new_rects, stats)) =
+                maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy)
+            {
                 current_patches = new_rects;
                 let u = union_rect_or_zero(&current_patches);
                 append_line(
                     &regrid_log_path,
-                    &format!("{},{:.8e},{:.8e},{},{},{},{},{},{}\n", step, stats.max_indicator, stats.threshold, stats.flagged_cells, current_patches.len(), u.i0, u.j0, u.nx, u.ny),
+                    &format!(
+                        "{},{:.8e},{:.8e},{},{},{},{},{},{}\n",
+                        step,
+                        stats.max_indicator,
+                        stats.threshold,
+                        stats.flagged_cells,
+                        current_patches.len(),
+                        u.i0,
+                        u.j0,
+                        u.nx,
+                        u.ny
+                    ),
                 );
 
                 let mut row = format!("{}", step);
                 for lvl in 1..=amr_max_level {
                     let rects = level_rects(&h, lvl);
                     let u = union_rect_or_zero(&rects);
-                    row.push_str(&format!(",{},{},{},{},{}", rects.len(), u.i0, u.j0, u.nx, u.ny));
+                    row.push_str(&format!(
+                        ",{},{},{},{},{}",
+                        rects.len(),
+                        u.i0,
+                        u.j0,
+                        u.nx,
+                        u.ny
+                    ));
                 }
                 row.push('\n');
                 append_line(&regrid_levels_path, &row);
+                // Per-patch rectangles by level for this accepted regrid
+                append_regrid_patches_csv(&regrid_patches_path, &h, amr_max_level, step);
             }
         }
 
@@ -775,26 +1021,58 @@ fn main() {
             let m_amr_comp = h.flatten_to_uniform_fine();
             let m_amr_fine = ensure_grid(&m_amr_comp, fine_grid);
             let (rmse, maxd) = rmse_and_max_delta(&m_amr_fine, &m_fine);
-            append_line(&rmse_log_path, &format!("{},{:.8e},{:.8e},{}\n", step, rmse, maxd, current_patches.len()));
+            append_line(
+                &rmse_log_path,
+                &format!(
+                    "{},{:.8e},{:.8e},{}\n",
+                    step,
+                    rmse,
+                    maxd,
+                    current_patches.len()
+                ),
+            );
 
             let mut lvl_counts = String::new();
             for lvl in 1..=amr_max_level {
-                if lvl > 1 { lvl_counts.push_str(" | "); }
+                if lvl > 1 {
+                    lvl_counts.push_str(" | ");
+                }
                 lvl_counts.push_str(&format!("L{} {:2}", lvl, level_patch_count(&h, lvl)));
             }
-            println!("step {:4} | rmse {:.3e} | maxΔ {:.3e} | {}", step, rmse, maxd, lvl_counts);
+            println!(
+                "step {:4} | rmse {:.3e} | maxΔ {:.3e} | {}",
+                step, rmse, maxd, lvl_counts
+            );
 
             if do_ovf {
                 let fname = format!("m{:07}.ovf", step);
-                write_ovf_text(&format!("{out_dir}/ovf_coarse/{fname}"), &m_coarse, "m_coarse");
+                write_ovf_text(
+                    &format!("{out_dir}/ovf_coarse/{fname}"),
+                    &m_coarse,
+                    "m_coarse",
+                );
                 write_ovf_text(&format!("{out_dir}/ovf_fine/{fname}"), &m_fine, "m_fine");
                 write_ovf_text(&format!("{out_dir}/ovf_amr/{fname}"), &m_amr_fine, "m_amr");
             }
 
             if do_plots {
                 let levels = all_level_rects(&h, amr_max_level);
-                let _ = save_patch_map(&base_grid, &levels, &format!("{out_dir}/patch_map_step{step:04}.png"), "Patch map (L1..Lmax)");
-                let _ = save_mesh_zoom_multilevel(&m_amr_fine, &base_grid, ratio, amr_max_level, &levels, &format!("{out_dir}/mesh_zoom_step{step:04}.png"), "Zoom mesh: in-plane angle + multi-level grid", 30);
+                let _ = save_patch_map(
+                    &base_grid,
+                    &levels,
+                    &format!("{out_dir}/patch_map_step{step:04}.png"),
+                    "Patch map (L1..Lmax)",
+                );
+                let _ = save_mesh_zoom_multilevel(
+                    &m_amr_fine,
+                    &base_grid,
+                    ratio,
+                    amr_max_level,
+                    &levels,
+                    &format!("{out_dir}/mesh_zoom_step{step:04}.png"),
+                    "Zoom mesh: in-plane angle + multi-level grid",
+                    30,
+                );
             }
         }
     }
@@ -809,13 +1087,30 @@ fn main() {
     write_csv_ij_m(&format!("{out_dir}/amr_fine_final.csv"), &m_amr_fine_final);
 
     write_midline_y(&format!("{out_dir}/lineout_uniform_mid_y.csv"), &m_fine);
-    write_midline_y(&format!("{out_dir}/lineout_amr_mid_y.csv"), &m_amr_fine_final);
+    write_midline_y(
+        &format!("{out_dir}/lineout_amr_mid_y.csv"),
+        &m_amr_fine_final,
+    );
 
     println!();
     println!("AMR two-bubbles relaxation benchmark (demag ON)");
-    println!("Base grid: {} x {}   dx={:.3e} dy={:.3e} dz={:.3e}", base_grid.nx, base_grid.ny, base_grid.dx, base_grid.dy, base_grid.dz);
-    println!("Fine grid: {} x {}   dx={:.3e} dy={:.3e}", fine_grid.nx, fine_grid.ny, fine_grid.dx, fine_grid.dy);
+    println!(
+        "Base grid: {} x {}   dx={:.3e} dy={:.3e} dz={:.3e}",
+        base_grid.nx, base_grid.ny, base_grid.dx, base_grid.dy, base_grid.dz
+    );
+    println!(
+        "Fine grid: {} x {}   dx={:.3e} dy={:.3e}",
+        fine_grid.nx, fine_grid.ny, fine_grid.dx, fine_grid.dy
+    );
     println!("Steps: {}   dt={:.3e}", steps, dt);
+    if subcycle_active {
+        println!(
+            "Subcycling: ON  n_levels={}  ratio={}  AMR coarse steps: ~{}",
+            h.num_levels(), subcycle_ratio, steps / subcycle_ratio.max(1)
+        );
+    } else {
+        println!("Subcycling: OFF");
+    }
     println!("Outputs: {out_dir}");
     println!();
     println!("Timing:");

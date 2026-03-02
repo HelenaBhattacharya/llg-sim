@@ -248,6 +248,80 @@ def rects_for_step(rows: List[Dict[str, int]], step: int) -> Tuple[Optional[Rect
 
     return mk("l1"), mk("l2"), mk("l3")
 
+def load_regrid_patches_csv(path: Path) -> List[Dict[str, int]]:
+    """
+    step,level,patch_id,i0,j0,nx,ny
+    """
+    rows: List[Dict[str, int]] = []
+    if not path.exists():
+        return rows
+    lines = path.read_text().splitlines()
+    if not lines:
+        return rows
+
+    header = lines[0].strip().split(",")
+    idx = {k: i for i, k in enumerate(header)}
+
+    def get_int(parts: List[str], key: str, default: int = 0) -> int:
+        if key not in idx:
+            return default
+        try:
+            return int(parts[idx[key]])
+        except Exception:
+            return default
+
+    for ln in lines[1:]:
+        s = ln.strip()
+        if not s:
+            continue
+        parts = s.split(",")
+        if len(parts) < len(header):
+            continue
+        rows.append({
+            "step": get_int(parts, "step", 0),
+            "level": get_int(parts, "level", 0),
+            "patch_id": get_int(parts, "patch_id", 0),
+            "i0": get_int(parts, "i0", 0),
+            "j0": get_int(parts, "j0", 0),
+            "nx": get_int(parts, "nx", 0),
+            "ny": get_int(parts, "ny", 0),
+        })
+
+    rows.sort(key=lambda r: (r["step"], r["level"], r["patch_id"]))
+    return rows
+
+
+def patch_rects_for_step(rows: List[Dict[str, int]], step: int, max_level: int = 3) -> Dict[int, List[Rect]]:
+    """
+    Return level -> list of Rect for the latest step <= requested.
+    """
+    out: Dict[int, List[Rect]] = {lvl: [] for lvl in range(1, max_level + 1)}
+    if not rows:
+        return out
+
+    # Find the latest logged step <= requested
+    latest = None
+    for r in rows:
+        if r["step"] <= step:
+            latest = r["step"]
+        else:
+            break
+    if latest is None:
+        latest = rows[0]["step"]
+
+    for r in rows:
+        if r["step"] != latest:
+            continue
+        lvl = r["level"]
+        if lvl < 1 or lvl > max_level:
+            continue
+        nx = r["nx"]
+        ny = r["ny"]
+        if nx <= 0 or ny <= 0:
+            continue
+        out[lvl].append(Rect(i0=r["i0"], j0=r["j0"], nx=nx, ny=ny))
+
+    return out
 
 # ----------------------------
 # Plotting utilities
@@ -330,9 +404,9 @@ def warp_surface_pyvista(
     offscreen: bool = True,
     mesh_overlay: bool = False,
     coarse_field: Optional[OvfField] = None,
-    l1_rect: Optional[Rect] = None,
-    l2_rect: Optional[Rect] = None,
-    l3_rect: Optional[Rect] = None,
+    l1_rects: Optional[List[Rect]] = None,
+    l2_rects: Optional[List[Rect]] = None,
+    l3_rects: Optional[List[Rect]] = None,
     args_local: Any = None,
 ) -> None:
     pv = try_import_pyvista()
@@ -503,24 +577,27 @@ def warp_surface_pyvista(
             add_grid_in_rect(full_rect, level=0, color_name="lightgray", width=2, stride_min=l0_stride_fine)
         )
 
-        # L1 + L2 patches
-        if l1_rect is not None:
-            a = add_rect_outline(l1_rect, "black", width=3)
-            if a is not None:
-                overlay_actors.append(a)
-            overlay_actors.extend(add_grid_in_rect(l1_rect, level=1, color_name="black", width=1))
+        # L1/L2/L3 patches (per-patch lists)
+        if l1_rects:
+            for r in l1_rects:
+                a = add_rect_outline(r, "black", width=3)
+                if a is not None:
+                    overlay_actors.append(a)
+                overlay_actors.extend(add_grid_in_rect(r, level=1, color_name="black", width=1))
 
-        if l2_rect is not None:
-            a = add_rect_outline(l2_rect, "red", width=3)
-            if a is not None:
-                overlay_actors.append(a)
-            overlay_actors.extend(add_grid_in_rect(l2_rect, level=2, color_name="red", width=1))
+        if l2_rects:
+            for r in l2_rects:
+                a = add_rect_outline(r, "red", width=3)
+                if a is not None:
+                    overlay_actors.append(a)
+                overlay_actors.extend(add_grid_in_rect(r, level=2, color_name="red", width=1))
 
-        if l3_rect is not None:
-            a = add_rect_outline(l3_rect, "dodgerblue", width=3)
-            if a is not None:
-                overlay_actors.append(a)
-            overlay_actors.extend(add_grid_in_rect(l3_rect, level=3, color_name="dodgerblue", width=1))
+        if l3_rects:
+            for r in l3_rects:
+                a = add_rect_outline(r, "dodgerblue", width=3)
+                if a is not None:
+                    overlay_actors.append(a)
+                overlay_actors.extend(add_grid_in_rect(r, level=3, color_name="dodgerblue", width=1))
     # (Glyphs are handled lazily in interactive toggles below)
 
     # Interactive toggles (only meaningful for --show)
@@ -727,13 +804,25 @@ def main() -> None:
     fine = load_ovf_text(f_fine)
     amr = load_ovf_text(f_amr)
 
-    l1_rect: Optional[Rect] = None
-    l2_rect: Optional[Rect] = None
-    l3_rect: Optional[Rect] = None
+    l1_rects: Optional[List[Rect]] = None
+    l2_rects: Optional[List[Rect]] = None
+    l3_rects: Optional[List[Rect]] = None
+
     if args.mesh_overlay:
-        mesh_log = Path(args.mesh_log) if args.mesh_log else (root / "regrid_levels.csv")
-        rows = load_regrid_levels_csv(mesh_log)
-        l1_rect, l2_rect, l3_rect = rects_for_step(rows, step)
+        patches_csv = root / "regrid_patches.csv"
+        if patches_csv.exists():
+            rows_p = load_regrid_patches_csv(patches_csv)
+            d = patch_rects_for_step(rows_p, step, max_level=3)
+            l1_rects = d.get(1, [])
+            l2_rects = d.get(2, [])
+            l3_rects = d.get(3, [])
+        else:
+            mesh_log = Path(args.mesh_log) if args.mesh_log else (root / "regrid_levels.csv")
+            rows = load_regrid_levels_csv(mesh_log)
+            l1, l2, l3 = rects_for_step(rows, step)
+            l1_rects = [l1] if l1 is not None else []
+            l2_rects = [l2] if l2 is not None else []
+            l3_rects = [l3] if l3 is not None else []
 
     # 2D plots
     save_angle_map(out_dir / f"angle_coarse_{step:07d}.png", coarse, origin=origin)
@@ -770,9 +859,9 @@ def main() -> None:
                     offscreen=not args.show,
                     mesh_overlay=args.mesh_overlay,
                     coarse_field=coarse,
-                    l1_rect=l1_rect,
-                    l2_rect=l2_rect,
-                    l3_rect=l3_rect,
+                    l1_rects=l1_rects,
+                    l2_rects=l2_rects,
+                    l3_rects=l3_rects,
                     args_local=args,
                 )
             except Exception as e:

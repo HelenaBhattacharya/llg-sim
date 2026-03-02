@@ -1,199 +1,256 @@
 // src/bin/amr_masked_disk_relax.rs
 //
-// Stage-2C AMR benchmark: masked disk (geometry mask), demag OFF.
-// Purpose:
-//   - Start geometry masking validation on top of working Stage-2B AMR.
-//   - Compare AMR vs uniform-fine for a masked disk sample.
+// AMR masked-disk relaxation benchmark (demag OFF)
+// ------------------------------------------------
+// Standardised AMR benchmark output contract matching:
+//   - amr_vortex_relax.rs
+//   - amr_two_bubbles_relax.rs
 //
-// Output: out/amr_masked_disk_relax/
+// Physics:
+//   - exchange + uniaxial anisotropy (FieldMask::ExchAnis)
+//   - demag OFF
+//   - geometry mask: disk (vacuum outside disk forced to m=(0,0,0))
 //
-// Notes:
-// - Uses exchange + uniaxial anisotropy only (FieldMask::ExchAnis).
-// - Geometry is a disk mask: magnetisation outside disk is forced to zero.
-// - We compute metrics only INSIDE the mask.
-// - Patch selection uses clustering on the coarse field's mz proxy (to avoid boundary-to-vacuum dominating the indicator).
+// AMR:
+//   - nested refinement levels L1..LLG_AMR_MAX_LEVEL (ratio=2)
+//   - periodic regrid with a grad^2 relative indicator on the coarse grid,
+//     evaluated with the geometry mask so vacuum does not dominate.
+//
+// Outputs in out/amr_masked_disk_relax:
+//   - patch_map_stepXXXX.png              : patch rectangles by refinement level [--plots]
+//   - mesh_zoom_stepXXXX.png              : in-plane angle + multi-level grid overlay [--plots]
+//   - regrid_log.csv                      : accepted regrid events summary
+//   - regrid_levels.csv                   : per-accept union summaries for L1..Lmax
+//   - regrid_attempts.csv                 : per-check diagnostics (max_indicator + per-level counts)
+//   - regrid_patches.csv                  : per-patch rectangles (step,level,patch_id,i0,j0,nx,ny)
+//   - rmse_log.csv                        : masked AMR vs uniform fine RMSE vs time
+//   - ovf_coarse/mXXXXXXX.ovf             : uniform coarse OVFs [--ovf]
+//   - ovf_fine/mXXXXXXX.ovf               : uniform fine reference OVFs [--ovf]
+//   - ovf_amr/mXXXXXXX.ovf                : AMR composite OVFs (masked) [--ovf]
+//   - *_final.csv                         : final states (coarse/fine/amr)
+//   - lineout_*_mid_y.csv                 : midline profiles
+//
+// Run:
+//   LLG_AMR_MAX_LEVEL=3 cargo run --release --bin amr_masked_disk_relax -- --ovf --plots
+//
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::time::Instant;
+
+use plotters::prelude::*;
+
+use llg_sim::amr::indicator::IndicatorKind;
+use llg_sim::amr::regrid::maybe_regrid_nested_levels;
 use llg_sim::amr::{
-    AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i,
-    compute_patch_rects_clustered_from_indicator,
+    AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i, RegridPolicy,
 };
 use llg_sim::effective_field::FieldMask;
-use llg_sim::energy::compute_energy_geom;
-use llg_sim::geometry_mask::{Mask2D, mask_disk};
+use llg_sim::geometry_mask::{Mask2D, MaskShape, mask_disk};
 use llg_sim::grid::Grid2D;
 use llg_sim::initial_states::{apply_mask_zero, init_vortex};
-use llg_sim::llg::RK4Scratch;
+use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax_geom};
 use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
 
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-
-fn ensure_out_dir() -> io::Result<PathBuf> {
-    let out = PathBuf::from("out").join("amr_masked_disk_relax");
-    fs::create_dir_all(&out)?;
-    Ok(out)
+fn ensure_dir(path: &str) {
+    if !Path::new(path).exists() {
+        fs::create_dir_all(path).unwrap();
+    }
 }
 
-fn write_run_info(
-    path: &Path,
-    base: &Grid2D,
-    ratio: usize,
-    ghost: usize,
-    n_steps: usize,
-    disk_radius: f64,
-    vortex_center: (f64, f64),
-    polarity: f64,
-    chirality: f64,
-    core_radius: f64,
-    cluster_policy: ClusterPolicy,
-    params: &LLGParams,
-    mat: &Material,
-) -> io::Result<()> {
-    let mut f = fs::File::create(path)?;
-    writeln!(
-        f,
-        "AMR masked disk relaxation benchmark (Stage 2C, demag OFF)"
-    )?;
-    writeln!(f, "")?;
-
-    writeln!(
-        f,
-        "Base grid: nx={} ny={} dx={:.6e} dy={:.6e} dz={:.6e}",
-        base.nx, base.ny, base.dx, base.dy, base.dz
-    )?;
-    writeln!(f, "AMR: ratio={} ghost={}", ratio, ghost)?;
-    writeln!(f, "Steps: {}", n_steps)?;
-    writeln!(f, "")?;
-
-    writeln!(f, "Disk geometry mask:")?;
-    writeln!(f, "  radius: {:.6e}", disk_radius)?;
-    writeln!(f, "")?;
-
-    writeln!(f, "Vortex initial state (masked):")?;
-    writeln!(
-        f,
-        "  center:       ({:.6e}, {:.6e})",
-        vortex_center.0, vortex_center.1
-    )?;
-    writeln!(f, "  polarity:     {:.6e}", polarity)?;
-    writeln!(f, "  chirality:    {:.6e}", chirality)?;
-    writeln!(f, "  core_radius:  {:.6e}", core_radius)?;
-    writeln!(f, "")?;
-
-    writeln!(f, "Clustering policy (for initial static patches):")?;
-    writeln!(
-        f,
-        "  indicator_frac:   {:.6e}",
-        cluster_policy.indicator_frac
-    )?;
-    writeln!(f, "  buffer_cells:     {}", cluster_policy.buffer_cells)?;
-    writeln!(f, "  connectivity:     {:?}", cluster_policy.connectivity)?;
-    writeln!(f, "  merge_distance:   {}", cluster_policy.merge_distance)?;
-    writeln!(f, "  min_patch_area:   {}", cluster_policy.min_patch_area)?;
-    writeln!(f, "  max_patches:      {}", cluster_policy.max_patches)?;
-    writeln!(f, "")?;
-
-    writeln!(f, "LLG params:")?;
-    writeln!(f, "  gamma: {:.6e}", params.gamma)?;
-    writeln!(f, "  alpha: {:.6e}", params.alpha)?;
-    writeln!(f, "  dt:    {:.6e}", params.dt)?;
-    writeln!(
-        f,
-        "  b_ext: [{:.6e}, {:.6e}, {:.6e}]",
-        params.b_ext[0], params.b_ext[1], params.b_ext[2]
-    )?;
-    writeln!(f, "")?;
-
-    writeln!(f, "Material:")?;
-    writeln!(f, "  Ms:   {:.6e}", mat.ms)?;
-    writeln!(f, "  Aex:  {:.6e}", mat.a_ex)?;
-    writeln!(f, "  Ku:   {:.6e}", mat.k_u)?;
-    writeln!(
-        f,
-        "  easy: [{:.6e}, {:.6e}, {:.6e}]",
-        mat.easy_axis[0], mat.easy_axis[1], mat.easy_axis[2]
-    )?;
-    writeln!(f, "  demag: {}", mat.demag)?;
-    writeln!(f, "  demag_method: {:?}", mat.demag_method)?;
-    Ok(())
+fn idx(i: usize, j: usize, nx: usize) -> usize {
+    j * nx + i
 }
 
-fn write_csv_field(path: &Path, field: &VectorField2D) -> io::Result<()> {
-    let mut f = fs::File::create(path)?;
-    writeln!(f, "i,j,x_m,y_m,mx,my,mz")?;
-    let nx = field.grid.nx;
-    let ny = field.grid.ny;
-    for j in 0..ny {
-        let y = (j as f64 + 0.5) * field.grid.dy;
-        for i in 0..nx {
-            let x = (i as f64 + 0.5) * field.grid.dx;
-            let idx = field.idx(i, j);
-            let v = field.data[idx];
-            writeln!(
-                f,
-                "{},{},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e}",
-                i, j, x, y, v[0], v[1], v[2]
-            )?;
+fn pow_usize(mut base: usize, mut exp: usize) -> usize {
+    let mut out = 1usize;
+    while exp > 0 {
+        if (exp & 1) == 1 {
+            out = out.saturating_mul(base);
         }
-    }
-    Ok(())
-}
-
-fn write_lineout_mid_y(path: &Path, field: &VectorField2D) -> io::Result<()> {
-    let mut f = fs::File::create(path)?;
-    writeln!(f, "i,x_m,mx,my,mz")?;
-    let nx = field.grid.nx;
-    let j = field.grid.ny / 2;
-    for i in 0..nx {
-        let x = (i as f64 + 0.5) * field.grid.dx;
-        let idx = field.idx(i, j);
-        let v = field.data[idx];
-        writeln!(f, "{},{:.9e},{:.9e},{:.9e},{:.9e}", i, x, v[0], v[1], v[2])?;
-    }
-    Ok(())
-}
-
-fn mz_proxy(field: &VectorField2D) -> VectorField2D {
-    let mut out = VectorField2D::new(field.grid);
-    for idx in 0..field.grid.n_cells() {
-        out.data[idx] = [0.0, 0.0, field.data[idx][2]];
+        exp >>= 1;
+        if exp > 0 {
+            base = base.saturating_mul(base);
+        }
     }
     out
 }
 
-// Upsample the base-grid mask to the uniform-fine grid so the discretised geometry is identical between AMR and the uniform-fine reference.
-fn upsample_mask_from_base(
-    base_mask: &Mask2D,
-    base: &Grid2D,
-    ratio: usize,
-    fine_grid: &Grid2D,
-) -> Mask2D {
-    assert_eq!(base_mask.len(), base.n_cells());
-    assert_eq!(fine_grid.nx, base.nx * ratio);
-    assert_eq!(fine_grid.ny, base.ny * ratio);
+fn write_ovf_text(path: &str, m: &VectorField2D, title: &str) {
+    let mut f = File::create(path).unwrap();
+    let nx = m.grid.nx;
+    let ny = m.grid.ny;
+    let dx = m.grid.dx;
+    let dy = m.grid.dy;
+    let dz = m.grid.dz;
 
-    let fine_nx = fine_grid.nx;
-    let mut out: Mask2D = vec![false; fine_grid.n_cells()];
+    writeln!(f, "# OOMMF OVF 2.0").unwrap();
+    writeln!(f, "# Segment count: 1").unwrap();
+    writeln!(f, "# Begin: Segment").unwrap();
+    writeln!(f, "# Begin: Header").unwrap();
+    writeln!(f, "# Title: {}", title).unwrap();
+    writeln!(f, "# meshtype: rectangular").unwrap();
+    writeln!(f, "# meshunit: m").unwrap();
+    writeln!(f, "# xbase: {:.16e}", 0.5 * dx).unwrap();
+    writeln!(f, "# ybase: {:.16e}", 0.5 * dy).unwrap();
+    writeln!(f, "# zbase: {:.16e}", 0.5 * dz).unwrap();
+    writeln!(f, "# xstepsize: {:.16e}", dx).unwrap();
+    writeln!(f, "# ystepsize: {:.16e}", dy).unwrap();
+    writeln!(f, "# zstepsize: {:.16e}", dz).unwrap();
+    writeln!(f, "# xnodes: {}", nx).unwrap();
+    writeln!(f, "# ynodes: {}", ny).unwrap();
+    writeln!(f, "# znodes: 1").unwrap();
+    writeln!(f, "# valuedim: 3").unwrap();
+    writeln!(f, "# End: Header").unwrap();
+    writeln!(f, "# Begin: Data Text").unwrap();
 
-    for j in 0..base.ny {
-        for i in 0..base.nx {
-            let v = base_mask[i + base.nx * j];
-            let i0 = i * ratio;
-            let j0 = j * ratio;
-            for fj in 0..ratio {
-                for fi in 0..ratio {
-                    let ii = i0 + fi;
-                    let jj = j0 + fj;
-                    out[ii + fine_nx * jj] = v;
-                }
+    for j in 0..ny {
+        for i in 0..nx {
+            let v = m.data[m.grid.idx(i, j)];
+            writeln!(f, "{:.16e} {:.16e} {:.16e}", v[0], v[1], v[2]).unwrap();
+        }
+    }
+
+    writeln!(f, "# End: Data Text").unwrap();
+    writeln!(f, "# End: Segment").unwrap();
+}
+
+fn write_csv_ij_m(path: &str, m: &VectorField2D) {
+    let f = File::create(path).unwrap();
+    let mut w = BufWriter::new(f);
+    writeln!(w, "i,j,mx,my,mz").unwrap();
+    for j in 0..m.grid.ny {
+        for i in 0..m.grid.nx {
+            let v = m.data[idx(i, j, m.grid.nx)];
+            writeln!(w, "{},{},{:.8e},{:.8e},{:.8e}", i, j, v[0], v[1], v[2]).unwrap();
+        }
+    }
+    w.flush().unwrap();
+}
+
+fn write_midline_y(path: &str, m: &VectorField2D) {
+    let f = File::create(path).unwrap();
+    let mut w = BufWriter::new(f);
+    writeln!(w, "i,mx,my,mz").unwrap();
+    let j = m.grid.ny / 2;
+    for i in 0..m.grid.nx {
+        let v = m.data[idx(i, j, m.grid.nx)];
+        writeln!(w, "{},{:.8e},{:.8e},{:.8e}", i, v[0], v[1], v[2]).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn append_line(path: &str, line: &str) {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    f.write_all(line.as_bytes()).unwrap();
+}
+
+fn append_regrid_patches_csv(path: &str, h: &AmrHierarchy2D, max_level: usize, step: usize) {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    // L1
+    for (pid, p) in h.patches.iter().enumerate() {
+        let r = p.coarse_rect;
+        writeln!(
+            f,
+            "{},{},{},{},{},{},{}",
+            step, 1, pid, r.i0, r.j0, r.nx, r.ny
+        )
+        .unwrap();
+    }
+    // L2+
+    for lvl in 2..=max_level {
+        let li = lvl - 2;
+        if let Some(patches) = h.patches_l2plus.get(li) {
+            for (pid, p) in patches.iter().enumerate() {
+                let r = p.coarse_rect;
+                writeln!(
+                    f,
+                    "{},{},{},{},{},{},{}",
+                    step, lvl, pid, r.i0, r.j0, r.nx, r.ny
+                )
+                .unwrap();
             }
         }
     }
+}
 
-    out
+fn flatten_to_target_grid(h: &AmrHierarchy2D, target: Grid2D) -> VectorField2D {
+    let m = h.flatten_to_uniform_fine();
+    if m.grid.nx == target.nx
+        && m.grid.ny == target.ny
+        && m.grid.dx == target.dx
+        && m.grid.dy == target.dy
+        && m.grid.dz == target.dz
+    {
+        m
+    } else {
+        m.resample_to_grid(target)
+    }
+}
+
+fn union_rect(rects: &[Rect2i]) -> Option<Rect2i> {
+    if rects.is_empty() {
+        return None;
+    }
+    let mut i0 = rects[0].i0;
+    let mut j0 = rects[0].j0;
+    let mut i1 = rects[0].i0 + rects[0].nx;
+    let mut j1 = rects[0].j0 + rects[0].ny;
+    for r in rects.iter().skip(1) {
+        i0 = i0.min(r.i0);
+        j0 = j0.min(r.j0);
+        i1 = i1.max(r.i0 + r.nx);
+        j1 = j1.max(r.j0 + r.ny);
+    }
+    Some(Rect2i {
+        i0,
+        j0,
+        nx: i1 - i0,
+        ny: j1 - j0,
+    })
+}
+
+fn union_rect_or_zero(rects: &[Rect2i]) -> Rect2i {
+    union_rect(rects).unwrap_or(Rect2i {
+        i0: 0,
+        j0: 0,
+        nx: 0,
+        ny: 0,
+    })
+}
+
+fn level_patch_count(h: &AmrHierarchy2D, level: usize) -> usize {
+    match level {
+        1 => h.patches.len(),
+        l if l >= 2 => h.patches_l2plus.get(l - 2).map(|v| v.len()).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn level_rects(h: &AmrHierarchy2D, level: usize) -> Vec<Rect2i> {
+    match level {
+        1 => h.patches.iter().map(|p| p.coarse_rect).collect(),
+        l if l >= 2 => h
+            .patches_l2plus
+            .get(l - 2)
+            .map(|v| v.iter().map(|p| p.coarse_rect).collect())
+            .unwrap_or_else(Vec::new),
+        _ => Vec::new(),
+    }
+}
+
+fn all_level_rects(h: &AmrHierarchy2D, max_level: usize) -> Vec<Vec<Rect2i>> {
+    (1..=max_level).map(|lvl| level_rects(h, lvl)).collect()
 }
 
 fn rmse_and_max_delta_masked(a: &VectorField2D, b: &VectorField2D, mask: &Mask2D) -> (f64, f64) {
@@ -243,150 +300,339 @@ fn max_norm_outside_mask(field: &VectorField2D, mask: &Mask2D) -> f64 {
     maxn
 }
 
-fn write_efficiency_metrics(
-    path: &Path,
+// Upsample base mask (coarse) to finest uniform grid used for OVFs/metrics.
+#[warn(unused_variables)]
+#[allow(dead_code)]
+fn upsample_mask_from_base(
+    base_mask: &Mask2D,
     base: &Grid2D,
     ratio: usize,
-    ghost: usize,
-    patches: &[Rect2i],
-    amr_secs: f64,
-    uniform_secs: f64,
-) -> io::Result<()> {
-    let coarse_cells = (base.nx * base.ny) as u64;
-    let uniform_fine_cells = ((base.nx * ratio) * (base.ny * ratio)) as u64;
+    fine_grid: &Grid2D,
+) -> Mask2D {
+    assert_eq!(base_mask.len(), base.n_cells());
+    assert_eq!(fine_grid.nx, base.nx * ratio);
+    assert_eq!(fine_grid.ny, base.ny * ratio);
 
-    let mut fine_total_cells: u64 = 0;
-    let mut fine_active_cells: u64 = 0;
-    for p in patches {
-        let interior_nx = p.nx * ratio;
-        let interior_ny = p.ny * ratio;
-        let nx_tot = interior_nx + 2 * ghost;
-        let ny_tot = interior_ny + 2 * ghost;
-        fine_total_cells += (nx_tot * ny_tot) as u64;
-        fine_active_cells += (interior_nx * interior_ny) as u64;
+    let fine_nx = fine_grid.nx;
+    let mut out: Mask2D = vec![false; fine_grid.n_cells()];
+
+    for j in 0..base.ny {
+        for i in 0..base.nx {
+            let v = base_mask[i + base.nx * j];
+            let i0 = i * ratio;
+            let j0 = j * ratio;
+            for fj in 0..ratio {
+                for fi in 0..ratio {
+                    let ii = i0 + fi;
+                    let jj = j0 + fj;
+                    out[ii + fine_nx * jj] = v;
+                }
+            }
+        }
     }
 
-    let coverage = if uniform_fine_cells > 0 {
-        fine_active_cells as f64 / uniform_fine_cells as f64
-    } else {
-        0.0
-    };
-    let speedup = if amr_secs > 0.0 {
-        uniform_secs / amr_secs
-    } else {
-        0.0
-    };
-
-    let mut f = fs::File::create(path)?;
-    writeln!(f, "coarse_cells:          {}", coarse_cells)?;
-    writeln!(f, "uniform_fine_cells:    {}", uniform_fine_cells)?;
-    writeln!(f, "patch_count:           {}", patches.len())?;
-    writeln!(f, "fine_active_cells:     {}", fine_active_cells)?;
-    writeln!(f, "fine_total_cells:      {}", fine_total_cells)?;
-    writeln!(f, "active_coverage_frac:  {:.6e}", coverage)?;
-    writeln!(f, "amr_time_s:            {:.6e}", amr_secs)?;
-    writeln!(f, "uniform_time_s:        {:.6e}", uniform_secs)?;
-    writeln!(f, "speedup_uniform_over_amr: {:.6e}", speedup)?;
-    Ok(())
+    out
 }
 
-fn write_energy_header(mut f: &fs::File) -> io::Result<()> {
-    writeln!(f, "step,time_s,exchange,anisotropy,zeeman,dmi,demag,total")
-}
+// ---------- Plot helpers (like the other AMR benchmarks) ----------
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> RGBColor {
+    let h = h.rem_euclid(1.0);
+    let i = (h * 6.0).floor() as i32;
+    let f = h * 6.0 - (i as f64);
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
 
-fn append_energy_row(
-    mut f: &fs::File,
-    step: usize,
-    time_s: f64,
-    e: llg_sim::energy::EnergyBreakdown,
-) -> io::Result<()> {
-    writeln!(
-        f,
-        "{},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e}",
-        step,
-        time_s,
-        e.exchange,
-        e.anisotropy,
-        e.zeeman,
-        e.dmi,
-        e.demag,
-        e.total()
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+
+    RGBColor(
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
     )
 }
 
-fn run_uniform_fine_masked(
-    fine_grid: Grid2D,
-    fine_mask: &Mask2D,
-    params: &LLGParams,
-    mat: &Material,
-    n_steps: usize,
-    vortex_center: (f64, f64),
-    polarity: f64,
-    chirality: f64,
-    core_radius: f64,
-    energy_path: Option<&Path>,
-    energy_every: usize,
-) -> (VectorField2D, f64) {
-    let mut m = VectorField2D::new(fine_grid);
-    init_vortex(
-        &mut m,
-        &fine_grid,
-        vortex_center,
-        polarity,
-        chirality,
-        core_radius,
-        Some(fine_mask),
-    );
+fn save_patch_map(
+    base_grid: &Grid2D,
+    levels: &[Vec<Rect2i>],
+    path: &str,
+    caption: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nx0 = base_grid.nx as f64;
+    let ny0 = base_grid.ny as f64;
 
-    let mut scratch = RK4Scratch::new(fine_grid);
+    let root = BitMapBackend::new(path, (900, 700)).into_drawing_area();
+    root.fill(&WHITE)?;
 
-    let energy_file = if let Some(p) = energy_path {
-        let f = fs::File::create(p).expect("failed to create uniform energy csv");
-        write_energy_header(&f).expect("failed to write uniform energy header");
-        Some(f)
-    } else {
-        None
-    };
+    let mut chart = ChartBuilder::on(&root)
+        .caption(caption, ("sans-serif", 22))
+        .margin(15)
+        .x_label_area_size(35)
+        .y_label_area_size(35)
+        .build_cartesian_2d(0f64..1f64, 0f64..1f64)?;
 
-    let t0 = Instant::now();
-    for step in 0..n_steps {
-        llg_sim::llg::step_llg_rk4_recompute_field_masked_relax_geom(
-            &mut m,
-            params,
-            mat,
-            &mut scratch,
-            FieldMask::ExchAnis,
-            Some(fine_mask.as_slice()),
-        );
+    chart
+        .configure_mesh()
+        .x_desc("x/L")
+        .y_desc("y/L")
+        .disable_mesh()
+        .draw()?;
 
-        // Keep vacuum cells pinned to zero (cheap and makes intent explicit).
-        apply_mask_zero(&mut m, fine_mask);
-
-        if let Some(ref f) = energy_file {
-            if energy_every > 0 && (step % energy_every == 0) {
-                let e =
-                    compute_energy_geom(&m.grid, &m, mat, params.b_ext, Some(fine_mask.as_slice()));
-                let t = (step as f64) * params.dt;
-                append_energy_row(f, step, t, e).expect("failed to write uniform energy row");
-            }
-        }
-
-        if step % 200 == 0 {
-            println!("[uniform] step {step}/{n_steps}");
+    fn fill_color(level: usize) -> RGBColor {
+        match level {
+            1 => RGBColor(240, 220, 0),
+            2 => RGBColor(0, 200, 0),
+            3 => RGBColor(0, 120, 255),
+            4 => RGBColor(160, 80, 255),
+            _ => RGBColor(220, 0, 220),
         }
     }
-    let dt = t0.elapsed();
-    println!("[uniform] done in {:.2?}", dt);
-    (m, dt.as_secs_f64())
+
+    fn stroke_color(level: usize) -> RGBColor {
+        match level {
+            1 => BLACK,
+            2 => RED,
+            3 => RGBColor(0, 60, 140),
+            4 => RGBColor(90, 40, 140),
+            _ => BLACK,
+        }
+    }
+
+    for (k, rects) in levels.iter().enumerate() {
+        let lvl = k + 1;
+        let fill = fill_color(lvl).filled();
+        let stroke = stroke_color(lvl).stroke_width(2);
+        for r in rects {
+            let x0 = (r.i0 as f64) / nx0;
+            let y0 = (r.j0 as f64) / ny0;
+            let x1 = ((r.i0 + r.nx) as f64) / nx0;
+            let y1 = ((r.j0 + r.ny) as f64) / ny0;
+            chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], fill)))?;
+            chart.draw_series(std::iter::once(PathElement::new(
+                vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
+                stroke.clone(),
+            )))?;
+        }
+    }
+
+    root.present()?;
+    Ok(())
 }
 
-fn main() -> io::Result<()> {
-    // ----------------------------
-    // 1) Grid / material / params
-    // ----------------------------
-    let base = Grid2D::new(192, 192, 5e-9, 5e-9, 1e-9);
+fn save_mesh_zoom_multilevel(
+    m_fine: &VectorField2D,
+    _base_grid: &Grid2D,
+    ratio: usize,
+    amr_max_level: usize,
+    levels: &[Vec<Rect2i>],
+    path: &str,
+    caption: &str,
+    margin_cells_finest: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ref_ratio_total = pow_usize(ratio, amr_max_level);
 
-    // Same easy-plane idea as the vortex benchmark.
+    let target: &[Rect2i] = if levels.len() >= 2 && !levels[1].is_empty() {
+        levels[1].as_slice()
+    } else if !levels.is_empty() && !levels[0].is_empty() {
+        levels[0].as_slice()
+    } else {
+        levels
+            .iter()
+            .rev()
+            .find(|v| !v.is_empty())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+
+    let u = match union_rect(target) {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+
+    let fi0 = u.i0 * ref_ratio_total;
+    let fj0 = u.j0 * ref_ratio_total;
+    let fi1 = fi0 + u.nx * ref_ratio_total;
+    let fj1 = fj0 + u.ny * ref_ratio_total;
+
+    let nx = m_fine.grid.nx;
+    let ny = m_fine.grid.ny;
+
+    let x0 = fi0.saturating_sub(margin_cells_finest);
+    let y0 = fj0.saturating_sub(margin_cells_finest);
+    let x1 = (fi1 + margin_cells_finest).min(nx);
+    let y1 = (fj1 + margin_cells_finest).min(ny);
+
+    let root = BitMapBackend::new(path, (900, 900)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(caption, ("sans-serif", 22))
+        .margin(10)
+        .set_all_label_area_size(0)
+        .build_cartesian_2d(x0 as i32..x1 as i32, y0 as i32..y1 as i32)?;
+
+    chart.configure_mesh().disable_mesh().draw()?;
+
+    // Background: in-plane angle
+    chart.draw_series((y0..y1).flat_map(|j| {
+        (x0..x1).map(move |i| {
+            let v = m_fine.data[m_fine.grid.idx(i, j)];
+            let phi = v[1].atan2(v[0]);
+            let h = (phi + std::f64::consts::PI) / (2.0 * std::f64::consts::PI);
+            let col = hsv_to_rgb(h, 1.0, 1.0);
+            Rectangle::new(
+                [(i as i32, j as i32), (i as i32 + 1, j as i32 + 1)],
+                col.filled(),
+            )
+        })
+    }))?;
+
+    let level_spacing = |lvl: usize| -> usize {
+        let r_lvl = pow_usize(ratio, lvl);
+        (ref_ratio_total / r_lvl).max(1)
+    };
+
+    // L0 grid
+    let s0 = ref_ratio_total.max(1);
+    let mut xx = ((x0 + s0 - 1) / s0) * s0;
+    while xx <= x1 {
+        chart.draw_series(std::iter::once(PathElement::new(
+            vec![(xx as i32, y0 as i32), (xx as i32, y1 as i32)],
+            RGBColor(180, 180, 180).stroke_width(1),
+        )))?;
+        xx = xx.saturating_add(s0);
+        if s0 == 0 {
+            break;
+        }
+    }
+    let mut yy = ((y0 + s0 - 1) / s0) * s0;
+    while yy <= y1 {
+        chart.draw_series(std::iter::once(PathElement::new(
+            vec![(x0 as i32, yy as i32), (x1 as i32, yy as i32)],
+            RGBColor(180, 180, 180).stroke_width(1),
+        )))?;
+        yy = yy.saturating_add(s0);
+        if s0 == 0 {
+            break;
+        }
+    }
+
+    // L1/L2 solid grids, L3 outlines
+    for (k, rects) in levels.iter().enumerate() {
+        let lvl = k + 1;
+        if rects.is_empty() {
+            continue;
+        }
+        let s = level_spacing(lvl);
+        let col = match lvl {
+            1 => BLACK,
+            2 => RED,
+            3 => RGBColor(0, 120, 255),
+            _ => RGBColor(160, 80, 255),
+        };
+
+        for r in rects {
+            let gi0 = r.i0 * ref_ratio_total;
+            let gj0 = r.j0 * ref_ratio_total;
+            let gi1 = gi0 + r.nx * ref_ratio_total;
+            let gj1 = gj0 + r.ny * ref_ratio_total;
+
+            let xi0 = gi0.max(x0);
+            let yi0 = gj0.max(y0);
+            let xi1 = gi1.min(x1);
+            let yi1 = gj1.min(y1);
+            if xi1 <= xi0 || yi1 <= yi0 {
+                continue;
+            }
+
+            chart.draw_series(std::iter::once(PathElement::new(
+                vec![
+                    (xi0 as i32, yi0 as i32),
+                    (xi1 as i32, yi0 as i32),
+                    (xi1 as i32, yi1 as i32),
+                    (xi0 as i32, yi1 as i32),
+                    (xi0 as i32, yi0 as i32),
+                ],
+                col.stroke_width(3),
+            )))?;
+
+            if lvl <= 2 {
+                let mut xg = xi0;
+                while xg <= xi1 {
+                    chart.draw_series(std::iter::once(PathElement::new(
+                        vec![(xg as i32, yi0 as i32), (xg as i32, yi1 as i32)],
+                        col.stroke_width(1),
+                    )))?;
+                    xg = xg.saturating_add(s);
+                    if s == 0 {
+                        break;
+                    }
+                }
+                let mut yg = yi0;
+                while yg <= yi1 {
+                    chart.draw_series(std::iter::once(PathElement::new(
+                        vec![(xi0 as i32, yg as i32), (xi1 as i32, yg as i32)],
+                        col.stroke_width(1),
+                    )))?;
+                    yg = yg.saturating_add(s);
+                    if s == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    root.present()?;
+    Ok(())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let do_plots = args.iter().any(|a| a == "--plots");
+    let do_ovf = args.iter().any(|a| a == "--ovf");
+
+    let out_dir = "out/amr_masked_disk_relax";
+    ensure_dir(out_dir);
+
+    let amr_max_level: usize = std::env::var("LLG_AMR_MAX_LEVEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let ratio = 2usize;
+    let ghost = 2usize;
+
+    // Base grid
+    let base_nx = 192usize;
+    let base_ny = 192usize;
+    let dx = 5e-9;
+    let dy = 5e-9;
+    let dz = 1e-9;
+    let base_grid = Grid2D::new(base_nx, base_ny, dx, dy, dz);
+
+    let ref_ratio_total = pow_usize(ratio, amr_max_level);
+    let fine_grid = Grid2D::new(
+        base_nx * ref_ratio_total,
+        base_ny * ref_ratio_total,
+        dx / (ref_ratio_total as f64),
+        dy / (ref_ratio_total as f64),
+        dz,
+    );
+
+    // Parameters
+    let steps_base = 2000usize;
+    let dt = 5e-14;
+    let out_every_base = 200usize;
+    let regrid_every_base = 100usize;
+
+    // demag OFF
     let mat = Material {
         ms: 8.0e5,
         a_ex: 13e-12,
@@ -397,223 +643,481 @@ fn main() -> io::Result<()> {
         demag_method: DemagMethod::FftUniform,
     };
 
-    let n_steps = 2_000;
-    let params = LLGParams {
+    let llg = LLGParams {
         gamma: GAMMA_E_RAD_PER_S_T,
         alpha: 0.5,
-        dt: 5e-14,
+        dt,
         b_ext: [0.0, 0.0, 0.0],
     };
 
-    // Disk mask radius (meters)
-    let lx = base.nx as f64 * base.dx;
+    // Disk geometry
+    let lx = base_grid.nx as f64 * base_grid.dx;
     let half = 0.5 * lx;
-    let disk_radius = 0.90 * half; // leaves a small margin to the domain boundary
-    let mask_base = mask_disk(&base, disk_radius, (0.0, 0.0));
+    let disk_radius = 0.90 * half;
+    let mask_base: Mask2D = mask_disk(&base_grid, disk_radius, (0.0, 0.0));
 
-    // Vortex params (centered coords)
+    // Vortex init
     let vortex_center = (0.0, 0.0);
     let polarity = 1.0;
     let chirality = 1.0;
     let core_radius = 30e-9;
 
-    // ----------------------------
-    // 2) AMR settings (static patches for Stage-2C start)
-    // ----------------------------
-    let ratio = 2;
-    let ghost = 2;
-
-    let cluster_policy = ClusterPolicy {
-        // Work on mz proxy, so this will focus on the core rather than the disk boundary.
-        indicator_frac: 0.25,
-        buffer_cells: 6,
-        connectivity: Connectivity::Eight,
-        merge_distance: 4,
-        min_patch_area: 16,
-        max_patches: 4,
-    };
-
-    // ----------------------------
-    // 3) Initial coarse state (masked)
-    // ----------------------------
-    let mut m0 = VectorField2D::new(base);
+    // Uniform coarse baseline
+    let mut m_coarse = VectorField2D::new(base_grid);
     init_vortex(
-        &mut m0,
-        &base,
+        &mut m_coarse,
+        &base_grid,
         vortex_center,
         polarity,
         chirality,
         core_radius,
         Some(&mask_base),
     );
+    apply_mask_zero(&mut m_coarse, &mask_base);
 
-    // Initial patches from clustering on mz proxy
-    let proxy0 = mz_proxy(&m0);
+    // AMR hierarchy coarse state
+    let mut m_coarse_amr = VectorField2D::new(base_grid);
+    init_vortex(
+        &mut m_coarse_amr,
+        &base_grid,
+        vortex_center,
+        polarity,
+        chirality,
+        core_radius,
+        Some(&mask_base),
+    );
+    apply_mask_zero(&mut m_coarse_amr, &mask_base);
 
-    let fallback = Rect2i::new(base.nx / 2 - 24, base.ny / 2 - 24, 48, 48);
-    let (patch_rects, stats) = match compute_patch_rects_clustered_from_indicator(
-        &proxy0,
-        cluster_policy,
-        Some(mask_base.as_slice()),
-    ) {
-        Some((rs, st)) if !rs.is_empty() => (rs, st),
-        _ => {
-            let rs = vec![fallback];
-            let st = llg_sim::amr::ClusterStats {
-                max_indicator: 0.0,
-                threshold: 0.0,
-                flagged_cells: 0,
-                components: 0,
-                patches_before_merge: 1,
-                patches_after_merge: 1,
-            };
-            (rs, st)
-        }
+    let mut h = AmrHierarchy2D::new(base_grid, m_coarse_amr, ratio, ghost);
+    let disk_shape = MaskShape::Disk {
+        center: (0.0, 0.0),
+        radius: disk_radius,
+    };
+    h.set_geom_shape(disk_shape);
+
+    // Uniform fine reference (will be overwritten to AMR composite at step 0)
+    let mut m_fine = VectorField2D::new(fine_grid);
+    let fine_mask = MaskShape::Disk {
+        center: (0.0, 0.0),
+        radius: disk_radius,
+    }
+    .to_mask(&fine_grid);
+    init_vortex(
+        &mut m_fine,
+        &fine_grid,
+        vortex_center,
+        polarity,
+        chirality,
+        core_radius,
+        Some(&fine_mask),
+    );
+    apply_mask_zero(&mut m_fine, &fine_mask);
+
+    // Regrid policies — default grad² relative mode, overridable via env.
+    let indicator_kind = IndicatorKind::from_env(); // defaults to Composite { frac: 0.10 }
+    let boundary_layer: usize = std::env::var("LLG_AMR_BOUNDARY_LAYER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    let regrid_policy = RegridPolicy {
+        indicator: indicator_kind,
+        buffer_cells: 6,
+        boundary_layer,
+        min_change_cells: 2,
+        min_area_change_frac: 0.05,
     };
 
-    println!(
-        "[init] max_indicator(mz proxy, coarse) = {:.9e}",
-        stats.max_indicator
-    );
-    println!("[init] clustered patches: {}", patch_rects.len());
-    for (k, r) in patch_rects.iter().enumerate() {
-        println!(
-            "[init] patch {k}: i0={} j0={} nx={} ny={}",
-            r.i0, r.j0, r.nx, r.ny
+    let cluster_policy = ClusterPolicy {
+        indicator: indicator_kind,
+        buffer_cells: 2,
+        boundary_layer,
+        min_patch_area: 32,
+        merge_distance: 1,
+        max_patches: 0,
+        connectivity: Connectivity::Eight,
+        min_efficiency: 0.70,
+        max_flagged_fraction: 0.50,  // ADD
+    };
+
+    // Logs
+    let regrid_log_path = format!("{out_dir}/regrid_log.csv");
+    let regrid_levels_path = format!("{out_dir}/regrid_levels.csv");
+    let regrid_attempts_path = format!("{out_dir}/regrid_attempts.csv");
+    let regrid_patches_path = format!("{out_dir}/regrid_patches.csv");
+    let rmse_log_path = format!("{out_dir}/rmse_log.csv");
+
+    {
+        let mut f = File::create(&regrid_log_path).unwrap();
+        writeln!(
+            f,
+            "step,max_indicator,threshold,flagged_cells,patches,union_i0,union_j0,union_nx,union_ny"
+        )
+        .unwrap();
+        let mut f2 = File::create(&rmse_log_path).unwrap();
+        writeln!(f2, "step,rmse,max_delta,patches,leak_amr,leak_fine").unwrap();
+
+        let mut f3 = File::create(&regrid_levels_path).unwrap();
+        let mut hdr = String::from("step");
+        for lvl in 1..=amr_max_level {
+            hdr.push_str(&format!(
+                ",l{lvl}_count,l{lvl}_i0,l{lvl}_j0,l{lvl}_nx,l{lvl}_ny"
+            ));
+        }
+        hdr.push('\n');
+        f3.write_all(hdr.as_bytes()).unwrap();
+
+        let mut f4 = File::create(&regrid_attempts_path).unwrap();
+        let mut hdr2 = String::from("step,max_indicator");
+        for lvl in 1..=amr_max_level {
+            hdr2.push_str(&format!(",l{lvl}_count"));
+        }
+        hdr2.push('\n');
+        f4.write_all(hdr2.as_bytes()).unwrap();
+
+        let mut f5 = File::create(&regrid_patches_path).unwrap();
+        writeln!(f5, "step,level,patch_id,i0,j0,nx,ny").unwrap();
+    }
+
+    // Initial nested regrid
+    let mut current_patches: Vec<Rect2i> = Vec::new();
+    if let Some((new_rects, stats)) =
+        maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy)
+    {
+        current_patches = new_rects;
+        let u = union_rect_or_zero(&current_patches);
+        append_line(
+            &regrid_log_path,
+            &format!(
+                "0,{:.8e},{:.8e},{},{},{},{},{},{}\n",
+                stats.max_indicator,
+                stats.threshold,
+                stats.flagged_cells,
+                current_patches.len(),
+                u.i0,
+                u.j0,
+                u.nx,
+                u.ny
+            ),
+        );
+
+        let mut row = String::from("0");
+        for lvl in 1..=amr_max_level {
+            let rects = level_rects(&h, lvl);
+            let uu = union_rect_or_zero(&rects);
+            row.push_str(&format!(
+                ",{},{},{},{},{}",
+                rects.len(),
+                uu.i0,
+                uu.j0,
+                uu.nx,
+                uu.ny
+            ));
+        }
+        row.push('\n');
+        append_line(&regrid_levels_path, &row);
+
+        let mut row2 = format!("0,{:.8e}", stats.max_indicator);
+        for lvl in 1..=amr_max_level {
+            row2.push_str(&format!(",{}", level_patch_count(&h, lvl)));
+        }
+        row2.push('\n');
+        append_line(&regrid_attempts_path, &row2);
+
+        append_regrid_patches_csv(&regrid_patches_path, &h, amr_max_level, 0);
+    }
+
+    // Fair: uniform-fine starts from AMR composite
+    m_fine = flatten_to_target_grid(&h, fine_grid);
+    apply_mask_zero(&mut m_fine, &fine_mask);
+
+    let mut stepper = AmrStepperRK4::new(&h, true);
+
+    // Subcycling awareness
+    let subcycle_active = stepper.is_subcycling();
+    let subcycle_ratio: usize = if subcycle_active {
+        (stepper.coarse_dt(&llg, &h) / llg.dt).round() as usize
+    } else {
+        1
+    };
+    let snap_up = |v: usize, r: usize| -> usize {
+        if r <= 1 { v } else { ((v + r - 1) / r) * r }
+    };
+    let steps = snap_up(steps_base, subcycle_ratio);
+    let out_every = snap_up(out_every_base, subcycle_ratio);
+    let regrid_every = snap_up(regrid_every_base, subcycle_ratio);
+    if subcycle_active {
+        eprintln!(
+            "[amr_masked_disk_relax] SUBCYCLING ACTIVE: n_levels={}, subcycle_ratio={}, steps={}, out_every={}, regrid_every={}",
+            h.num_levels(), subcycle_ratio, steps, out_every, regrid_every
         );
     }
 
-    // ----------------------------
-    // 4) Outputs
-    // ----------------------------
-    let out_dir = ensure_out_dir()?;
+    let mut scratch_fine = RK4Scratch::new(fine_grid);
+    let mut scratch_coarse = RK4Scratch::new(base_grid);
 
-    // Energy logging cadence (steps). Set to 0 to disable.
-    let energy_every: usize = 20;
-
-    let energy_amr_path = out_dir.join("energy_amr.csv");
-    let energy_uniform_path = out_dir.join("energy_uniform.csv");
-
-    let energy_amr_file = fs::File::create(&energy_amr_path)?;
-    write_energy_header(&energy_amr_file)?;
-
-    write_run_info(
-        &out_dir.join("run_info.txt"),
-        &base,
-        ratio,
-        ghost,
-        n_steps,
-        disk_radius,
-        vortex_center,
-        polarity,
-        chirality,
-        core_radius,
-        cluster_policy,
-        &params,
-        &mat,
-    )?;
-
-    // ----------------------------
-    // 5) Run AMR
-    // ----------------------------
-    let mut h_amr = AmrHierarchy2D::new(base, m0, ratio, ghost);
-
-    // Store the geometry mask on the hierarchy so the AMR stepper can call the
-    // mask-aware coarse-grid steppers internally.
-    h_amr.set_geom_mask(mask_base.clone());
-
-    for r in &patch_rects {
-        h_amr.add_patch(*r);
+    if do_ovf {
+        ensure_dir(&format!("{out_dir}/ovf_coarse"));
+        ensure_dir(&format!("{out_dir}/ovf_fine"));
+        ensure_dir(&format!("{out_dir}/ovf_amr"));
     }
 
-    let mut stepper = AmrStepperRK4::new(&h_amr, true);
+    // Step 0 outputs
+    {
+        let mut m_amr_fine = flatten_to_target_grid(&h, fine_grid);
+        apply_mask_zero(&mut m_amr_fine, &fine_mask);
+        let (rmse, maxd) = rmse_and_max_delta_masked(&m_amr_fine, &m_fine, &fine_mask);
+        let leak_amr = max_norm_outside_mask(&m_amr_fine, &fine_mask);
+        let leak_fine = max_norm_outside_mask(&m_fine, &fine_mask);
+        append_line(
+            &rmse_log_path,
+            &format!(
+                "0,{:.8e},{:.8e},{},{:.8e},{:.8e}\n",
+                rmse,
+                maxd,
+                current_patches.len(),
+                leak_amr,
+                leak_fine
+            ),
+        );
+
+        if do_ovf {
+            write_ovf_text(
+                &format!("{out_dir}/ovf_coarse/m0000000.ovf"),
+                &m_coarse,
+                "m_coarse",
+            );
+            write_ovf_text(
+                &format!("{out_dir}/ovf_fine/m0000000.ovf"),
+                &m_fine,
+                "m_fine",
+            );
+            write_ovf_text(
+                &format!("{out_dir}/ovf_amr/m0000000.ovf"),
+                &m_amr_fine,
+                "m_amr",
+            );
+        }
+
+        if do_plots {
+            let levels = all_level_rects(&h, amr_max_level);
+            save_patch_map(
+                &base_grid,
+                &levels,
+                &format!("{out_dir}/patch_map_step0000.png"),
+                "Patch map (L1..Lmax)",
+            )
+            .unwrap();
+            save_mesh_zoom_multilevel(
+                &m_amr_fine,
+                &base_grid,
+                ratio,
+                amr_max_level,
+                &levels,
+                &format!("{out_dir}/mesh_zoom_step0000.png"),
+                "Zoom mesh: in-plane angle + grid",
+                30,
+            )
+            .unwrap();
+        }
+    }
+
+    if do_plots {
+        println!("[amr_masked_disk_relax] --plots enabled: writing PNGs to {out_dir}");
+    }
 
     let t0 = Instant::now();
-    for step in 0..n_steps {
-        stepper.step(&mut h_amr, &params, &mat, FieldMask::ExchAnis);
 
-        // Safety belt: keep vacuum pinned to zero on the coarse level.
-        apply_mask_zero(&mut h_amr.coarse, &mask_base);
+    for step in 1..=steps {
+        // Uniform fine + coarse updates
+        step_llg_rk4_recompute_field_masked_relax_geom(
+            &mut m_fine,
+            &llg,
+            &mat,
+            &mut scratch_fine,
+            FieldMask::ExchAnis,
+            Some(&fine_mask),
+        );
+        apply_mask_zero(&mut m_fine, &fine_mask);
 
-        if energy_every > 0 && (step % energy_every == 0) {
-            let e = compute_energy_geom(
-                &h_amr.coarse.grid,
-                &h_amr.coarse,
-                &mat,
-                params.b_ext,
-                Some(mask_base.as_slice()),
-            );
-            let t = (step as f64) * params.dt;
-            append_energy_row(&energy_amr_file, step, t, e)?;
+        step_llg_rk4_recompute_field_masked_relax_geom(
+            &mut m_coarse,
+            &llg,
+            &mat,
+            &mut scratch_coarse,
+            FieldMask::ExchAnis,
+            Some(&mask_base),
+        );
+        apply_mask_zero(&mut m_coarse, &mask_base);
+
+        // AMR step
+        let amr_due = step % subcycle_ratio == 0;
+        if amr_due {
+            stepper.step(&mut h, &llg, &mat, FieldMask::ExchAnis);
+            apply_mask_zero(&mut h.coarse, &mask_base);
         }
 
-        if step % 200 == 0 {
-            println!("[amr] step {step}/{n_steps}");
+        // Regrid
+        if amr_due && regrid_every > 0 && step % regrid_every == 0 {
+            let mut row2 = format!("{},{:.8e}", step, 0.0f64);
+            for lvl in 1..=amr_max_level {
+                row2.push_str(&format!(",{}", level_patch_count(&h, lvl)));
+            }
+            row2.push('\n');
+            append_line(&regrid_attempts_path, &row2);
+
+            if let Some((new_rects, stats)) =
+                maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy)
+            {
+                current_patches = new_rects;
+                let u = union_rect_or_zero(&current_patches);
+                append_line(
+                    &regrid_log_path,
+                    &format!(
+                        "{},{:.8e},{:.8e},{},{},{},{},{},{}\n",
+                        step,
+                        stats.max_indicator,
+                        stats.threshold,
+                        stats.flagged_cells,
+                        current_patches.len(),
+                        u.i0,
+                        u.j0,
+                        u.nx,
+                        u.ny
+                    ),
+                );
+
+                let mut row = format!("{}", step);
+                for lvl in 1..=amr_max_level {
+                    let rects = level_rects(&h, lvl);
+                    let uu = union_rect_or_zero(&rects);
+                    row.push_str(&format!(
+                        ",{},{},{},{},{}",
+                        rects.len(),
+                        uu.i0,
+                        uu.j0,
+                        uu.nx,
+                        uu.ny
+                    ));
+                }
+                row.push('\n');
+                append_line(&regrid_levels_path, &row);
+
+                append_regrid_patches_csv(&regrid_patches_path, &h, amr_max_level, step);
+            }
+        }
+
+        // Output
+        if step % out_every == 0 || step == steps {
+            let mut m_amr_fine = flatten_to_target_grid(&h, fine_grid);
+            apply_mask_zero(&mut m_amr_fine, &fine_mask);
+
+            let (rmse, maxd) = rmse_and_max_delta_masked(&m_amr_fine, &m_fine, &fine_mask);
+            let leak_amr = max_norm_outside_mask(&m_amr_fine, &fine_mask);
+            let leak_fine = max_norm_outside_mask(&m_fine, &fine_mask);
+            append_line(
+                &rmse_log_path,
+                &format!(
+                    "{},{:.8e},{:.8e},{},{:.8e},{:.8e}\n",
+                    step,
+                    rmse,
+                    maxd,
+                    current_patches.len(),
+                    leak_amr,
+                    leak_fine
+                ),
+            );
+
+            let mut lvl_counts = String::new();
+            for lvl in 1..=amr_max_level {
+                if lvl > 1 {
+                    lvl_counts.push_str(" | ");
+                }
+                lvl_counts.push_str(&format!("L{} {:2}", lvl, level_patch_count(&h, lvl)));
+            }
+            println!(
+                "step {:4} | rmse(mask) {:.3e} | maxΔ {:.3e} | leak_amr {:.2e} | {}",
+                step, rmse, maxd, leak_amr, lvl_counts
+            );
+
+            if do_ovf {
+                let fname = format!("m{:07}.ovf", step);
+                write_ovf_text(
+                    &format!("{out_dir}/ovf_coarse/{fname}"),
+                    &m_coarse,
+                    "m_coarse",
+                );
+                write_ovf_text(&format!("{out_dir}/ovf_fine/{fname}"), &m_fine, "m_fine");
+                write_ovf_text(&format!("{out_dir}/ovf_amr/{fname}"), &m_amr_fine, "m_amr");
+            }
+
+            if do_plots && step == steps {
+                let levels = all_level_rects(&h, amr_max_level);
+                save_patch_map(
+                    &base_grid,
+                    &levels,
+                    &format!("{out_dir}/patch_map_step{step:04}.png"),
+                    "Patch map (L1..Lmax)",
+                )
+                .unwrap();
+                save_mesh_zoom_multilevel(
+                    &m_amr_fine,
+                    &base_grid,
+                    ratio,
+                    amr_max_level,
+                    &levels,
+                    &format!("{out_dir}/mesh_zoom_step{step:04}.png"),
+                    "Zoom mesh: in-plane angle + grid",
+                    30,
+                )
+                .unwrap();
+            }
         }
     }
-    let dt_amr = t0.elapsed();
-    let amr_secs = dt_amr.as_secs_f64();
-    println!("[amr] done in {:.2?}", dt_amr);
 
-    // Flatten and then apply fine mask to avoid interpolation bleed outside geometry.
-    let mut fine_amr = h_amr.flatten_to_uniform_fine();
-    let fine_grid = fine_amr.grid;
-    let fine_mask = upsample_mask_from_base(&mask_base, &base, ratio, &fine_grid);
-    apply_mask_zero(&mut fine_amr, &fine_mask);
+    let wall = t0.elapsed().as_secs_f64();
 
-    // ----------------------------
-    // 6) Uniform-fine reference (masked)
-    // ----------------------------
-    let (mut fine_uniform, uniform_secs) = run_uniform_fine_masked(
-        fine_grid,
-        &fine_mask,
-        &params,
-        &mat,
-        n_steps,
-        vortex_center,
-        polarity,
-        chirality,
-        core_radius,
-        Some(&energy_uniform_path),
-        energy_every,
+    // Final CSVs
+    let mut m_amr_fine_final = flatten_to_target_grid(&h, fine_grid);
+    apply_mask_zero(&mut m_amr_fine_final, &fine_mask);
+
+    write_csv_ij_m(&format!("{out_dir}/uniform_coarse_final.csv"), &m_coarse);
+    write_csv_ij_m(&format!("{out_dir}/uniform_fine_final.csv"), &m_fine);
+    write_csv_ij_m(&format!("{out_dir}/amr_fine_final.csv"), &m_amr_fine_final);
+
+    write_midline_y(&format!("{out_dir}/lineout_uniform_mid_y.csv"), &m_fine);
+    write_midline_y(
+        &format!("{out_dir}/lineout_amr_mid_y.csv"),
+        &m_amr_fine_final,
     );
-    apply_mask_zero(&mut fine_uniform, &fine_mask);
 
-    // ----------------------------
-    // 7) Metrics + outputs (mask-aware)
-    // ----------------------------
-    write_csv_field(&out_dir.join("amr_fine_final.csv"), &fine_amr)?;
-    write_csv_field(&out_dir.join("uniform_fine_final.csv"), &fine_uniform)?;
-    write_lineout_mid_y(&out_dir.join("lineout_amr_mid_y.csv"), &fine_amr)?;
-    write_lineout_mid_y(&out_dir.join("lineout_uniform_mid_y.csv"), &fine_uniform)?;
+    let (rmse_final, maxd_final) =
+        rmse_and_max_delta_masked(&m_amr_fine_final, &m_fine, &fine_mask);
+    let leak_final = max_norm_outside_mask(&m_amr_fine_final, &fine_mask);
 
-    let (rmse, max_dm) = rmse_and_max_delta_masked(&fine_amr, &fine_uniform, &fine_mask);
-    let leak_amr = max_norm_outside_mask(&fine_amr, &fine_mask);
-    let leak_uni = max_norm_outside_mask(&fine_uniform, &fine_mask);
-
-    let mut mf = fs::File::create(out_dir.join("metrics.txt"))?;
-    writeln!(mf, "RMSE(|Δm|_2) [inside mask]: {:.6e}", rmse)?;
-    writeln!(mf, "max |Δm|     [inside mask]: {:.6e}", max_dm)?;
-    writeln!(mf, "max |m| outside mask (amr): {:.6e}", leak_amr)?;
-    writeln!(mf, "max |m| outside mask (uni): {:.6e}", leak_uni)?;
-
-    write_efficiency_metrics(
-        &out_dir.join("efficiency.txt"),
-        &base,
-        ratio,
-        ghost,
-        &patch_rects,
-        amr_secs,
-        uniform_secs,
-    )?;
-
-    println!("[metrics] RMSE(|Δm|_2) [inside mask] = {:.6e}", rmse);
-    println!("[metrics] max |Δm|     [inside mask] = {:.6e}", max_dm);
-    println!("[mask] max |m| outside mask (amr) = {:.6e}", leak_amr);
-    println!("[mask] max |m| outside mask (uni) = {:.6e}", leak_uni);
-    println!("[output] wrote {}", out_dir.display());
-    println!("[energy] wrote {}", energy_amr_path.display());
-    println!("[energy] wrote {}", energy_uniform_path.display());
-
-    Ok(())
+    println!();
+    println!("AMR masked disk relaxation benchmark (demag OFF)");
+    println!(
+        "Base grid: {} x {}   dx={:.3e} dy={:.3e} dz={:.3e}",
+        base_grid.nx, base_grid.ny, base_grid.dx, base_grid.dy, base_grid.dz
+    );
+    println!(
+        "Fine grid: {} x {}   dx={:.3e} dy={:.3e}",
+        fine_grid.nx, fine_grid.ny, fine_grid.dx, fine_grid.dy
+    );
+    println!("Steps: {}   dt={:.3e}", steps, dt);
+    if subcycle_active {
+        println!(
+            "Subcycling: ON  n_levels={}  ratio={}  AMR coarse steps: ~{}",
+            h.num_levels(), subcycle_ratio, steps / subcycle_ratio.max(1)
+        );
+    } else {
+        println!("Subcycling: OFF");
+    }
+    println!("Outputs: {out_dir}");
+    println!(
+        "Final RMSE(mask)={:.6e}  maxΔ={:.6e}  leak_amr={:.3e}",
+        rmse_final, maxd_final, leak_final
+    );
+    println!("Total wall time: {:.3} s", wall);
 }
