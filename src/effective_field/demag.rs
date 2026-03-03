@@ -4,8 +4,9 @@
 //
 // This file intentionally contains *no new physics*.
 // It routes calls to one of:
-//   - demag_fft_uniform.rs  (FFT convolution on a uniform FD grid)
-//   - demag_poisson_mg.rs   (Poisson + geometric multigrid; experimental)
+//   - demag_fft_uniform.rs    (FFT convolution on a uniform FD grid)
+//   - demag_poisson_mg.rs     (Poisson + geometric multigrid; experimental)
+//   - demag_poisson_dst.rs    (Poisson via DST with open-BC boundary integral)
 //
 // The goal is that call sites keep importing `effective_field::demag` and calling
 // `add_demag_field(...)` / `compute_demag_field(...)` without caring about the method.
@@ -15,24 +16,23 @@
 // - Additionally, you can override the method at runtime using `LLG_DEMAG_METHOD`:
 //     export LLG_DEMAG_METHOD=fft
 //     export LLG_DEMAG_METHOD=mg
+//     export LLG_DEMAG_METHOD=dst
 
 use crate::grid::Grid2D;
 use crate::params::{DemagMethod, Material};
 use crate::vector_field::VectorField2D;
 
 use super::demag_fft_uniform;
+use super::demag_poisson_dst;
 use super::demag_poisson_mg;
 
 use rayon::current_num_threads;
 use std::sync::{Once, OnceLock};
 
 static WARN_MG_PBC_FALLBACK: Once = Once::new();
+static WARN_DST_PBC_FALLBACK: Once = Once::new();
 static PRINT_DEMAG_METHOD_ONCE: Once = Once::new();
 
-// Cache the parsed environment override so hot loops (e.g. SP2 demag calls) don't
-// pay a getenv/parse cost every field evaluation.
-//
-// NOTE: This is intentionally process-wide. Set LLG_DEMAG_METHOD before running.
 static DEMAG_METHOD_OVERRIDE: OnceLock<Option<DemagMethod>> = OnceLock::new();
 
 /// Resolve the demag method for this run.
@@ -42,7 +42,6 @@ static DEMAG_METHOD_OVERRIDE: OnceLock<Option<DemagMethod>> = OnceLock::new();
 /// 2) `mat.demag_method`
 #[inline]
 pub fn resolved_demag_method(mat: &Material) -> DemagMethod {
-    // Read + parse once per process.
     if let Some(m) = DEMAG_METHOD_OVERRIDE.get_or_init(|| {
         std::env::var("LLG_DEMAG_METHOD")
             .ok()
@@ -77,6 +76,7 @@ pub fn compute_demag_field(
 ///
 /// *FFT method*: supports MuMax-style finite-image PBC sums.
 /// *MG method*: not PBC-aware yet; if `pbc_x>0 || pbc_y>0`, we fall back to FFT.
+/// *DST method*: open BC only; if `pbc_x>0 || pbc_y>0`, falls back to FFT.
 pub fn add_demag_field_pbc(
     grid: &Grid2D,
     m: &VectorField2D,
@@ -92,8 +92,6 @@ pub fn add_demag_field_pbc(
     let method = resolved_demag_method(mat);
 
     PRINT_DEMAG_METHOD_ONCE.call_once(|| {
-        // Print once per process to avoid polluting hot-loop output.
-        // This helps confirm which backend is actually being used.
         match std::env::var("LLG_DEMAG_METHOD") {
             Ok(raw) => {
                 let parsed = DemagMethod::from_str(raw.trim());
@@ -106,22 +104,13 @@ pub fn add_demag_field_pbc(
                 }
                 eprintln!(
                     "[demag] resolved method={:?} (material={:?}, env='{}'), pbc_x={}, pbc_y={}, rayon_threads={}",
-                    method,
-                    mat.demag_method,
-                    raw,
-                    pbc_x,
-                    pbc_y,
-                    current_num_threads()
+                    method, mat.demag_method, raw, pbc_x, pbc_y, current_num_threads()
                 );
             }
             Err(_) => {
                 eprintln!(
                     "[demag] resolved method={:?} (material={:?}, env=<unset>), pbc_x={}, pbc_y={}, rayon_threads={}",
-                    method,
-                    mat.demag_method,
-                    pbc_x,
-                    pbc_y,
-                    current_num_threads()
+                    method, mat.demag_method, pbc_x, pbc_y, current_num_threads()
                 );
             }
         }
@@ -132,8 +121,6 @@ pub fn add_demag_field_pbc(
             demag_fft_uniform::add_demag_field_pbc(grid, m, b_eff, mat, pbc_x, pbc_y)
         }
         DemagMethod::PoissonMG => {
-            // MG implementation is not PBC-aware yet.
-            // If periodic images are requested, fall back to FFT to preserve semantics.
             if pbc_x > 0 || pbc_y > 0 {
                 WARN_MG_PBC_FALLBACK.call_once(|| {
                     eprintln!(
@@ -146,13 +133,24 @@ pub fn add_demag_field_pbc(
                 demag_poisson_mg::add_demag_field_poisson_mg(grid, m, b_eff, mat)
             }
         }
+        DemagMethod::PoissonDst => {
+            // DST decomposition is for open (non-periodic) boundaries only.
+            if pbc_x > 0 || pbc_y > 0 {
+                WARN_DST_PBC_FALLBACK.call_once(|| {
+                    eprintln!(
+                        "[llg-sim] WARN: demag_method=dst does not support PBC (pbc_x={}, pbc_y={}); falling back to FFT.",
+                        pbc_x, pbc_y
+                    );
+                });
+                demag_fft_uniform::add_demag_field_pbc(grid, m, b_eff, mat, pbc_x, pbc_y)
+            } else {
+                demag_poisson_dst::add_demag_field_poisson_dst(grid, m, b_eff, mat)
+            }
+        }
     }
 }
 
 /// Compute demag induction B_demag (Tesla) into `out` (overwrites out), with PBC in x/y.
-///
-/// *FFT method*: supports MuMax-style finite-image PBC sums.
-/// *MG method*: not PBC-aware yet; if `pbc_x>0 || pbc_y>0`, we fall back to FFT.
 pub fn compute_demag_field_pbc(
     grid: &Grid2D,
     m: &VectorField2D,

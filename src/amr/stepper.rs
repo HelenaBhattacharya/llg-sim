@@ -2,6 +2,7 @@
 
 use crate::effective_field::{
     FieldMask, build_h_eff_masked, build_h_eff_masked_geom, demag_fft_uniform, demag_poisson_mg,
+    mg_composite,
 };
 use crate::grid::Grid2D;
 use crate::llg::{
@@ -26,11 +27,14 @@ enum AmrDemagMode {
     MixMgCoarseOnly,
     /// Stage 3B: run Poisson-MG demag on the flattened uniform-fine composite, then sample back.
     AllMgUniformFine,
+    /// AMR-aware composite-grid: enhanced-RHS MG on L0 + interpolation to patches.
+    /// Avoids flattening to uniform fine — V-cycle runs on the coarse grid only.
+    CompositeGrid,
 }
 
 impl AmrDemagMode {
     fn from_env() -> Self {
-        // LLG_AMR_DEMAG_MODE = all_fft | mix | all_mg
+        // LLG_AMR_DEMAG_MODE = all_fft | mix | all_mg | composite
         // Backward-compatible aliases are accepted.
         let v = std::env::var("LLG_AMR_DEMAG_MODE").ok();
         match v.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
@@ -44,6 +48,11 @@ impl AmrDemagMode {
                 if s == "all_mg" || s == "mg" || s == "mg_uniform" || s == "mg_uniform_fine" =>
             {
                 Self::AllMgUniformFine
+            }
+            Some(ref s)
+                if s == "composite" || s == "composite_grid" || s == "garcia" =>
+            {
+                Self::CompositeGrid
             }
             _ => Self::AllFft,
         }
@@ -600,6 +609,7 @@ impl AmrStepperRK4 {
         {
             let b_demag_fine = &self.b_demag_fine;
             let relax = self.relax;
+            let is_composite = self.demag_mode == AmrDemagMode::CompositeGrid;
             h.patches
                 .par_iter_mut()
                 .zip(self.patch_scratch.par_iter_mut())
@@ -624,8 +634,9 @@ impl AmrStepperRK4 {
                                 }
                             }
                         }
-                    } else {
+                    } else if !is_composite {
                         // Mix mode: patches are stepped without demag (exchange/anis/etc only).
+                        // (CompositeGrid already set b_add in compute_demag.)
                         s.b_add.set_uniform(0.0, 0.0, 0.0);
                     }
 
@@ -642,6 +653,7 @@ impl AmrStepperRK4 {
         {
             let b_demag_fine = &self.b_demag_fine;
             let relax = self.relax;
+            let is_composite = self.demag_mode == AmrDemagMode::CompositeGrid;
             for (patches_lvl, scratch_lvl) in h
                 .patches_l2plus
                 .iter_mut()
@@ -671,8 +683,9 @@ impl AmrStepperRK4 {
                                     }
                                 }
                             }
-                        } else {
+                        } else if !is_composite {
                             // Mix mode: patches are stepped without demag (exchange/anis/etc only).
+                            // (CompositeGrid already set b_add in compute_demag.)
                             s.b_add.set_uniform(0.0, 0.0, 0.0);
                         }
 
@@ -857,6 +870,81 @@ impl AmrStepperRK4 {
                     &self.b_demag_coarse,
                 );
             }
+            AmrDemagMode::CompositeGrid => {
+                // AMR-aware composite-grid demag: enhanced-RHS MG on the coarse
+                // grid, with fine-resolution ∇·M injected from patches.  The V-cycle
+                // runs on the coarse grid (not the flattened fine grid).
+                let mg_cfg = demag_poisson_mg::DemagPoissonMGConfig::from_env();
+
+                let (b_l1, b_l2plus) = mg_composite::compute_composite_demag(
+                    h,
+                    mat,
+                    &mg_cfg,
+                    &mut self.b_demag_coarse,
+                );
+
+                // Zero demag in vacuum (coarse level)
+                if let Some(gm) = h.geom_mask.as_deref() {
+                    for idx in 0..h.base_grid.n_cells() {
+                        if !gm[idx] {
+                            self.b_demag_coarse.data[idx] = [0.0, 0.0, 0.0];
+                        }
+                    }
+                }
+                assert_field_finite("b_demag_coarse (composite)", &self.b_demag_coarse);
+
+                // Write per-patch B addends directly into scratch (L1)
+                for (pi, s) in self.patch_scratch.iter_mut().enumerate() {
+                    if pi < b_l1.len() && pi < h.patches.len() {
+                        let b_patch = &b_l1[pi];
+                        for (idx, v) in b_patch.iter().enumerate() {
+                            if idx < s.b_add.data.len() {
+                                s.b_add.data[idx] = *v;
+                            }
+                        }
+                        // Zero vacuum cells
+                        if let Some(gm) = h.patches[pi].geom_mask_fine.as_deref() {
+                            for idx in 0..s.b_add.data.len().min(gm.len()) {
+                                if !gm[idx] {
+                                    s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                                }
+                            }
+                        }
+                    } else {
+                        s.b_add.set_uniform(0.0, 0.0, 0.0);
+                    }
+                }
+
+                // Write per-patch B addends directly into scratch (L2+)
+                for (li, scratch_lvl) in self.patch_scratch_l2plus.iter_mut().enumerate() {
+                    let b_lvl = b_l2plus.get(li);
+                    for (pi, s) in scratch_lvl.iter_mut().enumerate() {
+                        if let Some(bl) = b_lvl {
+                            if pi < bl.len() {
+                                for (idx, v) in bl[pi].iter().enumerate() {
+                                    if idx < s.b_add.data.len() {
+                                        s.b_add.data[idx] = *v;
+                                    }
+                                }
+                                let h_idx = li;
+                                if let Some(patches_lvl) = h.patches_l2plus.get(h_idx) {
+                                    if let Some(p) = patches_lvl.get(pi) {
+                                        if let Some(gm) = p.geom_mask_fine.as_deref() {
+                                            for idx in 0..s.b_add.data.len().min(gm.len()) {
+                                                if !gm[idx] {
+                                                    s.b_add.data[idx] = [0.0, 0.0, 0.0];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        s.b_add.set_uniform(0.0, 0.0, 0.0);
+                    }
+                }
+            }
         }
     }
 
@@ -926,7 +1014,11 @@ impl AmrStepperRK4 {
         // ----------------------------------------------------------
         // 3) Set up frozen demag addends for ALL patches (once)
         // ----------------------------------------------------------
-        self.setup_patch_demag_addends(h, use_fine_demag_sampling);
+        // CompositeGrid mode already populated b_add in compute_demag;
+        // other modes need the explicit sampling/zeroing step.
+        if self.demag_mode != AmrDemagMode::CompositeGrid {
+            self.setup_patch_demag_addends(h, use_fine_demag_sampling);
+        }
 
         // ----------------------------------------------------------
         // 4) Advance coarse for ONE step of dt_coarse

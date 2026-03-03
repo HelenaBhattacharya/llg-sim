@@ -68,6 +68,8 @@ impl Preset {
 pub enum DemagMethod {
     FftUniform,
     PoissonMG,
+    /// DST-based Poisson solver with open-BC boundary integral (U = v + w decomposition).
+    PoissonDst,
 }
 
 impl DemagMethod {
@@ -75,6 +77,7 @@ impl DemagMethod {
         match s.trim().to_ascii_lowercase().as_str() {
             "fft" | "fftuniform" | "uniform" => Some(Self::FftUniform),
             "mg" | "multigrid" | "poissonmg" | "poisson_mg" => Some(Self::PoissonMG),
+            "dst" | "poissondst" | "poisson_dst" | "dst_open" => Some(Self::PoissonDst),
             _ => None,
         }
     }
@@ -83,6 +86,7 @@ impl DemagMethod {
         match self {
             Self::FftUniform => "fft",
             Self::PoissonMG => "mg",
+            Self::PoissonDst => "dst",
         }
     }
 }

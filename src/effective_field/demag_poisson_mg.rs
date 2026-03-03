@@ -63,11 +63,13 @@ use crate::params::{MU0, Material};
 use crate::vector_field::VectorField2D;
 
 use super::demag_fft_uniform;
+use super::mg_kernels as kernels;
+use super::mg_kernels::{idx3, interp_1d_cell_centered};
+use super::mg_treecode as treecode;
 
 use rayon::prelude::*;
 
 use std::collections::HashMap;
-use std::f64::consts::PI;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -270,7 +272,7 @@ impl DemagPoissonMGConfig {
 // ---------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct HybridConfig {
+pub(crate) struct HybridConfig {
     enabled: bool,
     radius_xy: usize,
     delta_v_cycles: usize,
@@ -291,7 +293,7 @@ impl Default for HybridConfig {
 }
 
 impl HybridConfig {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         fn get_usize(name: &str) -> Option<usize> {
             std::env::var(name)
                 .ok()
@@ -355,38 +357,6 @@ impl HybridConfig {
     #[inline]
     fn enabled(&self) -> bool {
         self.enabled && self.radius_xy > 0
-    }
-}
-
-#[inline]
-fn idx3(i: usize, j: usize, k: usize, nx: usize, ny: usize) -> usize {
-    (k * ny + j) * nx + i
-}
-
-#[inline]
-fn stamp_dirichlet_bc(arr: &mut [f64], bc_phi: &[f64], nx: usize, ny: usize, nz: usize) {
-    for k in 0..nz {
-        for j in 0..ny {
-            let id0 = idx3(0, j, k, nx, ny);
-            let id1 = idx3(nx - 1, j, k, nx, ny);
-            arr[id0] = bc_phi[id0];
-            arr[id1] = bc_phi[id1];
-        }
-        for i in 0..nx {
-            let id0 = idx3(i, 0, k, nx, ny);
-            let id1 = idx3(i, ny - 1, k, nx, ny);
-            arr[id0] = bc_phi[id0];
-            arr[id1] = bc_phi[id1];
-        }
-    }
-
-    for j in 0..ny {
-        for i in 0..nx {
-            let id0 = idx3(i, j, 0, nx, ny);
-            let id1 = idx3(i, j, nz - 1, nx, ny);
-            arr[id0] = bc_phi[id0];
-            arr[id1] = bc_phi[id1];
-        }
     }
 }
 
@@ -482,6 +452,63 @@ impl DeltaKernel2D {
             });
     }
 
+    #[allow(dead_code)]
+    pub fn add_correction_subregion(
+        &self,
+        _m_patch: &[[f64; 3]],
+        b_patch: &mut [[f64; 3]],
+        patch_nx: usize,
+        _patch_ny: usize,
+        i0: usize,       // patch origin x in full grid
+        j0: usize,       // patch origin y in full grid
+        full_m: &[[f64; 3]],  // full-grid magnetisation for halo reads
+        full_nx: usize,
+        full_ny: usize,
+        ms: f64,
+    ) {
+        let r = self.radius as isize;
+        let stride = self.stride;
+        let dkxx = &self.dkxx;
+        let dkxy = &self.dkxy;
+        let dkyy = &self.dkyy;
+        let dkzz = &self.dkzz;
+
+        b_patch
+            .par_chunks_mut(patch_nx)
+            .enumerate()
+            .for_each(|(pj, row)| {
+                let gj = j0 + pj;  // global j
+                for pi in 0..patch_nx {
+                    let gi = i0 + pi;  // global i
+
+                    let mut bx = 0.0f64;
+                    let mut by = 0.0f64;
+                    let mut bz = 0.0f64;
+
+                    for dy in -r..=r {
+                        let sj = gj as isize - dy;
+                        if sj < 0 || sj >= full_ny as isize { continue; }
+                        for dx in -r..=r {
+                            let si = gi as isize - dx;
+                            if si < 0 || si >= full_nx as isize { continue; }
+                            let k = (dy + r) as usize * stride + (dx + r) as usize;
+                            let src = full_m[(sj as usize) * full_nx + (si as usize)];
+                            let mx = ms * src[0];
+                            let my = ms * src[1];
+                            let mz = ms * src[2];
+                            bx += dkxx[k] * mx + dkxy[k] * my;
+                            by += dkxy[k] * mx + dkyy[k] * my;
+                            bz += dkzz[k] * mz;
+                        }
+                    }
+
+                    row[pi][0] += bx;
+                    row[pi][1] += by;
+                    row[pi][2] += bz;
+                }
+            });
+    }
+    
     fn symmetrize(&mut self, cell_dx: f64, cell_dy: f64) {
         let r = self.radius as isize;
         for dy in -r..=r {
@@ -515,260 +542,6 @@ impl DeltaKernel2D {
     }
 }
 
-// ---------------------------
-// Barnes–Hut treecode for open-boundary Dirichlet values
-// ---------------------------
-
-#[derive(Clone, Copy)]
-struct Charge {
-    pos: [f64; 3],
-    q: f64,
-}
-
-#[derive(Clone)]
-struct BhNode {
-    center: [f64; 3],
-    half: f64,
-    q: f64,
-    p: [f64; 3],
-    children: [Option<usize>; 8],
-    indices: Vec<usize>,
-}
-
-impl BhNode {
-    fn new(center: [f64; 3], half: f64) -> Self {
-        Self {
-            center,
-            half,
-            q: 0.0,
-            p: [0.0; 3],
-            children: [None; 8],
-            indices: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn is_leaf(&self) -> bool {
-        self.children.iter().all(|c| c.is_none())
-    }
-}
-
-struct BarnesHutTree {
-    charges: Vec<Charge>,
-    nodes: Vec<BhNode>,
-    theta: f64,
-    leaf_size: usize,
-    max_depth: usize,
-}
-
-impl BarnesHutTree {
-    fn build(
-        charges: Vec<Charge>,
-        root_center: [f64; 3],
-        root_half: f64,
-        leaf_size: usize,
-        theta: f64,
-        max_depth: usize,
-    ) -> Self {
-        let mut tree = Self {
-            charges,
-            nodes: Vec::new(),
-            theta,
-            leaf_size,
-            max_depth,
-        };
-        tree.nodes.push(BhNode::new(root_center, root_half));
-
-        let n = tree.charges.len();
-        for idx in 0..n {
-            tree.insert(0, idx, 0);
-        }
-
-        tree.compute_moments_rec(0);
-        tree
-    }
-
-    #[inline]
-    fn octant(center: [f64; 3], pos: [f64; 3]) -> usize {
-        let mut o = 0usize;
-        if pos[0] >= center[0] {
-            o |= 1;
-        }
-        if pos[1] >= center[1] {
-            o |= 2;
-        }
-        if pos[2] >= center[2] {
-            o |= 4;
-        }
-        o
-    }
-
-    fn ensure_child(&mut self, node_idx: usize, oct: usize) -> usize {
-        if let Some(ci) = self.nodes[node_idx].children[oct] {
-            return ci;
-        }
-
-        let parent_center = self.nodes[node_idx].center;
-        let parent_half = self.nodes[node_idx].half;
-
-        let child_half = parent_half * 0.5;
-        let cx = parent_center[0]
-            + if (oct & 1) != 0 {
-                child_half
-            } else {
-                -child_half
-            };
-        let cy = parent_center[1]
-            + if (oct & 2) != 0 {
-                child_half
-            } else {
-                -child_half
-            };
-        let cz = parent_center[2]
-            + if (oct & 4) != 0 {
-                child_half
-            } else {
-                -child_half
-            };
-
-        let child_idx = self.nodes.len();
-        self.nodes.push(BhNode::new([cx, cy, cz], child_half));
-        self.nodes[node_idx].children[oct] = Some(child_idx);
-        child_idx
-    }
-
-    fn insert(&mut self, node_idx: usize, charge_idx: usize, depth: usize) {
-        if depth >= self.max_depth {
-            self.nodes[node_idx].indices.push(charge_idx);
-            return;
-        }
-
-        let is_leaf = self.nodes[node_idx].is_leaf();
-        if is_leaf {
-            self.nodes[node_idx].indices.push(charge_idx);
-
-            if self.nodes[node_idx].indices.len() > self.leaf_size {
-                let indices = std::mem::take(&mut self.nodes[node_idx].indices);
-                for ci in indices {
-                    let pos = self.charges[ci].pos;
-                    let oct = Self::octant(self.nodes[node_idx].center, pos);
-                    let child = self.ensure_child(node_idx, oct);
-                    self.insert(child, ci, depth + 1);
-                }
-            }
-        } else {
-            let pos = self.charges[charge_idx].pos;
-            let oct = Self::octant(self.nodes[node_idx].center, pos);
-            let child = self.ensure_child(node_idx, oct);
-            self.insert(child, charge_idx, depth + 1);
-        }
-    }
-
-    fn compute_moments_rec(&mut self, node_idx: usize) -> (f64, [f64; 3]) {
-        let center = self.nodes[node_idx].center;
-        if self.nodes[node_idx].is_leaf() {
-            let indices = self.nodes[node_idx].indices.clone();
-            let mut q = 0.0f64;
-            let mut p = [0.0f64; 3];
-            for ci in indices {
-                let c = self.charges[ci];
-                q += c.q;
-                p[0] += c.q * (c.pos[0] - center[0]);
-                p[1] += c.q * (c.pos[1] - center[1]);
-                p[2] += c.q * (c.pos[2] - center[2]);
-            }
-            self.nodes[node_idx].q = q;
-            self.nodes[node_idx].p = p;
-            (q, p)
-        } else {
-            let children = self.nodes[node_idx].children;
-            let mut q = 0.0f64;
-            let mut p = [0.0f64; 3];
-
-            for &child_opt in &children {
-                if let Some(ci) = child_opt {
-                    let (cq, cp) = self.compute_moments_rec(ci);
-                    let child_center = self.nodes[ci].center;
-                    q += cq;
-                    p[0] += cp[0] + cq * (child_center[0] - center[0]);
-                    p[1] += cp[1] + cq * (child_center[1] - center[1]);
-                    p[2] += cp[2] + cq * (child_center[2] - center[2]);
-                }
-            }
-
-            self.nodes[node_idx].q = q;
-            self.nodes[node_idx].p = p;
-            (q, p)
-        }
-    }
-
-    fn eval_phi(&self, target: [f64; 3]) -> f64 {
-        let sum = self.eval_node(0, target);
-        -sum / (4.0 * PI)
-    }
-
-    fn eval_node(&self, node_idx: usize, target: [f64; 3]) -> f64 {
-        let node = &self.nodes[node_idx];
-        if node.q == 0.0 && node.indices.is_empty() && node.is_leaf() {
-            return 0.0;
-        }
-
-        let rx = target[0] - node.center[0];
-        let ry = target[1] - node.center[1];
-        let rz = target[2] - node.center[2];
-
-        let ax = rx.abs();
-        let ay = ry.abs();
-        let az = rz.abs();
-        let dx = (ax - node.half).max(0.0);
-        let dy = (ay - node.half).max(0.0);
-        let dz = (az - node.half).max(0.0);
-        let d2 = dx * dx + dy * dy + dz * dz;
-        let d = d2.sqrt();
-
-        let r2 = rx * rx + ry * ry + rz * rz;
-        let r = r2.sqrt();
-        let size = node.half * 2.0;
-
-        let accept = if node.is_leaf() {
-            true
-        } else if d > 0.0 {
-            size / d < self.theta
-        } else {
-            false
-        };
-
-        if accept {
-            if node.is_leaf() {
-                let mut sum = 0.0f64;
-                for &ci in &node.indices {
-                    let c = self.charges[ci];
-                    let dx = target[0] - c.pos[0];
-                    let dy = target[1] - c.pos[1];
-                    let dz = target[2] - c.pos[2];
-                    let rr2 = dx * dx + dy * dy + dz * dz;
-                    if rr2 > 0.0 {
-                        sum += c.q / rr2.sqrt();
-                    }
-                }
-                sum
-            } else {
-                let inv_r = 1.0 / r;
-                let inv_r3 = inv_r * inv_r * inv_r;
-                let pr = node.p[0] * rx + node.p[1] * ry + node.p[2] * rz;
-                node.q * inv_r + pr * inv_r3
-            }
-        } else {
-            let mut sum = 0.0f64;
-            for &child_opt in &node.children {
-                if let Some(ci) = child_opt {
-                    sum += self.eval_node(ci, target);
-                }
-            }
-            sum
-        }
-    }
-}
 
 // -----------------------------------------------------------------------------
 // A3/A4 operator + multigrid hygiene upgrades (stencil/prolong/coarse-op)
@@ -932,6 +705,7 @@ impl Stencil3D {
         coeffs.push(sz);
 
         let diag = -center;
+
         Self {
             center,
             diag,
@@ -1140,78 +914,17 @@ impl Stencil3D {
         }
     }
 
-    #[inline]
-    fn clamp_idx(v: isize, lo: isize, hi: isize) -> isize {
-        if v < lo {
-            lo
-        } else if v > hi {
-            hi
-        } else {
-            v
-        }
+    fn apply_at(&self, phi: &[f64], nx: usize, ny: usize, nz: usize,
+                i: usize, j: usize, k: usize) -> f64 {
+        kernels::stencil_apply_at(phi, nx, ny, nz, i, j, k,
+                                self.center, &self.offs, &self.coeffs)
     }
 
-    #[inline]
-    fn idx(nx: usize, ny: usize, i: usize, j: usize, k: usize) -> usize {
-        (k * ny + j) * nx + i
-    }
-
-    fn apply_at(
-        &self,
-        phi: &[f64],
-        nx: usize,
-        ny: usize,
-        nz: usize,
-        i: usize,
-        j: usize,
-        k: usize,
-    ) -> f64 {
-        let idc = Self::idx(nx, ny, i, j, k);
-        let mut sum = self.center * phi[idc];
-
-        let i0 = i as isize;
-        let j0 = j as isize;
-        let k0 = k as isize;
-
-        let nxm = nx as isize - 1;
-        let nym = ny as isize - 1;
-        let nzm = nz as isize - 1;
-
-        for (off, &c) in self.offs.iter().zip(self.coeffs.iter()) {
-            let ii = Self::clamp_idx(i0 + off[0], 0, nxm) as usize;
-            let jj = Self::clamp_idx(j0 + off[1], 0, nym) as usize;
-            let kk = Self::clamp_idx(k0 + off[2], 0, nzm) as usize;
-            sum += c * phi[Self::idx(nx, ny, ii, jj, kk)];
-        }
-        sum
-    }
-
-    fn offdiag_sum_at(
-        &self,
-        phi: &[f64],
-        nx: usize,
-        ny: usize,
-        nz: usize,
-        i: usize,
-        j: usize,
-        k: usize,
-    ) -> f64 {
-        let i0 = i as isize;
-        let j0 = j as isize;
-        let k0 = k as isize;
-
-        let nxm = nx as isize - 1;
-        let nym = ny as isize - 1;
-        let nzm = nz as isize - 1;
-
-        let mut sum = 0.0;
-        for (off, &c) in self.offs.iter().zip(self.coeffs.iter()) {
-            let ii = Self::clamp_idx(i0 + off[0], 0, nxm) as usize;
-            let jj = Self::clamp_idx(j0 + off[1], 0, nym) as usize;
-            let kk = Self::clamp_idx(k0 + off[2], 0, nzm) as usize;
-            sum += c * phi[Self::idx(nx, ny, ii, jj, kk)];
-        }
-        sum
+    #[allow(dead_code)]
+    fn offdiag_sum_at(&self, phi: &[f64], nx: usize, ny: usize, nz: usize,
+                    i: usize, j: usize, k: usize) -> f64 {
+        kernels::offdiag_sum_at(phi, nx, ny, nz, i, j, k,
+                                &self.offs, &self.coeffs)
     }
 
     fn galerkin_coarsen(
@@ -1230,7 +943,7 @@ impl Stencil3D {
         let nfz = ncz * rz;
 
         let c0 = (ncx / 2, ncy / 2, ncz / 2);
-        let id_c0 = Self::idx(ncx, ncy, c0.0, c0.1, c0.2);
+        let id_c0 = kernels::idx3(c0.0, c0.1, c0.2, ncx, ncy);
 
         let mut phi_c = vec![0.0f64; ncx * ncy * ncz];
         let mut phi_f = vec![0.0f64; nfx * nfy * nfz];
@@ -1243,7 +956,7 @@ impl Stencil3D {
             for jy in 0..ncy {
                 for ix in 0..ncx {
                     phi_c.fill(0.0);
-                    phi_c[Self::idx(ncx, ncy, ix, jy, kz)] = 1.0;
+                    phi_c[kernels::idx3(ix, jy, kz, ncx, ncy)] = 1.0;
 
                     prolongate_scalar(
                         &phi_c, ncx, ncy, ncz, &mut phi_f, nfx, nfy, nfz, rx, ry, rz, prolong,
@@ -1284,6 +997,32 @@ impl Stencil3D {
         }
 
         let diag = -center;
+
+        // Validate Galerkin-coarsened stencil.
+        // If the diagonal is non-positive or the Jacobi spectral radius
+        // is too large, the smoother will diverge (producing NaN).
+        // This happens with extreme cell aspect ratios (thin-film geometries).
+        let offdiag_abs_sum: f64 = coeffs.iter().map(|c| c.abs()).sum();
+        let neg_offdiag = coeffs.iter().filter(|&&c| c < 0.0).count();
+        let jacobi_rho = if diag > 0.0 { offdiag_abs_sum / diag } else { f64::INFINITY };
+
+        if diag <= 0.0 || jacobi_rho > 2.0 || neg_offdiag > coeffs.len() / 2 {
+            eprintln!(
+                "[demag_mg] WARNING: Galerkin produced ill-conditioned stencil \
+                 (diag={:.3e}, jacobi_rho={:.2}, neg_offdiag={}/{}). \
+                 Will use rediscretization instead.",
+                diag, jacobi_rho, neg_offdiag, coeffs.len()
+            );
+            // Return a sentinel that the level builder can detect
+            // to trigger fallback to rediscretization.
+            return Self {
+                center: 0.0,
+                diag: 0.0,
+                offs: Vec::new(),
+                coeffs: Vec::new(),
+            };
+        }
+
         Self {
             center,
             diag,
@@ -1307,7 +1046,7 @@ fn apply_stencil_to_field(
     for k in 0..nz {
         for j in 0..ny {
             for i in 0..nx {
-                out[Stencil3D::idx(nx, ny, i, j, k)] = st.apply_at(phi, nx, ny, nz, i, j, k);
+                out[kernels::idx3(i, j, k, nx, ny)] = st.apply_at(phi, nx, ny, nz, i, j, k);
             }
         }
     }
@@ -1341,11 +1080,11 @@ fn restrict_scalar_avg(
                             let i = ix * rx + fi;
                             let j = jy * ry + fj;
                             let k = kz * rz + fk;
-                            sum += fine[Stencil3D::idx(nfx, nfy, i, j, k)];
+                            sum += fine[kernels::idx3(i, j, k, nfx, nfy)];
                         }
                     }
                 }
-                coarse[Stencil3D::idx(ncx, ncy, ix, jy, kz)] = norm * sum;
+                coarse[kernels::idx3(ix, jy, kz, ncx, ncy)] = norm * sum;
             }
         }
     }
@@ -1374,14 +1113,14 @@ fn prolongate_scalar(
             for kz in 0..ncz {
                 for jy in 0..ncy {
                     for ix in 0..ncx {
-                        let v = coarse[Stencil3D::idx(ncx, ncy, ix, jy, kz)];
+                        let v = coarse[kernels::idx3(ix, jy, kz, ncx, ncy)];
                         for fk in 0..rz {
                             for fj in 0..ry {
                                 for fi in 0..rx {
                                     let i = ix * rx + fi;
                                     let j = jy * ry + fj;
                                     let k = kz * rz + fk;
-                                    fine[Stencil3D::idx(nfx, nfy, i, j, k)] = v;
+                                    fine[kernels::idx3(i, j, k, nfx, nfy)] = v;
                                 }
                             }
                         }
@@ -1408,16 +1147,16 @@ fn prolongate_scalar(
 
                         let mut v = 0.0;
 
-                        v += wi0 * wj0 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i0, j0, k0)];
-                        v += wi1 * wj0 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i1, j0, k0)];
-                        v += wi0 * wj1 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i0, j1, k0)];
-                        v += wi1 * wj1 * wk0 * coarse[Stencil3D::idx(ncx, ncy, i1, j1, k0)];
-                        v += wi0 * wj0 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i0, j0, k1)];
-                        v += wi1 * wj0 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i1, j0, k1)];
-                        v += wi0 * wj1 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i0, j1, k1)];
-                        v += wi1 * wj1 * wk1 * coarse[Stencil3D::idx(ncx, ncy, i1, j1, k1)];
+                        v += wi0 * wj0 * wk0 * coarse[kernels::idx3(i0, j0, k0, ncx, ncy)];
+                        v += wi1 * wj0 * wk0 * coarse[kernels::idx3(i1, j0, k0, ncx, ncy)];
+                        v += wi0 * wj1 * wk0 * coarse[kernels::idx3(i0, j1, k0, ncx, ncy)];
+                        v += wi1 * wj1 * wk0 * coarse[kernels::idx3(i1, j1, k0, ncx, ncy)];
+                        v += wi0 * wj0 * wk1 * coarse[kernels::idx3(i0, j0, k1, ncx, ncy)];
+                        v += wi1 * wj0 * wk1 * coarse[kernels::idx3(i1, j0, k1, ncx, ncy)];
+                        v += wi0 * wj1 * wk1 * coarse[kernels::idx3(i0, j1, k1, ncx, ncy)];
+                        v += wi1 * wj1 * wk1 * coarse[kernels::idx3(i1, j1, k1, ncx, ncy)];
 
-                        fine[Stencil3D::idx(nfx, nfy, i, j, k)] = v;
+                        fine[kernels::idx3(i, j, k, nfx, nfy)] = v;
                     }
                 }
             }
@@ -1425,35 +1164,6 @@ fn prolongate_scalar(
     }
 }
 
-fn interp_1d_cell_centered(
-    i_coarse: usize,
-    r_i: usize,
-    n_coarse: usize,
-    r: usize,
-) -> (usize, usize, f64, f64) {
-    if r == 1 {
-        let i0 = i_coarse.min(n_coarse - 1);
-        return (i0, i0, 1.0, 0.0);
-    }
-    debug_assert!(r == 2);
-
-    let i0 = i_coarse.min(n_coarse - 1);
-    if r_i == 0 {
-        let i1 = if i0 > 0 { i0 - 1 } else { 0 };
-        if i1 == i0 {
-            (i0, i0, 1.0, 0.0)
-        } else {
-            (i0, i1, 0.75, 0.25)
-        }
-    } else {
-        let i1 = (i0 + 1).min(n_coarse - 1);
-        if i1 == i0 {
-            (i0, i0, 1.0, 0.0)
-        } else {
-            (i0, i1, 0.75, 0.25)
-        }
-    }
-}
 
 // ---------------------------
 // Multigrid data structures
@@ -1503,10 +1213,11 @@ impl MGLevel {
     }
 
     fn enforce_dirichlet(&mut self) {
-        stamp_dirichlet_bc(&mut self.phi, &self.bc_phi, self.nx, self.ny, self.nz);
+        kernels::stamp_dirichlet_bc(&mut self.phi, &self.bc_phi, self.nx, self.ny, self.nz);
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn idx(&self, i: usize, j: usize, k: usize) -> usize {
         idx3(i, j, k, self.nx, self.ny)
     }
@@ -1580,6 +1291,12 @@ impl DemagPoissonMG {
         if pz % 2 == 1 {
             pz += 1;
         }
+        // Round up to next multiple of 4 so z can coarsen at least twice
+        // before becoming odd. This avoids mixed-ratio Galerkin coarsening
+        // which produces degenerate stencils for anisotropic grids.
+        if pz % 4 != 0 {
+            pz = ((pz + 3) / 4) * 4;
+        }
 
         let offx = (px.saturating_sub(nx)) / 2;
         let offy = (py.saturating_sub(ny)) / 2;
@@ -1621,6 +1338,23 @@ impl DemagPoissonMG {
             }
         }
 
+        // Warn about extreme cell aspect ratios that may degrade MG convergence.
+        {
+            let aspect_xy = (grid.dx / grid.dy).max(grid.dy / grid.dx);
+            let aspect_xz = (grid.dx / grid.dz).max(grid.dz / grid.dx);
+            let aspect_yz = (grid.dy / grid.dz).max(grid.dz / grid.dy);
+            let max_aspect = aspect_xy.max(aspect_xz).max(aspect_yz);
+            if max_aspect > 4.0 {
+                eprintln!(
+                    "[demag_mg] WARNING: extreme cell aspect ratio {:.1} \
+                     (dx={:.2e}, dy={:.2e}, dz={:.2e}). \
+                     Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) \
+                     or adjusting n_vac_z for better conditioning.",
+                    max_aspect, grid.dx, grid.dy, grid.dz,
+                );
+            }
+        }
+
         // Assign stencils per level.
         if !levels.is_empty() {
             levels[0].stencil = Stencil3D::from_kind(
@@ -1644,7 +1378,28 @@ impl DemagPoissonMG {
                         op.iso27_alpha_bits,
                     ),
                     CoarseOpKind::Galerkin => {
-                        Stencil3D::galerkin_coarsen(&levels[l - 1].stencil, rx, ry, rz, op.prolong)
+                        let g = Stencil3D::galerkin_coarsen(
+                            &levels[l - 1].stencil, rx, ry, rz, op.prolong,
+                        );
+                        if g.diag <= 0.0 || g.offs.is_empty() {
+                            // Galerkin produced a degenerate stencil — fall back
+                            // to rediscretization at this level and all coarser.
+                            eprintln!(
+                                "[demag_mg] Falling back to rediscretization at level {} \
+                                 ({}×{}×{}, dx={:.2e} dy={:.2e} dz={:.2e})",
+                                l, levels[l].nx, levels[l].ny, levels[l].nz,
+                                levels[l].dx, levels[l].dy, levels[l].dz,
+                            );
+                            Stencil3D::from_kind(
+                                op.stencil,
+                                levels[l].dx,
+                                levels[l].dy,
+                                levels[l].dz,
+                                op.iso27_alpha_bits,
+                            )
+                        } else {
+                            g
+                        }
                     }
                 };
             }
@@ -1680,7 +1435,7 @@ impl DemagPoissonMG {
             && self.op == MGOperatorSettings::from_env()
     }
 
-    fn build_rhs_from_m(&mut self, m: &VectorField2D, ms: f64) {
+    pub(crate) fn build_rhs_from_m(&mut self, m: &VectorField2D, ms: f64) {
         let finest = &mut self.levels[0];
         finest.rhs.fill(0.0);
 
@@ -1896,209 +1651,24 @@ impl DemagPoissonMG {
         match self.cfg.bc {
             BoundaryCondition::DirichletZero => {}
             BoundaryCondition::DirichletDipole => {
-                let dx = finest.dx;
-                let dy = finest.dy;
-                let dz = finest.dz;
-                let dvol = dx * dy * dz;
-
-                let cx = (finest.nx as f64) * 0.5;
-                let cy = (finest.ny as f64) * 0.5;
-                let cz = (finest.nz as f64) * 0.5;
-
-                let mut q = 0.0f64;
-                let mut pxm = 0.0f64;
-                let mut pym = 0.0f64;
-                let mut pzm = 0.0f64;
-
-                for k in 0..finest.nz {
-                    let z = (k as f64 + 0.5 - cz) * dz;
-                    for j in 0..finest.ny {
-                        let y = (j as f64 + 0.5 - cy) * dy;
-                        let row = (k * finest.ny + j) * finest.nx;
-                        for i in 0..finest.nx {
-                            let x = (i as f64 + 0.5 - cx) * dx;
-                            let rho = finest.rhs[row + i];
-                            let w = rho * dvol;
-                            q += w;
-                            pxm += w * x;
-                            pym += w * y;
-                            pzm += w * z;
-                        }
-                    }
-                }
-
-                let inv4pi = 1.0 / (4.0 * PI);
-
-                let nx = finest.nx;
-                let ny = finest.ny;
-                let nz = finest.nz;
-
-                for k in 0..nz {
-                    let z = (k as f64 + 0.5 - cz) * dz;
-                    for j in 0..ny {
-                        let y = (j as f64 + 0.5 - cy) * dy;
-
-                        {
-                            let i = 0usize;
-                            let x = (i as f64 + 0.5 - cx) * dx;
-                            let r2 = x * x + y * y + z * z;
-                            if r2 > 0.0 {
-                                let r = r2.sqrt();
-                                let pr = pxm * x + pym * y + pzm * z;
-                                finest.bc_phi[idx3(i, j, k, nx, ny)] =
-                                    -inv4pi * (q / r + pr / (r * r * r));
-                            }
-                        }
-                        {
-                            let i = nx - 1;
-                            let x = (i as f64 + 0.5 - cx) * dx;
-                            let r2 = x * x + y * y + z * z;
-                            if r2 > 0.0 {
-                                let r = r2.sqrt();
-                                let pr = pxm * x + pym * y + pzm * z;
-                                finest.bc_phi[idx3(i, j, k, nx, ny)] =
-                                    -inv4pi * (q / r + pr / (r * r * r));
-                            }
-                        }
-                    }
-
-                    for i in 0..nx {
-                        let x = (i as f64 + 0.5 - cx) * dx;
-
-                        {
-                            let j = 0usize;
-                            let y = (j as f64 + 0.5 - cy) * dy;
-                            let r2 = x * x + y * y + z * z;
-                            if r2 > 0.0 {
-                                let r = r2.sqrt();
-                                let pr = pxm * x + pym * y + pzm * z;
-                                finest.bc_phi[idx3(i, j, k, nx, ny)] =
-                                    -inv4pi * (q / r + pr / (r * r * r));
-                            }
-                        }
-                        {
-                            let j = ny - 1;
-                            let y = (j as f64 + 0.5 - cy) * dy;
-                            let r2 = x * x + y * y + z * z;
-                            if r2 > 0.0 {
-                                let r = r2.sqrt();
-                                let pr = pxm * x + pym * y + pzm * z;
-                                finest.bc_phi[idx3(i, j, k, nx, ny)] =
-                                    -inv4pi * (q / r + pr / (r * r * r));
-                            }
-                        }
-                    }
-                }
-
-                for j in 0..ny {
-                    let y = (j as f64 + 0.5 - cy) * dy;
-                    for i in 0..nx {
-                        let x = (i as f64 + 0.5 - cx) * dx;
-
-                        {
-                            let k = 0usize;
-                            let z = (k as f64 + 0.5 - cz) * dz;
-                            let r2 = x * x + y * y + z * z;
-                            if r2 > 0.0 {
-                                let r = r2.sqrt();
-                                let pr = pxm * x + pym * y + pzm * z;
-                                finest.bc_phi[idx3(i, j, k, nx, ny)] =
-                                    -inv4pi * (q / r + pr / (r * r * r));
-                            }
-                        }
-                        {
-                            let k = nz - 1;
-                            let z = (k as f64 + 0.5 - cz) * dz;
-                            let r2 = x * x + y * y + z * z;
-                            if r2 > 0.0 {
-                                let r = r2.sqrt();
-                                let pr = pxm * x + pym * y + pzm * z;
-                                finest.bc_phi[idx3(i, j, k, nx, ny)] =
-                                    -inv4pi * (q / r + pr / (r * r * r));
-                            }
-                        }
-                    }
-                }
+                treecode::evaluate_dipole_bc(
+                    &mut finest.bc_phi, &finest.rhs,
+                    finest.nx, finest.ny, finest.nz,
+                    finest.dx, finest.dy, finest.dz,
+                );
             }
-
             BoundaryCondition::DirichletTreecode => {
-                let dx = finest.dx;
-                let dy = finest.dy;
-                let dz = finest.dz;
-                let dvol = dx * dy * dz;
-
-                let cx = (finest.nx as f64) * 0.5;
-                let cy = (finest.ny as f64) * 0.5;
-                let cz = (finest.nz as f64) * 0.5;
-
-                let mut charges: Vec<Charge> = Vec::new();
-                charges.reserve(finest.rhs.len() / 8);
-
-                for k in 0..finest.nz {
-                    let z = (k as f64 + 0.5 - cz) * dz;
-                    for j in 0..finest.ny {
-                        let y = (j as f64 + 0.5 - cy) * dy;
-                        let row = (k * finest.ny + j) * finest.nx;
-                        for i in 0..finest.nx {
-                            let rho = finest.rhs[row + i];
-                            if rho.abs() < 1e-40 {
-                                continue;
-                            }
-                            let x = (i as f64 + 0.5 - cx) * dx;
-                            charges.push(Charge {
-                                pos: [x, y, z],
-                                q: rho * dvol,
-                            });
-                        }
-                    }
-                }
-
-                if !charges.is_empty() {
-                    let lx = (finest.nx as f64) * dx;
-                    let ly = (finest.ny as f64) * dy;
-                    let lz = (finest.nz as f64) * dz;
-                    let root_half = 0.5 * lx.max(ly).max(lz) + 1e-12;
-
-                    let tree = BarnesHutTree::build(
-                        charges,
-                        [0.0, 0.0, 0.0],
-                        root_half,
-                        self.cfg.tree_leaf,
-                        self.cfg.tree_theta,
-                        self.cfg.tree_max_depth,
-                    );
-
-                    let nx = finest.nx;
-                    let ny = finest.ny;
-                    let nz = finest.nz;
-
-                    finest
-                        .bc_phi
-                        .par_chunks_mut(nx)
-                        .enumerate()
-                        .for_each(|(row_idx, bc_row)| {
-                            let k = row_idx / ny;
-                            let j = row_idx % ny;
-
-                            let z = (k as f64 + 0.5 - cz) * dz;
-                            let y = (j as f64 + 0.5 - cy) * dy;
-
-                            if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                                for i in 0..nx {
-                                    let x = (i as f64 + 0.5 - cx) * dx;
-                                    bc_row[i] = tree.eval_phi([x, y, z]);
-                                }
-                            } else {
-                                let i0 = 0usize;
-                                let x0 = (i0 as f64 + 0.5 - cx) * dx;
-                                bc_row[i0] = tree.eval_phi([x0, y, z]);
-
-                                let i1 = nx - 1;
-                                let x1 = (i1 as f64 + 0.5 - cx) * dx;
-                                bc_row[i1] = tree.eval_phi([x1, y, z]);
-                            }
-                        });
-                }
+                let charges = treecode::build_charges_from_rhs(
+                    &finest.rhs,
+                    finest.nx, finest.ny, finest.nz,
+                    finest.dx, finest.dy, finest.dz,
+                );
+                treecode::evaluate_treecode_bc(
+                    &mut finest.bc_phi, charges,
+                    finest.nx, finest.ny, finest.nz,
+                    finest.dx, finest.dy, finest.dz,
+                    self.cfg.tree_leaf, self.cfg.tree_theta, self.cfg.tree_max_depth,
+                );
             }
         }
 
@@ -2106,307 +1676,45 @@ impl DemagPoissonMG {
     }
 
     fn smooth_weighted_jacobi(level: &mut MGLevel, iters: usize, omega: f64) {
-        let nx = level.nx;
-        let ny = level.ny;
-        let nz = level.nz;
-
-        let st = level.stencil.clone();
-
-        for _ in 0..iters {
-            level.tmp.copy_from_slice(&level.phi);
-
-            {
-                let tmp: &[f64] = &level.tmp;
-                let rhs: &[f64] = &level.rhs;
-                let st_ref = &st;
-
-                level
-                    .phi
-                    .par_chunks_mut(nx)
-                    .enumerate()
-                    .for_each(|(row_idx, phi_row)| {
-                        let k = row_idx / ny;
-                        let j = row_idx % ny;
-
-                        if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                            return;
-                        }
-
-                        let base = row_idx * nx;
-                        for i in 1..(nx - 1) {
-                            let id = base + i;
-                            let off = st_ref.offdiag_sum_at(tmp, nx, ny, nz, i, j, k);
-                            let phi_gs = (off - rhs[id]) / st_ref.diag;
-                            phi_row[i] = (1.0 - omega) * tmp[id] + omega * phi_gs;
-                        }
-                    });
-            }
-
-            level.enforce_dirichlet();
-        }
+        kernels::smooth_weighted_jacobi(
+            &mut level.phi, &mut level.tmp, &level.rhs, &level.bc_phi,
+            level.nx, level.ny, level.nz,
+            level.stencil.diag, &level.stencil.offs, &level.stencil.coeffs,
+            iters, omega,
+        );
     }
 
     fn smooth_rb_sor(level: &mut MGLevel, iters: usize, omega: f64) {
-        let nx = level.nx;
-        let ny = level.ny;
-        let nz = level.nz;
-
-        let sx = level.inv_dx2;
-        let sy = level.inv_dy2;
-        let sz = level.inv_dz2;
-
-        let denom = 2.0 * (sx + sy + sz);
-        let plane = nx * ny;
-
-        for _ in 0..iters {
-            for color in 0..2usize {
-                let phi_ro: &[f64] = &level.phi;
-                let rhs_ro: &[f64] = &level.rhs;
-
-                level
-                    .tmp
-                    .par_chunks_mut(nx)
-                    .enumerate()
-                    .for_each(|(row_idx, tmp_row)| {
-                        let k = row_idx / ny;
-                        let j = row_idx % ny;
-
-                        if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                            return;
-                        }
-
-                        let base = row_idx * nx;
-
-                        for i in 1..(nx - 1) {
-                            if ((i + j + k) & 1) != color {
-                                continue;
-                            }
-                            let id = base + i;
-
-                            let xm = phi_ro[id - 1];
-                            let xp = phi_ro[id + 1];
-                            let ym = phi_ro[id - nx];
-                            let yp = phi_ro[id + nx];
-                            let zm = phi_ro[id - plane];
-                            let zp = phi_ro[id + plane];
-
-                            let off = sx * (xm + xp) + sy * (ym + yp) + sz * (zm + zp);
-                            let rhs = rhs_ro[id];
-                            let phi_new = (off - rhs) / denom;
-
-                            let phi_old = phi_ro[id];
-                            tmp_row[i] = phi_old + omega * (phi_new - phi_old);
-                        }
-                    });
-
-                let tmp_ro: &[f64] = &level.tmp;
-                level
-                    .phi
-                    .par_chunks_mut(nx)
-                    .enumerate()
-                    .for_each(|(row_idx, phi_row)| {
-                        let k = row_idx / ny;
-                        let j = row_idx % ny;
-
-                        if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                            return;
-                        }
-
-                        let base = row_idx * nx;
-
-                        for i in 1..(nx - 1) {
-                            if ((i + j + k) & 1) != color {
-                                continue;
-                            }
-                            let id = base + i;
-                            phi_row[i] = tmp_ro[id];
-                        }
-                    });
-            }
-
-            level.enforce_dirichlet();
-        }
+        kernels::smooth_rb_sor(
+            &mut level.phi, &mut level.tmp, &level.rhs, &level.bc_phi,
+            level.nx, level.ny, level.nz,
+            level.inv_dx2, level.inv_dy2, level.inv_dz2,
+            iters, omega,
+        );
     }
 
     fn compute_residual(level: &mut MGLevel) -> f64 {
-        let nx = level.nx;
-        let ny = level.ny;
-        let nz = level.nz;
-
-        let phi: &[f64] = &level.phi;
-        let rhs: &[f64] = &level.rhs;
-        let st = &level.stencil;
-
-        level
-            .res
-            .par_chunks_mut(nx)
-            .enumerate()
-            .map(|(row_idx, res_row)| {
-                let k = row_idx / ny;
-                let j = row_idx % ny;
-
-                if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                    res_row.fill(0.0);
-                    return 0.0f64;
-                }
-
-                let base = row_idx * nx;
-                let mut max_abs: f64 = 0.0;
-
-                res_row[0] = 0.0;
-                res_row[nx - 1] = 0.0;
-
-                for i in 1..(nx - 1) {
-                    let id = base + i;
-                    let aphi = st.apply_at(phi, nx, ny, nz, i, j, k);
-                    let r = rhs[id] - aphi;
-
-                    res_row[i] = r;
-                    max_abs = max_abs.max(r.abs());
-                }
-
-                max_abs
-            })
-            .reduce(|| 0.0, |a, b| a.max(b))
+        kernels::compute_residual(
+            &level.phi, &level.rhs, &mut level.res,
+            level.nx, level.ny, level.nz,
+            level.stencil.center, &level.stencil.offs, &level.stencil.coeffs,
+        )
     }
 
     fn restrict_residual(fine: &MGLevel, coarse: &mut MGLevel) {
-        coarse.rhs.fill(0.0);
-        coarse.phi.fill(0.0);
-
-        let nxc = coarse.nx;
-        let nyc = coarse.ny;
-        let nzc = coarse.nz;
-
-        let rxf = fine.nx / coarse.nx;
-        let ryf = fine.ny / coarse.ny;
-        let rzf = fine.nz / coarse.nz;
-
-        debug_assert!(rxf == 1 || rxf == 2);
-        debug_assert!(ryf == 1 || ryf == 2);
-        debug_assert!(rzf == 1 || rzf == 2);
-
-        coarse
-            .rhs
-            .par_chunks_mut(nxc)
-            .enumerate()
-            .for_each(|(rowc_idx, rhs_row)| {
-                let kc = rowc_idx / nyc;
-                let jc = rowc_idx % nyc;
-                if kc == 0 || kc + 1 == nzc || jc == 0 || jc + 1 == nyc {
-                    return;
-                }
-
-                for ic in 1..(nxc - 1) {
-                    let fi0 = rxf * ic;
-                    let fj0 = ryf * jc;
-                    let fk0 = rzf * kc;
-
-                    let mut sum = 0.0;
-                    for dk in 0..rzf {
-                        for dj in 0..ryf {
-                            for di in 0..rxf {
-                                let id_f = idx3(fi0 + di, fj0 + dj, fk0 + dk, fine.nx, fine.ny);
-                                sum += fine.res[id_f];
-                            }
-                        }
-                    }
-
-                    let w = 1.0 / ((rxf * ryf * rzf) as f64);
-                    rhs_row[ic] = w * sum;
-                }
-            });
+        kernels::restrict_residual(
+            &fine.res, fine.nx, fine.ny, fine.nz,
+            &mut coarse.rhs, &mut coarse.phi,
+            coarse.nx, coarse.ny, coarse.nz,
+        );
     }
 
     fn prolongate_add(coarse: &MGLevel, fine: &mut MGLevel, kind: ProlongationKind) {
-        let rx = fine.nx / coarse.nx;
-        let ry = fine.ny / coarse.ny;
-        let rz = fine.nz / coarse.nz;
-
-        let nfx = fine.nx;
-        let nfy = fine.ny;
-        let nfz = fine.nz;
-
-        match kind {
-            ProlongationKind::Injection => {
-                let cphi: &[f64] = &coarse.phi;
-
-                fine.phi
-                    .par_chunks_mut(nfx)
-                    .enumerate()
-                    .for_each(|(row_idx, phi_row)| {
-                        let k = row_idx / nfy;
-                        let j = row_idx % nfy;
-
-                        if k == 0 || k + 1 == nfz || j == 0 || j + 1 == nfy {
-                            return;
-                        }
-
-                        let kc = k / rz;
-                        let jc = j / ry;
-
-                        for i in 1..(nfx - 1) {
-                            let ic = i / rx;
-
-                            if ic == 0
-                                || ic + 1 >= coarse.nx
-                                || jc == 0
-                                || jc + 1 >= coarse.ny
-                                || kc == 0
-                                || kc + 1 >= coarse.nz
-                            {
-                                continue;
-                            }
-
-                            let v = cphi[coarse.idx(ic, jc, kc)];
-                            phi_row[i] += v;
-                        }
-                    });
-            }
-
-            ProlongationKind::Trilinear => {
-                let cphi: &[f64] = &coarse.phi;
-
-                fine.phi
-                    .par_chunks_mut(nfx)
-                    .enumerate()
-                    .for_each(|(row_idx, phi_row)| {
-                        let k = row_idx / nfy;
-                        let j = row_idx % nfy;
-
-                        if k == 0 || k + 1 == nfz || j == 0 || j + 1 == nfy {
-                            return;
-                        }
-
-                        let kz = k / rz;
-                        let rk = k % rz;
-                        let (k0, k1, wk0, wk1) = interp_1d_cell_centered(kz, rk, coarse.nz, rz);
-
-                        let jy = j / ry;
-                        let rj = j % ry;
-                        let (j0, j1, wj0, wj1) = interp_1d_cell_centered(jy, rj, coarse.ny, ry);
-
-                        for i in 1..(nfx - 1) {
-                            let ix = i / rx;
-                            let ri = i % rx;
-                            let (i0, i1, wi0, wi1) = interp_1d_cell_centered(ix, ri, coarse.nx, rx);
-
-                            let mut v = 0.0;
-
-                            v += wi0 * wj0 * wk0 * cphi[coarse.idx(i0, j0, k0)];
-                            v += wi1 * wj0 * wk0 * cphi[coarse.idx(i1, j0, k0)];
-                            v += wi0 * wj1 * wk0 * cphi[coarse.idx(i0, j1, k0)];
-                            v += wi1 * wj1 * wk0 * cphi[coarse.idx(i1, j1, k0)];
-                            v += wi0 * wj0 * wk1 * cphi[coarse.idx(i0, j0, k1)];
-                            v += wi1 * wj0 * wk1 * cphi[coarse.idx(i1, j0, k1)];
-                            v += wi0 * wj1 * wk1 * cphi[coarse.idx(i0, j1, k1)];
-                            v += wi1 * wj1 * wk1 * cphi[coarse.idx(i1, j1, k1)];
-
-                            phi_row[i] += v;
-                        }
-                    });
-            }
-        }
+        kernels::prolongate_add(
+            &coarse.phi, coarse.nx, coarse.ny, coarse.nz,
+            &mut fine.phi, fine.nx, fine.ny, fine.nz,
+            kind == ProlongationKind::Trilinear,
+        );
     }
 
     fn v_cycle(&mut self, l: usize) {
@@ -2424,6 +1732,23 @@ impl DemagPoissonMG {
                 }
                 MGSmoother::RedBlackSOR => Self::smooth_rb_sor(&mut self.levels[l], 80, omega_sor),
             }
+
+            // NaN guard: detect divergence at the coarsest level before it
+            // propagates upward through prolongation.
+            #[cfg(debug_assertions)]
+            {
+                let has_nan = self.levels[l].phi.iter().any(|v| !v.is_finite());
+                if has_nan {
+                    let lev = &self.levels[l];
+                    eprintln!(
+                        "[demag_mg] NaN/Inf detected at coarsest level {} \
+                         ({}×{}×{}, diag={:.3e}). \
+                         Stencil may be degenerate for this grid geometry.",
+                        l, lev.nx, lev.ny, lev.nz, lev.stencil.diag,
+                    );
+                }
+            }
+
             return;
         }
 
@@ -2529,6 +1854,28 @@ impl DemagPoissonMG {
             self.v_cycle(0);
             self.levels[0].enforce_dirichlet();
 
+            // Early exit if the solution has diverged to NaN/Inf.
+            // This prevents wasting cycles on garbage data and gives
+            // a clearer diagnostic than downstream NaN propagation.
+            if iter % 2 == 1 || iter + 1 == max_cycles {
+                let has_bad = self.levels[0].phi.iter()
+                    .take(self.levels[0].nx * self.levels[0].ny * 2)
+                    .any(|v| !v.is_finite());
+                if has_bad {
+                    eprintln!(
+                        "[demag_mg] ERROR: NaN/Inf in phi after V-cycle {}. \
+                         Solver diverged — check grid aspect ratio and stencil. \
+                         (grid={}×{}×{}, dx={:.2e}, dz={:.2e})",
+                        iter + 1,
+                        self.levels[0].nx, self.levels[0].ny, self.levels[0].nz,
+                        self.levels[0].dx, self.levels[0].dz,
+                    );
+                    self.levels[0].phi.fill(0.0);
+                    self.levels[0].enforce_dirichlet();
+                    break;
+                }
+            }
+
             if use_tol && (iter + 1) >= min_cycles {
                 let max_r = Self::compute_residual(&mut self.levels[0]);
                 if max_r <= tol_target {
@@ -2552,7 +1899,7 @@ impl DemagPoissonMG {
         (bc_ns, solve_ns)
     }
 
-    fn solve(&mut self) {
+    pub(crate) fn solve(&mut self) {
         let _ = self.solve_with_timing();
     }
 
@@ -2565,7 +1912,7 @@ impl DemagPoissonMG {
         self.add_b_from_phi_on_magnet_layer_impl(Some(&m.data), b_eff);
     }
 
-    fn add_b_from_phi_on_magnet_layer_all(&self, b_eff: &mut VectorField2D) {
+    pub(crate) fn add_b_from_phi_on_magnet_layer_all(&self, b_eff: &mut VectorField2D) {
         self.add_b_from_phi_on_magnet_layer_impl(None, b_eff);
     }
 
@@ -2575,98 +1922,50 @@ impl DemagPoissonMG {
         b_eff: &mut VectorField2D,
     ) {
         let finest = &self.levels[0];
-        let phi = &finest.phi;
-
-        let nx_m = self.grid.nx;
-
-        let dx = finest.dx;
-        let dy = finest.dy;
-        let dz = finest.dz;
-
-        let k = self.offz;
-
-        #[inline]
-        fn is_mag(mv: [f64; 3]) -> bool {
-            let n2 = mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2];
-            n2 > 1e-30
-        }
-
-        b_eff
-            .data
-            .par_chunks_mut(nx_m)
-            .enumerate()
-            .for_each(|(j, row)| {
-                let pj = self.offy + j;
-                for i in 0..nx_m {
-                    let idx2 = j * nx_m + i;
-                    if let Some(mdata) = mdata_opt {
-                        if !is_mag(mdata[idx2]) {
-                            continue;
-                        }
-                    }
-
-                    let pi = self.offx + i;
-                    let phi_c = phi[idx3(pi, pj, k, self.px, self.py)];
-
-                    let mut dphi_dx = 0.0;
-                    let mut wdx = 0.0;
-                    if pi + 1 < self.px {
-                        let phi_p = phi[idx3(pi + 1, pj, k, self.px, self.py)];
-                        dphi_dx += (phi_p - phi_c) / dx;
-                        wdx += 1.0;
-                    }
-                    if pi > 0 {
-                        let phi_m = phi[idx3(pi - 1, pj, k, self.px, self.py)];
-                        dphi_dx += (phi_c - phi_m) / dx;
-                        wdx += 1.0;
-                    }
-                    if wdx > 0.0 {
-                        dphi_dx /= wdx;
-                    }
-
-                    let mut dphi_dy = 0.0;
-                    let mut wdy = 0.0;
-                    if pj + 1 < self.py {
-                        let phi_p = phi[idx3(pi, pj + 1, k, self.px, self.py)];
-                        dphi_dy += (phi_p - phi_c) / dy;
-                        wdy += 1.0;
-                    }
-                    if pj > 0 {
-                        let phi_m = phi[idx3(pi, pj - 1, k, self.px, self.py)];
-                        dphi_dy += (phi_c - phi_m) / dy;
-                        wdy += 1.0;
-                    }
-                    if wdy > 0.0 {
-                        dphi_dy /= wdy;
-                    }
-
-                    let mut dphi_dz = 0.0;
-                    let mut wdz = 0.0;
-                    if k + 1 < self.pz {
-                        let phi_p = phi[idx3(pi, pj, k + 1, self.px, self.py)];
-                        dphi_dz += (phi_p - phi_c) / dz;
-                        wdz += 1.0;
-                    }
-                    if k > 0 {
-                        let phi_m = phi[idx3(pi, pj, k - 1, self.px, self.py)];
-                        dphi_dz += (phi_c - phi_m) / dz;
-                        wdz += 1.0;
-                    }
-                    if wdz > 0.0 {
-                        dphi_dz /= wdz;
-                    }
-
-                    row[i][0] += -MU0 * dphi_dx;
-                    row[i][1] += -MU0 * dphi_dy;
-                    row[i][2] += -MU0 * dphi_dz;
-                }
-            });
+        kernels::extract_gradient_on_magnet_layer(
+            &finest.phi,
+            self.px, self.py, self.pz,
+            finest.dx, finest.dy, finest.dz,
+            self.offx, self.offy, self.offz,
+            self.grid.nx, self.grid.ny,
+            MU0,
+            &mut b_eff.data,
+            mdata_opt,
+        );
     }
 
     pub fn add_field(&mut self, m: &VectorField2D, b_eff: &mut VectorField2D, ms: f64) {
         self.build_rhs_from_m(m, ms);
         self.solve();
         self.add_b_from_phi_on_magnet_layer(m, ms, b_eff);
+    }
+
+    // -- Composite-grid accessors (used by mg_composite) ---------------------
+
+    /// Padded box dimensions.
+    pub(crate) fn padded_dims(&self) -> (usize, usize, usize) {
+        (self.px, self.py, self.pz)
+    }
+
+    /// Offsets from padded-box origin to magnet-layer origin.
+    pub(crate) fn magnet_offsets(&self) -> (usize, usize, usize) {
+        (self.offx, self.offy, self.offz)
+    }
+
+    /// Read-only access to finest-level φ.
+    #[allow(dead_code)]
+    pub(crate) fn finest_phi(&self) -> &[f64] {
+        &self.levels[0].phi
+    }
+
+    /// Mutable access to finest-level RHS (for injecting patch residuals).
+    pub(crate) fn finest_rhs_mut(&mut self) -> &mut [f64] {
+        &mut self.levels[0].rhs
+    }
+
+    /// The physical grid this solver was built for.
+    pub(crate) fn base_grid(&self) -> Grid2D {
+        self.grid
     }
 }
 
@@ -2775,16 +2074,16 @@ impl DeltaKernelKey {
     }
 }
 
-struct DemagPoissonMGHybrid {
-    mg: DemagPoissonMG,
-    hyb: HybridConfig,
+pub(crate) struct DemagPoissonMGHybrid {
+    pub(crate) mg: DemagPoissonMG,
+    pub(crate) hyb: HybridConfig,
 
     dk_key: Option<DeltaKernelKey>,
     dk: Option<DeltaKernel2D>,
 }
 
 impl DemagPoissonMGHybrid {
-    fn new(grid: Grid2D, mut mg_cfg: DemagPoissonMGConfig, hyb: HybridConfig) -> Self {
+    pub(crate) fn new(grid: Grid2D, mut mg_cfg: DemagPoissonMGConfig, hyb: HybridConfig) -> Self {
         let op = MGOperatorSettings::from_env();
         sanitize_cfg_for_op(&mut mg_cfg, op);
         let mg = DemagPoissonMG::new_with_operator(grid, mg_cfg, op);
@@ -2797,7 +2096,7 @@ impl DemagPoissonMGHybrid {
         }
     }
 
-    fn same_structure(&self, grid: &Grid2D, mg_cfg: &DemagPoissonMGConfig) -> bool {
+    pub(crate) fn same_structure(&self, grid: &Grid2D, mg_cfg: &DemagPoissonMGConfig) -> bool {
         self.mg.same_structure(grid, mg_cfg)
     }
 
@@ -2963,114 +2262,13 @@ fn mg_hybrid_diag_invar_enabled() -> bool {
 // PPPM/Ewald-style screening: Gaussian smoothing of RHS in XY
 // ---------------------------
 
-fn gaussian_kernel_1d(sigma_cells: f64) -> (Vec<f64>, isize) {
-    if !(sigma_cells > 0.0) {
-        return (vec![1.0], 0);
-    }
-    let r = (3.0 * sigma_cells).ceil() as isize;
-    if r <= 0 {
-        return (vec![1.0], 0);
-    }
-    let mut w = Vec::with_capacity((2 * r + 1) as usize);
-    let inv2s2 = 1.0 / (2.0 * sigma_cells * sigma_cells);
-    for i in -r..=r {
-        let x = i as f64;
-        w.push((-x * x * inv2s2).exp());
-    }
-    let sum: f64 = w.iter().sum();
-    if sum > 0.0 {
-        for wi in &mut w {
-            *wi /= sum;
-        }
-    }
-    (w, r)
-}
-
 fn screen_rhs_gaussian_xy(level: &mut MGLevel, sigma_cells: f64) {
-    if !(sigma_cells > 0.0) {
-        return;
-    }
-
-    let (w, r) = gaussian_kernel_1d(sigma_cells);
-    if r <= 0 {
-        return;
-    }
-
-    let nx = level.nx;
-    let ny = level.ny;
-    let nz = level.nz;
-
-    if nx < 3 || ny < 3 || nz < 3 {
-        return;
-    }
-
-    // Pass 1: X convolution (rhs -> tmp)
-    {
-        let rhs = &level.rhs;
-        let tmp = &mut level.tmp;
-        tmp.par_chunks_mut(nx)
-            .enumerate()
-            .for_each(|(row, tmp_row)| {
-                let k = row / ny;
-                let j = row - k * ny;
-                if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                    tmp_row.fill(0.0);
-                    return;
-                }
-                let base = row * nx;
-                tmp_row[0] = 0.0;
-                tmp_row[nx - 1] = 0.0;
-                for i in 1..(nx - 1) {
-                    let mut acc = 0.0;
-                    let ii = i as isize;
-                    for (t, wi) in (-r..=r).zip(w.iter()) {
-                        let mut x = ii + t;
-                        if x < 0 {
-                            x = 0;
-                        } else if x > (nx as isize - 1) {
-                            x = nx as isize - 1;
-                        }
-                        acc += wi * rhs[base + x as usize];
-                    }
-                    tmp_row[i] = acc;
-                }
-            });
-    }
-
-    // Pass 2: Y convolution (tmp -> rhs)
-    {
-        let tmp = &level.tmp;
-        let rhs = &mut level.rhs;
-        rhs.par_chunks_mut(nx)
-            .enumerate()
-            .for_each(|(row, rhs_row)| {
-                let k = row / ny;
-                let j = row - k * ny;
-                if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
-                    rhs_row.fill(0.0);
-                    return;
-                }
-                rhs_row[0] = 0.0;
-                rhs_row[nx - 1] = 0.0;
-                let jj = j as isize;
-                for i in 1..(nx - 1) {
-                    let mut acc = 0.0;
-                    for (t, wi) in (-r..=r).zip(w.iter()) {
-                        let mut y = jj + t;
-                        if y < 0 {
-                            y = 0;
-                        } else if y > (ny as isize - 1) {
-                            y = ny as isize - 1;
-                        }
-                        let src_row = k * ny + y as usize;
-                        acc += wi * tmp[src_row * nx + i];
-                    }
-                    rhs_row[i] = acc;
-                }
-            });
-    }
+    kernels::screen_rhs_gaussian_xy(
+        &mut level.rhs, &mut level.tmp,
+        level.nx, level.ny, level.nz,
+        sigma_cells,
+    );
 }
-
 // ---------------------------
 // Timing / profiling helpers (opt-in via env var)
 // ---------------------------

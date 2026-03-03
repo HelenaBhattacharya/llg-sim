@@ -8,6 +8,14 @@ pub mod demag_poisson_mg;
 pub mod dmi;
 pub mod exchange;
 pub mod zeeman;
+pub mod mg_kernels;      // (Change A)
+pub mod mg_treecode;     // (Change B)
+pub mod mg_composite;
+
+// DST-based Poisson decomposition for open-BC demag (U = v + w)
+pub mod dst_poisson_2d;
+pub mod boundary_integral_2d;
+pub mod demag_poisson_dst;
 
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
