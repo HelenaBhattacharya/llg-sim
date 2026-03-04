@@ -8,14 +8,27 @@ pub mod demag_poisson_mg;
 pub mod dmi;
 pub mod exchange;
 pub mod zeeman;
-pub mod mg_kernels;      // (Change A)
-pub mod mg_treecode;     // (Change B)
+
+// 2D multigrid infrastructure
+pub mod mg_config;
+pub mod mg_stencil;
+pub mod mg_kernels;
+pub mod mg_solver;
+pub mod mg_diagnostics;
+
+// Boundary integral for open-BC Poisson decomposition (used by MG solver)
+pub mod boundary_integral_2d;
+
+// AMR composite-grid wrapper (legacy — enhanced-RHS Poisson / FK approach)
 pub mod mg_composite;
 
-// DST-based Poisson decomposition for open-BC demag (U = v + w)
-pub mod dst_poisson_2d;
-pub mod boundary_integral_2d;
-pub mod demag_poisson_dst;
+// AMR coarse-FFT wrapper (production — exact Newell-tensor FFT on L0)
+pub mod coarse_fft_demag;
+
+// Retired modules (kept for reference but no longer in the active code path):
+//   mg_treecode.rs     — Barnes-Hut treecode (was used by old 3D padded-box MG)
+//   demag_poisson_dst.rs — DST-based Poisson solver (retired; kernel mismatch)
+//   dst_poisson_2d.rs  — DST spectral solver (retired)
 
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};
@@ -62,12 +75,6 @@ pub fn build_h_eff_masked(
 }
 
 /// Build effective induction with a term mask and an optional geometry mask.
-///
-/// `geom_mask` semantics:
-/// - Cells with geom_mask[idx]==false are treated as vacuum.
-/// - Local terms (exchange, anisotropy, DMI) are expected to respect the geometry mask.
-/// - Demag handling for masked geometries is deferred (Stage 3); for now demag is only
-///   applied on uniform full grids.
 pub fn build_h_eff_masked_geom(
     grid: &Grid2D,
     m: &VectorField2D,
@@ -79,30 +86,21 @@ pub fn build_h_eff_masked_geom(
 ) {
     b_eff.set_uniform(0.0, 0.0, 0.0);
 
-    // Zeeman (always included; may be zero)
     zeeman::add_zeeman_field(b_eff, sim.b_ext);
-
-    // Exchange + anisotropy
     exchange::add_exchange_field_masked(grid, m, b_eff, mat, geom_mask);
-    // Anisotropy is local; for now we still add it everywhere and rely on the
-    // caller keeping m=0 outside the mask. We will make this explicitly mask-aware
-    // in Milestone 2.
     anisotropy::add_uniaxial_anisotropy_field(m, b_eff, mat);
 
-    // DMI only if mask allows it and material has DMI enabled
     let include_dmi = matches!(mask, FieldMask::ExchAnisDmi | FieldMask::Full);
     if include_dmi && mat.dmi.is_some() {
         dmi::add_dmi_field_masked(grid, m, b_eff, mat, geom_mask);
     }
 
-    // Demag only if mask is Full and demag is enabled.
-    // Stage 3: demag + masked geometries will be handled via bridge mode or Poisson/MG.
     if matches!(mask, FieldMask::Full) && mat.demag {
         demag::add_demag_field(grid, m, b_eff, mat);
     }
 }
 
-/// Backwards-compatible: build full B_eff (includes DMI if mat.dmi is Some, Demag if mat.demag=true).
+/// Backwards-compatible: build full B_eff.
 pub fn build_h_eff(
     grid: &Grid2D,
     m: &VectorField2D,

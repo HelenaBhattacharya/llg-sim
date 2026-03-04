@@ -3,9 +3,18 @@
 // AMR vortex relaxation benchmark with:
 //  - uniform coarse baseline
 //  - uniform fine reference
-//  - AMR (coarse + patches) using Demag Bridge B (FFT on flattened fine composite)
+//  - AMR (coarse + patches) using demag mode from LLG_AMR_DEMAG_MODE env var
+//  - Per-step wall-clock timing (timing_log.csv) for mode comparison
+//  - --skip-fine-ref flag to disable uniform-fine reference (fast timing mode)
+//  - --amr-only flag to disable both fine and coarse references
+//
+// Demag modes (set via LLG_AMR_DEMAG_MODE):
+//  - all_fft      : flatten to uniform fine (1536²), FFT demag → gold reference, ~29s/step
+//  - composite    : enhanced-RHS Poisson-MG on L0 → ~4.7s/step, ~11% RMSE
+//  - coarse_fft   : exact Newell-tensor FFT on L0 (192²) with M-restriction → target <1s/step, <3% RMSE
 //
 // Outputs in out/amr_vortex_relax:
+//  - timing_log.csv                       : per-AMR-step wall time (ms) + fine/coarse for comparison
 //  - patch_map_stepXXXX.png              : patch rectangles by refinement level (Fig.4-style) [--plots only]
 //  - mesh_zoom_stepXXXX.png              : in-plane angle + multi-level grid overlay (Fig.5-style) [--plots only]
 //  - regrid_log.csv                      : level-1 regrid events (existing ClusterStats)
@@ -998,6 +1007,17 @@ fn main() {
 
     let do_ovf = args.iter().any(|a| a == "--ovf");
 
+    // --skip-fine-ref : skip the uniform-fine FFT reference runs (dominates wall time).
+    //                   Disables RMSE tracking (no ground truth). Use for timing benchmarks.
+    // --amr-only      : skip BOTH fine AND coarse reference runs; only AMR stepper executes.
+    let amr_only = args.iter().any(|a| a == "--amr-only");
+    let skip_fine_ref = amr_only || args.iter().any(|a| a == "--skip-fine-ref");
+    let skip_coarse_ref = amr_only;
+
+    // Read the AMR demag mode for display (stepper reads it independently via from_env).
+    let amr_demag_mode_label = std::env::var("LLG_AMR_DEMAG_MODE")
+        .unwrap_or_else(|_| "all_fft".to_string());
+
     // Nested refinement control (default: level 1 only).
     let amr_max_level: usize = std::env::var("LLG_AMR_MAX_LEVEL")
         .ok()
@@ -1142,6 +1162,7 @@ fn main() {
     let regrid_log_path = format!("{out_dir}/regrid_log.csv");
     let rmse_log_path = format!("{out_dir}/rmse_log.csv");
     let regrid_patches_path = format!("{out_dir}/regrid_patches.csv");
+    let timing_log_path = format!("{out_dir}/timing_log.csv");
     {
         let mut f = File::create(&regrid_log_path).unwrap();
         writeln!(
@@ -1168,6 +1189,9 @@ fn main() {
 
         let mut f5 = File::create(&regrid_patches_path).unwrap();
         writeln!(f5, "step,level,patch_id,i0,j0,nx,ny").unwrap();
+
+        let mut f6 = File::create(&timing_log_path).unwrap();
+        writeln!(f6, "step,amr_step_ms,fine_step_ms,coarse_step_ms").unwrap();
     }
 
     // initial regrid
@@ -1295,6 +1319,9 @@ fn main() {
     let mut t_demag_fine = 0.0;
     let mut t_demag_coarse = 0.0;
     let mut t_amr_step = 0.0;
+    let mut amr_step_count = 0usize;
+    // Rolling window for per-step AMR timing (last 10 steps)
+    let mut recent_amr_ms: Vec<f64> = Vec::with_capacity(16);
 
     if do_plots {
         println!("[amr_vortex_relax] --plots enabled: will write PNGs to {out_dir}");
@@ -1311,12 +1338,28 @@ fn main() {
         regrid_policy.boundary_layer,
     );
 
+    println!(
+        "[amr_vortex_relax] AMR demag mode: {}",
+        amr_demag_mode_label,
+    );
+    if skip_fine_ref {
+        println!("[amr_vortex_relax] --skip-fine-ref: fine reference DISABLED (no RMSE tracking)");
+    }
+    if skip_coarse_ref {
+        println!("[amr_vortex_relax] --amr-only: coarse baseline DISABLED");
+    }
+
+
     // output at step 0 (RMSE always; plots only if requested)
     {
         let fine_patches = patches_to_fine_rects(&current_patches, ref_ratio_total);
 
         let m_amr_fine = flatten_to_target_grid(&h, fine_grid);
-        let (rmse, maxd) = rmse_and_max_delta(&m_amr_fine, &m_fine);
+        let (rmse, maxd) = if !skip_fine_ref {
+            rmse_and_max_delta(&m_amr_fine, &m_fine)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
         append_line(
             &rmse_log_path,
             &format!("0,{:.8e},{:.8e},{}\n", rmse, maxd, fine_patches.len()),
@@ -1378,48 +1421,56 @@ fn main() {
     // ---------- time loop ----------
     for step in 1..=steps {
         // uniform fine demag + relax step
-        let t1 = Instant::now();
-        b_fine.set_uniform(0.0, 0.0, 0.0);
-        demag_fft_uniform::compute_demag_field_pbc(
-            &fine_grid,
-            &m_fine,
-            &mut b_fine,
-            &mat,
-            pbcx,
-            pbcy,
-        );
-        t_demag_fine += t1.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(
-            &mut m_fine,
-            &llg,
-            &mat,
-            &mut scratch_fine,
-            local_mask,
-            Some(&b_fine),
-        );
+        let mut dt_fine_ms = f64::NAN;
+        if !skip_fine_ref {
+            let t1 = Instant::now();
+            b_fine.set_uniform(0.0, 0.0, 0.0);
+            demag_fft_uniform::compute_demag_field_pbc(
+                &fine_grid,
+                &m_fine,
+                &mut b_fine,
+                &mat,
+                pbcx,
+                pbcy,
+            );
+            t_demag_fine += t1.elapsed().as_secs_f64();
+            step_llg_rk4_recompute_field_masked_relax_add(
+                &mut m_fine,
+                &llg,
+                &mat,
+                &mut scratch_fine,
+                local_mask,
+                Some(&b_fine),
+            );
+            dt_fine_ms = t1.elapsed().as_secs_f64() * 1e3;
+        }
 
         // uniform coarse demag + relax step (baseline)
-        let t2 = Instant::now();
-        b_coarse.set_uniform(0.0, 0.0, 0.0);
-        demag_fft_uniform::compute_demag_field_pbc(
-            &base_grid,
-            &m_coarse,
-            &mut b_coarse,
-            &mat,
-            pbcx,
-            pbcy,
-        );
-        t_demag_coarse += t2.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(
-            &mut m_coarse,
-            &llg,
-            &mat,
-            &mut scratch_coarse,
-            local_mask,
-            Some(&b_coarse),
-        );
+        let mut dt_coarse_ms = f64::NAN;
+        if !skip_coarse_ref {
+            let t2 = Instant::now();
+            b_coarse.set_uniform(0.0, 0.0, 0.0);
+            demag_fft_uniform::compute_demag_field_pbc(
+                &base_grid,
+                &m_coarse,
+                &mut b_coarse,
+                &mat,
+                pbcx,
+                pbcy,
+            );
+            t_demag_coarse += t2.elapsed().as_secs_f64();
+            step_llg_rk4_recompute_field_masked_relax_add(
+                &mut m_coarse,
+                &llg,
+                &mat,
+                &mut scratch_coarse,
+                local_mask,
+                Some(&b_coarse),
+            );
+            dt_coarse_ms = t2.elapsed().as_secs_f64() * 1e3;
+        }
 
-        // AMR step (Bridge B demag inside)
+        // AMR step (demag mode controlled by LLG_AMR_DEMAG_MODE)
         //
         // With subcycling, one stepper.step() advances by dt_coarse = dt × subcycle_ratio.
         // We only call it at multiples of subcycle_ratio, keeping AMR and reference in sync.
@@ -1427,7 +1478,36 @@ fn main() {
         if amr_due {
             let t3 = Instant::now();
             stepper.step(&mut h, &llg, &mat, local_mask);
-            t_amr_step += t3.elapsed().as_secs_f64();
+            let elapsed = t3.elapsed().as_secs_f64();
+            t_amr_step += elapsed;
+            let dt_amr_ms = elapsed * 1e3;
+            amr_step_count += 1;
+
+            // Track rolling window
+            recent_amr_ms.push(dt_amr_ms);
+            if recent_amr_ms.len() > 10 {
+                recent_amr_ms.remove(0);
+            }
+
+            // Per-step timing log
+            append_line(
+                &timing_log_path,
+                &format!(
+                    "{},{:.3},{:.3},{:.3}\n",
+                    step, dt_amr_ms, dt_fine_ms, dt_coarse_ms
+                ),
+            );
+
+            // Print per-step timing every 10 AMR steps (or first 3)
+            if amr_step_count <= 3 || amr_step_count % 10 == 0 {
+                let avg: f64 = recent_amr_ms.iter().sum::<f64>() / recent_amr_ms.len() as f64;
+                let l1 = h.patches.len();
+                let l2 = h.patches_l2plus.get(0).map(|v| v.len()).unwrap_or(0);
+                eprintln!(
+                    "[step {:4}] AMR {:.1}ms (avg {:.1}ms) | L1 {} L2 {} | mode={}",
+                    step, dt_amr_ms, avg, l1, l2, amr_demag_mode_label
+                );
+            }
         }
 
         // Regrid periodically (only after an AMR step has actually fired)
@@ -1512,7 +1592,11 @@ fn main() {
         if step % out_every == 0 || step == steps {
             let fine_patches = patches_to_fine_rects(&current_patches, ref_ratio_total);
             let m_amr_fine = flatten_to_target_grid(&h, fine_grid);
-            let (rmse, maxd) = rmse_and_max_delta(&m_amr_fine, &m_fine);
+            let (rmse, maxd) = if !skip_fine_ref {
+                rmse_and_max_delta(&m_amr_fine, &m_fine)
+            } else {
+                (f64::NAN, f64::NAN)
+            };
 
             append_line(
                 &rmse_log_path,
@@ -1596,10 +1680,14 @@ fn main() {
     let fine_cells_in_patches: usize = fine_patches.iter().map(|r| r.nx * r.ny).sum();
     let coverage = fine_cells_in_patches as f64 / fine_cells_total as f64;
 
-    let (rmse_final, maxd_final) = rmse_and_max_delta(&m_amr_fine_final, &m_fine);
+    let (rmse_final, maxd_final) = if !skip_fine_ref {
+        rmse_and_max_delta(&m_amr_fine_final, &m_fine)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
 
     println!();
-    println!("AMR vortex relaxation benchmark (Bridge B demag FFT)");
+    println!("AMR vortex relaxation benchmark (demag mode: {})", amr_demag_mode_label);
     println!("Base grid: {base_nx} x {base_ny}   dx={dx:.3e}  dy={dy:.3e}  dz={dz:.3e}");
     println!(
         "Fine grid: {fine_nx} x {fine_ny}   dx={:.3e}  dy={:.3e}",
@@ -1620,17 +1708,47 @@ fn main() {
     }
     println!("Outputs: {out_dir}");
     println!();
+    if skip_fine_ref {
+        println!("Final RMSE(|\u{0394}m|): N/A (--skip-fine-ref)");
+        println!("Final max |\u{0394}m| : N/A");
+    } else {
     println!("Final RMSE(|Δm|): {:.6e}", rmse_final);
     println!("Final max |Δm| : {:.6e}", maxd_final);
+    }
     println!("Fine cells (uniform): {fine_cells_total}");
     println!("Fine cells covered by patches: {fine_cells_in_patches}");
     println!("Patch coverage fraction: {:.6}", coverage);
     println!();
-    println!("Timing (includes demag FFT everywhere):");
+    println!("Demag FFT grid sizes:");
+    println!("  uniform fine FFT:      {} × {} = {} cells", fine_nx, fine_ny, fine_nx * fine_ny);
+    println!("  coarse_fft FFT:        {} × {} = {} cells", base_nx, base_ny, base_nx * base_ny);
+    println!("  cell ratio (fine/coarse): {}×", (fine_nx * fine_ny) / (base_nx * base_ny));
+    println!();
+    println!("Timing:");
     println!("  total wall time:       {:.3} s", wall);
+    if skip_fine_ref {
+        println!("  fine demag time:       (skipped --skip-fine-ref)");
+    } else {
     println!("  fine demag time:       {:.3} s", t_demag_fine);
+    }
+    if skip_coarse_ref {
+        println!("  coarse demag time:     (skipped --amr-only)");
+    } else {
     println!("  coarse demag time:     {:.3} s", t_demag_coarse);
-    println!("  AMR step time:         {:.3} s", t_amr_step);
+    }
+    println!("  AMR step time:         {:.3} s  ({} AMR steps)", t_amr_step, amr_step_count);
+    if amr_step_count > 0 {
+        let avg_amr_ms = (t_amr_step / amr_step_count as f64) * 1e3;
+        println!("  AMR avg per step:      {:.1} ms/step", avg_amr_ms);
+        if !skip_fine_ref && steps > 0 {
+            let avg_fine_ms = (t_demag_fine / steps as f64) * 1e3;
+            let speedup = avg_fine_ms / avg_amr_ms;
+            println!("  fine avg per step:     {:.1} ms/step  (demag only)", avg_fine_ms);
+            println!("  speedup (fine/AMR):    {:.1}×", speedup);
+        }
+    }
     let other = (wall - t_demag_fine - t_demag_coarse - t_amr_step).max(0.0);
     println!("  other/unaccounted:     {:.3} s", other);
+    println!();
+    println!("Timing log: {out_dir}/timing_log.csv");
 }

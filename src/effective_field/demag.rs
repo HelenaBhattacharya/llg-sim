@@ -1,36 +1,30 @@
 // src/effective_field/demag.rs
 //
-// Demag dispatcher: selects between multiple demagnetising-field implementations.
+// Demag dispatcher: selects between demagnetising-field implementations.
 //
 // This file intentionally contains *no new physics*.
 // It routes calls to one of:
 //   - demag_fft_uniform.rs    (FFT convolution on a uniform FD grid)
-//   - demag_poisson_mg.rs     (Poisson + geometric multigrid; experimental)
-//   - demag_poisson_dst.rs    (Poisson via DST with open-BC boundary integral)
+//   - demag_poisson_mg.rs     (2D MG + boundary integral; Fredkin-Koehler decomposition)
 //
-// The goal is that call sites keep importing `effective_field::demag` and calling
-// `add_demag_field(...)` / `compute_demag_field(...)` without caring about the method.
+// The DST solver has been retired — the 2D MG solver uses the same Fredkin-
+// Koehler decomposition with multigrid replacing the spectral solve.
 //
-// Implementation note:
-// - `DemagMethod` is intended to live in `src/params.rs` and be stored on `Material`.
-// - Additionally, you can override the method at runtime using `LLG_DEMAG_METHOD`:
-//     export LLG_DEMAG_METHOD=fft
-//     export LLG_DEMAG_METHOD=mg
-//     export LLG_DEMAG_METHOD=dst
+// Runtime override:
+//   export LLG_DEMAG_METHOD=fft   (FFT convolution — default)
+//   export LLG_DEMAG_METHOD=mg    (2D multigrid + boundary integral)
 
 use crate::grid::Grid2D;
 use crate::params::{DemagMethod, Material};
 use crate::vector_field::VectorField2D;
 
 use super::demag_fft_uniform;
-use super::demag_poisson_dst;
 use super::demag_poisson_mg;
 
 use rayon::current_num_threads;
 use std::sync::{Once, OnceLock};
 
 static WARN_MG_PBC_FALLBACK: Once = Once::new();
-static WARN_DST_PBC_FALLBACK: Once = Once::new();
 static PRINT_DEMAG_METHOD_ONCE: Once = Once::new();
 
 static DEMAG_METHOD_OVERRIDE: OnceLock<Option<DemagMethod>> = OnceLock::new();
@@ -75,8 +69,7 @@ pub fn compute_demag_field(
 /// Add demag field with periodic boundary conditions in x/y.
 ///
 /// *FFT method*: supports MuMax-style finite-image PBC sums.
-/// *MG method*: not PBC-aware yet; if `pbc_x>0 || pbc_y>0`, we fall back to FFT.
-/// *DST method*: open BC only; if `pbc_x>0 || pbc_y>0`, falls back to FFT.
+/// *MG method*: open-BC only (Fredkin-Koehler); falls back to FFT for PBC.
 pub fn add_demag_field_pbc(
     grid: &Grid2D,
     m: &VectorField2D,
@@ -124,7 +117,8 @@ pub fn add_demag_field_pbc(
             if pbc_x > 0 || pbc_y > 0 {
                 WARN_MG_PBC_FALLBACK.call_once(|| {
                     eprintln!(
-                        "[llg-sim] WARN: demag_method=mg does not support PBC (pbc_x={}, pbc_y={}); falling back to FFT.",
+                        "[demag] WARN: demag_method=mg does not support PBC (pbc_x={}, pbc_y={}); \
+                         falling back to FFT.",
                         pbc_x, pbc_y
                     );
                 });
@@ -133,18 +127,20 @@ pub fn add_demag_field_pbc(
                 demag_poisson_mg::add_demag_field_poisson_mg(grid, m, b_eff, mat)
             }
         }
+        // DST variant retired — accept the enum value but route to MG.
+        // This prevents compile errors if old configs still specify "dst".
         DemagMethod::PoissonDst => {
-            // DST decomposition is for open (non-periodic) boundaries only.
+            static WARN_DST_RETIRED: Once = Once::new();
+            WARN_DST_RETIRED.call_once(|| {
+                eprintln!(
+                    "[demag] INFO: demag_method=dst has been retired. \
+                     Using demag_method=mg (2D MG + boundary integral) instead."
+                );
+            });
             if pbc_x > 0 || pbc_y > 0 {
-                WARN_DST_PBC_FALLBACK.call_once(|| {
-                    eprintln!(
-                        "[llg-sim] WARN: demag_method=dst does not support PBC (pbc_x={}, pbc_y={}); falling back to FFT.",
-                        pbc_x, pbc_y
-                    );
-                });
                 demag_fft_uniform::add_demag_field_pbc(grid, m, b_eff, mat, pbc_x, pbc_y)
             } else {
-                demag_poisson_dst::add_demag_field_poisson_dst(grid, m, b_eff, mat)
+                demag_poisson_mg::add_demag_field_poisson_mg(grid, m, b_eff, mat)
             }
         }
     }

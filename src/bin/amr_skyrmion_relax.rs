@@ -969,7 +969,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a == "--plots");
     let do_ovf = args.iter().any(|a| a == "--ovf");
-    let do_fine = !args.iter().any(|a| a == "--no-fine");
+    let amr_only = args.iter().any(|a| a == "--amr-only");
+    let do_fine = !amr_only && !args.iter().any(|a| a == "--skip-fine-ref" || a == "--no-fine");
+    let skip_coarse_ref = amr_only;
+
+    // Read the AMR demag mode for display (stepper reads it independently via from_env).
+    let amr_demag_mode_label = std::env::var("LLG_AMR_DEMAG_MODE")
+        .unwrap_or_else(|_| "all_fft".to_string());
 
     let out_dir = "out/amr_skyrmion_relax";
     ensure_dir(out_dir);
@@ -1149,6 +1155,7 @@ fn main() {
     let rmse_log_path = format!("{out_dir}/rmse_log.csv");
     let energy_log_path = format!("{out_dir}/energy_log.csv");
     let skyrmion_log_path = format!("{out_dir}/skyrmion_log.csv");
+    let timing_log_path = format!("{out_dir}/timing_log.csv");
 
     {
         let mut f = File::create(&regrid_log_path).unwrap();
@@ -1191,6 +1198,9 @@ fn main() {
             "step,Q_fine,Q_amr,n_sk_fine,n_sk_amr,min_mz_fine,min_mz_amr"
         )
         .unwrap();
+
+        let mut f8 = File::create(&timing_log_path).unwrap();
+        writeln!(f8, "step,amr_step_ms,fine_step_ms,coarse_step_ms").unwrap();
     }
 
     // ---- Initial regrid ----
@@ -1402,8 +1412,12 @@ fn main() {
         println!("  --ovf enabled");
     }
     if !do_fine {
-        println!("  --no-fine: uniform fine reference SKIPPED (AMR + coarse only)");
+        println!("  --skip-fine-ref: uniform fine reference SKIPPED");
     }
+    if skip_coarse_ref {
+        println!("  --amr-only: coarse baseline SKIPPED");
+    }
+    println!("  AMR demag mode: {}", amr_demag_mode_label);
     println!();
 
     // ---- Timings ----
@@ -1411,6 +1425,8 @@ fn main() {
     let mut t_demag_fine = 0.0;
     let mut t_demag_coarse = 0.0;
     let mut t_amr_step = 0.0;
+    let mut amr_step_count = 0usize;
+    let mut recent_amr_ms: Vec<f64> = Vec::with_capacity(16);
 
     // ---- Step 0 outputs ----
     {
@@ -1531,6 +1547,7 @@ fn main() {
     // =====================================================================
     for step in 1..=steps {
         // ---- Uniform fine: demag + relax step ----
+        let mut dt_fine_ms = f64::NAN;
         if do_fine {
             let bf = b_fine.as_mut().unwrap();
             let sf = scratch_fine.as_mut().unwrap();
@@ -1553,37 +1570,60 @@ fn main() {
                 local_mask,
                 Some(bf),
             );
+            dt_fine_ms = t1.elapsed().as_secs_f64() * 1e3;
         }
 
         // ---- Uniform coarse: demag + relax step (baseline) ----
-        let t2 = Instant::now();
-        b_coarse.set_uniform(0.0, 0.0, 0.0);
-        demag_fft_uniform::compute_demag_field_pbc(
-            &base_grid,
-            &m_coarse,
-            &mut b_coarse,
-            &mat,
-            pbcx,
-            pbcy,
-        );
-        t_demag_coarse += t2.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(
-            &mut m_coarse,
-            &llg,
-            &mat,
-            &mut scratch_coarse,
-            local_mask,
-            Some(&b_coarse),
-        );
+        let mut dt_coarse_ms = f64::NAN;
+        if !skip_coarse_ref {
+            let t2 = Instant::now();
+            b_coarse.set_uniform(0.0, 0.0, 0.0);
+            demag_fft_uniform::compute_demag_field_pbc(
+                &base_grid,
+                &m_coarse,
+                &mut b_coarse,
+                &mat,
+                pbcx,
+                pbcy,
+            );
+            t_demag_coarse += t2.elapsed().as_secs_f64();
+            step_llg_rk4_recompute_field_masked_relax_add(
+                &mut m_coarse,
+                &llg,
+                &mat,
+                &mut scratch_coarse,
+                local_mask,
+                Some(&b_coarse),
+            );
+            dt_coarse_ms = t2.elapsed().as_secs_f64() * 1e3;
+        }
 
-        // ---- AMR step (Bridge B: FFT demag on flattened fine composite) ----
+        // ---- AMR step (demag mode controlled by LLG_AMR_DEMAG_MODE) ----
         // With subcycling, one stepper.step() advances by dt_coarse = dt × subcycle_ratio.
         // We only call it at multiples of subcycle_ratio, keeping AMR and reference in sync.
         let amr_due = step % subcycle_ratio == 0;
         if amr_due {
             let t3 = Instant::now();
             stepper.step(&mut h, &llg, &mat, local_mask);
-            t_amr_step += t3.elapsed().as_secs_f64();
+            let elapsed = t3.elapsed().as_secs_f64();
+            t_amr_step += elapsed;
+            let dt_amr_ms = elapsed * 1e3;
+            amr_step_count += 1;
+
+            recent_amr_ms.push(dt_amr_ms);
+            if recent_amr_ms.len() > 10 { recent_amr_ms.remove(0); }
+
+            append_line(&timing_log_path, &format!(
+                "{},{:.3},{:.3},{:.3}\n", step, dt_amr_ms, dt_fine_ms, dt_coarse_ms
+            ));
+
+            if amr_step_count <= 3 || amr_step_count % 10 == 0 {
+                let avg: f64 = recent_amr_ms.iter().sum::<f64>() / recent_amr_ms.len() as f64;
+                let l1 = h.patches.len();
+                let l2 = h.patches_l2plus.get(0).map(|v| v.len()).unwrap_or(0);
+                eprintln!("[step {:4}] AMR {:.1}ms (avg {:.1}ms) | L1 {} L2 {} | mode={}",
+                    step, dt_amr_ms, avg, l1, l2, amr_demag_mode_label);
+            }
         }
 
         // ---- Regrid periodically (only on coarse-step boundaries) ----
@@ -1900,23 +1940,42 @@ fn main() {
     );
     println!("  → Expected: ~5–15% (skyrmion walls + buffer only)");
     println!();
-    println!("Timing:");
+    println!("Timing (demag mode: {}):", amr_demag_mode_label);
     println!("  total wall time:       {:.3} s", wall);
+    if do_fine {
+        println!(
+            "  fine demag FFT:        {:.3} s ({:.1}%)",
+            t_demag_fine,
+            100.0 * t_demag_fine / wall
+        );
+    } else {
+        println!("  fine demag FFT:        (skipped --skip-fine-ref)");
+    }
+    if !skip_coarse_ref {
+        println!(
+            "  coarse demag FFT:      {:.3} s ({:.1}%)",
+            t_demag_coarse,
+            100.0 * t_demag_coarse / wall
+        );
+    } else {
+        println!("  coarse demag FFT:      (skipped --amr-only)");
+    }
     println!(
-        "  fine demag FFT:        {:.3} s ({:.1}%)",
-        t_demag_fine,
-        100.0 * t_demag_fine / wall
-    );
-    println!(
-        "  coarse demag FFT:      {:.3} s ({:.1}%)",
-        t_demag_coarse,
-        100.0 * t_demag_coarse / wall
-    );
-    println!(
-        "  AMR step (incl. demag):{:.3} s ({:.1}%)",
+        "  AMR step (incl. demag):{:.3} s ({:.1}%)  ({} AMR steps)",
         t_amr_step,
-        100.0 * t_amr_step / wall
+        100.0 * t_amr_step / wall,
+        amr_step_count
     );
+    if amr_step_count > 0 {
+        let avg_amr_ms = (t_amr_step / amr_step_count as f64) * 1e3;
+        println!("  AMR avg per step:      {:.1} ms/step", avg_amr_ms);
+        if do_fine && steps > 0 {
+            let avg_fine_ms = (t_demag_fine / steps as f64) * 1e3;
+            let speedup = avg_fine_ms / avg_amr_ms;
+            println!("  fine avg per step:     {:.1} ms/step  (demag only)", avg_fine_ms);
+            println!("  speedup (fine/AMR):    {:.1}×", speedup);
+        }
+    }
     let other = (wall - t_demag_fine - t_demag_coarse - t_amr_step).max(0.0);
     println!(
         "  other/overhead:        {:.3} s ({:.1}%)",
@@ -1924,5 +1983,11 @@ fn main() {
         100.0 * other / wall
     );
     println!();
+    println!("Demag FFT grid sizes:");
+    println!("  uniform fine FFT:      {} × {} = {} cells", fine_grid.nx, fine_grid.ny, fine_grid.nx * fine_grid.ny);
+    println!("  coarse_fft FFT:        {} × {} = {} cells", base_grid.nx, base_grid.ny, base_grid.nx * base_grid.ny);
+    println!("  cell ratio (fine/coarse): {}×", (fine_grid.nx * fine_grid.ny) / (base_grid.nx * base_grid.ny));
+    println!();
     println!("Outputs: {out_dir}");
+    println!("Timing log: {out_dir}/timing_log.csv");
 }

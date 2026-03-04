@@ -179,7 +179,7 @@ pub fn compute_source_density(
         // 2) ∂w/∂ν: outward normal derivative of w at the boundary node.
         let dw_dn = boundary_dw_dn(nx, ny, dx, dy, w_nodes, bn);
 
-        g.push(-m_dot_n + dw_dn);
+        g.push(m_dot_n - dw_dn);    // g = +M·ν̂ - ∂w/∂ν  ← CORRECT
     }
 
     g

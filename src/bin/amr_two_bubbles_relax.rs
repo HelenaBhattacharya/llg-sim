@@ -620,6 +620,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a == "--plots");
     let do_ovf = args.iter().any(|a| a == "--ovf");
+    let amr_only = args.iter().any(|a| a == "--amr-only");
+    let do_fine = !amr_only && !args.iter().any(|a| a == "--skip-fine-ref" || a == "--no-fine");
+    let skip_coarse_ref = amr_only;
+
+    // Read the AMR demag mode for display (stepper reads it independently via from_env).
+    let amr_demag_mode_label = std::env::var("LLG_AMR_DEMAG_MODE")
+        .unwrap_or_else(|_| "all_fft".to_string());
 
     // AMR max level (nested)
     let amr_max_level: usize = std::env::var("LLG_AMR_MAX_LEVEL")
@@ -748,6 +755,7 @@ fn main() {
     let regrid_attempts_path = format!("{out_dir}/regrid_attempts.csv");
     let rmse_log_path = format!("{out_dir}/rmse_log.csv");
     let regrid_patches_path = format!("{out_dir}/regrid_patches.csv");
+    let timing_log_path = format!("{out_dir}/timing_log.csv");
 
     {
         let mut f = File::create(&regrid_log_path).unwrap();
@@ -780,6 +788,9 @@ fn main() {
 
         let mut f5 = File::create(&regrid_patches_path).unwrap();
         writeln!(f5, "step,level,patch_id,i0,j0,nx,ny").unwrap();
+
+        let mut f6 = File::create(&timing_log_path).unwrap();
+        writeln!(f6, "step,amr_step_ms,fine_step_ms,coarse_step_ms").unwrap();
     }
 
     // Initial nested regrid
@@ -857,6 +868,13 @@ fn main() {
     if do_plots {
         println!("[amr_two_bubbles_relax] --plots enabled: will write PNGs to {out_dir}");
     }
+    if !do_fine {
+        println!("[amr_two_bubbles_relax] --skip-fine-ref: fine reference DISABLED");
+    }
+    if skip_coarse_ref {
+        println!("[amr_two_bubbles_relax] --amr-only: coarse baseline DISABLED");
+    }
+    println!("[amr_two_bubbles_relax] AMR demag mode: {}", amr_demag_mode_label);
     if do_ovf {
         ensure_dir(&format!("{out_dir}/ovf_coarse"));
         ensure_dir(&format!("{out_dir}/ovf_fine"));
@@ -867,7 +885,7 @@ fn main() {
     {
         let m_amr_comp = h.flatten_to_uniform_fine();
         let m_amr_fine = ensure_grid(&m_amr_comp, fine_grid);
-        let (rmse, maxd) = rmse_and_max_delta(&m_amr_fine, &m_fine);
+        let (rmse, maxd) = if do_fine { rmse_and_max_delta(&m_amr_fine, &m_fine) } else { (f64::NAN, f64::NAN) };
         append_line(
             &rmse_log_path,
             &format!("0,{:.8e},{:.8e},{}\n", rmse, maxd, current_patches.len()),
@@ -917,50 +935,78 @@ fn main() {
     let mut t_demag_fine = 0.0;
     let mut t_demag_coarse = 0.0;
     let mut t_amr_step = 0.0;
+    let mut amr_step_count = 0usize;
+    let mut recent_amr_ms: Vec<f64> = Vec::with_capacity(16);
 
     // Main loop
     for step in 1..=steps {
         // Uniform fine
-        let t1 = Instant::now();
-        b_fine.set_uniform(0.0, 0.0, 0.0);
-        demag_fft_uniform::compute_demag_field_pbc(&fine_grid, &m_fine, &mut b_fine, &mat, 0, 0);
-        t_demag_fine += t1.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(
-            &mut m_fine,
-            &llg,
-            &mat,
-            &mut scratch_fine,
-            local_mask,
-            Some(&b_fine),
-        );
+        let mut dt_fine_ms = f64::NAN;
+        if do_fine {
+            let t1 = Instant::now();
+            b_fine.set_uniform(0.0, 0.0, 0.0);
+            demag_fft_uniform::compute_demag_field_pbc(&fine_grid, &m_fine, &mut b_fine, &mat, 0, 0);
+            t_demag_fine += t1.elapsed().as_secs_f64();
+            step_llg_rk4_recompute_field_masked_relax_add(
+                &mut m_fine,
+                &llg,
+                &mat,
+                &mut scratch_fine,
+                local_mask,
+                Some(&b_fine),
+            );
+            dt_fine_ms = t1.elapsed().as_secs_f64() * 1e3;
+        }
 
         // Uniform coarse
-        let t2 = Instant::now();
-        b_coarse.set_uniform(0.0, 0.0, 0.0);
-        demag_fft_uniform::compute_demag_field_pbc(
-            &base_grid,
-            &m_coarse,
-            &mut b_coarse,
-            &mat,
-            0,
-            0,
-        );
-        t_demag_coarse += t2.elapsed().as_secs_f64();
-        step_llg_rk4_recompute_field_masked_relax_add(
-            &mut m_coarse,
-            &llg,
-            &mat,
-            &mut scratch_coarse,
-            local_mask,
-            Some(&b_coarse),
-        );
+        let mut dt_coarse_ms = f64::NAN;
+        if !skip_coarse_ref {
+            let t2 = Instant::now();
+            b_coarse.set_uniform(0.0, 0.0, 0.0);
+            demag_fft_uniform::compute_demag_field_pbc(
+                &base_grid,
+                &m_coarse,
+                &mut b_coarse,
+                &mat,
+                0,
+                0,
+            );
+            t_demag_coarse += t2.elapsed().as_secs_f64();
+            step_llg_rk4_recompute_field_masked_relax_add(
+                &mut m_coarse,
+                &llg,
+                &mat,
+                &mut scratch_coarse,
+                local_mask,
+                Some(&b_coarse),
+            );
+            dt_coarse_ms = t2.elapsed().as_secs_f64() * 1e3;
+        }
 
-        // AMR
+        // AMR (demag mode controlled by LLG_AMR_DEMAG_MODE)
         let amr_due = step % subcycle_ratio == 0;
         if amr_due {
             let t3 = Instant::now();
             stepper.step(&mut h, &llg, &mat, local_mask);
-            t_amr_step += t3.elapsed().as_secs_f64();
+            let elapsed = t3.elapsed().as_secs_f64();
+            t_amr_step += elapsed;
+            let dt_amr_ms = elapsed * 1e3;
+            amr_step_count += 1;
+
+            recent_amr_ms.push(dt_amr_ms);
+            if recent_amr_ms.len() > 10 { recent_amr_ms.remove(0); }
+
+            append_line(&timing_log_path, &format!(
+                "{},{:.3},{:.3},{:.3}\n", step, dt_amr_ms, dt_fine_ms, dt_coarse_ms
+            ));
+
+            if amr_step_count <= 3 || amr_step_count % 10 == 0 {
+                let avg: f64 = recent_amr_ms.iter().sum::<f64>() / recent_amr_ms.len() as f64;
+                let l1 = h.patches.len();
+                let l2 = h.patches_l2plus.get(0).map(|v| v.len()).unwrap_or(0);
+                eprintln!("[step {:4}] AMR {:.1}ms (avg {:.1}ms) | L1 {} L2 {} | mode={}",
+                    step, dt_amr_ms, avg, l1, l2, amr_demag_mode_label);
+            }
         }
 
         // Regrid
@@ -1020,7 +1066,7 @@ fn main() {
         if step % out_every == 0 || step == steps {
             let m_amr_comp = h.flatten_to_uniform_fine();
             let m_amr_fine = ensure_grid(&m_amr_comp, fine_grid);
-            let (rmse, maxd) = rmse_and_max_delta(&m_amr_fine, &m_fine);
+            let (rmse, maxd) = if do_fine { rmse_and_max_delta(&m_amr_fine, &m_fine) } else { (f64::NAN, f64::NAN) };
             append_line(
                 &rmse_log_path,
                 &format!(
@@ -1083,17 +1129,17 @@ fn main() {
     let m_amr_comp_final = h.flatten_to_uniform_fine();
     let m_amr_fine_final = ensure_grid(&m_amr_comp_final, fine_grid);
     write_csv_ij_m(&format!("{out_dir}/uniform_coarse_final.csv"), &m_coarse);
-    write_csv_ij_m(&format!("{out_dir}/uniform_fine_final.csv"), &m_fine);
+    if do_fine { write_csv_ij_m(&format!("{out_dir}/uniform_fine_final.csv"), &m_fine); }
     write_csv_ij_m(&format!("{out_dir}/amr_fine_final.csv"), &m_amr_fine_final);
 
-    write_midline_y(&format!("{out_dir}/lineout_uniform_mid_y.csv"), &m_fine);
+    if do_fine { write_midline_y(&format!("{out_dir}/lineout_uniform_mid_y.csv"), &m_fine); }
     write_midline_y(
         &format!("{out_dir}/lineout_amr_mid_y.csv"),
         &m_amr_fine_final,
     );
 
     println!();
-    println!("AMR two-bubbles relaxation benchmark (demag ON)");
+    println!("AMR two-bubbles relaxation benchmark (demag mode: {})", amr_demag_mode_label);
     println!(
         "Base grid: {} x {}   dx={:.3e} dy={:.3e} dz={:.3e}",
         base_grid.nx, base_grid.ny, base_grid.dx, base_grid.dy, base_grid.dz
@@ -1113,9 +1159,36 @@ fn main() {
     }
     println!("Outputs: {out_dir}");
     println!();
+    println!("Demag FFT grid sizes:");
+    println!("  uniform fine FFT:      {} × {} = {} cells", fine_grid.nx, fine_grid.ny, fine_grid.nx * fine_grid.ny);
+    println!("  coarse_fft FFT:        {} × {} = {} cells", base_grid.nx, base_grid.ny, base_grid.nx * base_grid.ny);
+    println!("  cell ratio (fine/coarse): {}×", (fine_grid.nx * fine_grid.ny) / (base_grid.nx * base_grid.ny));
+    println!();
     println!("Timing:");
-    println!("  total wall time:   {:.3} s", wall);
-    println!("  fine demag time:   {:.3} s", t_demag_fine);
-    println!("  coarse demag time: {:.3} s", t_demag_coarse);
-    println!("  AMR step time:     {:.3} s", t_amr_step);
+    println!("  total wall time:       {:.3} s", wall);
+    if do_fine {
+        println!("  fine demag time:       {:.3} s", t_demag_fine);
+    } else {
+        println!("  fine demag time:       (skipped --skip-fine-ref)");
+    }
+    if !skip_coarse_ref {
+        println!("  coarse demag time:     {:.3} s", t_demag_coarse);
+    } else {
+        println!("  coarse demag time:     (skipped --amr-only)");
+    }
+    println!("  AMR step time:         {:.3} s  ({} AMR steps)", t_amr_step, amr_step_count);
+    if amr_step_count > 0 {
+        let avg_amr_ms = (t_amr_step / amr_step_count as f64) * 1e3;
+        println!("  AMR avg per step:      {:.1} ms/step", avg_amr_ms);
+        if do_fine && steps > 0 {
+            let avg_fine_ms = (t_demag_fine / steps as f64) * 1e3;
+            let speedup = avg_fine_ms / avg_amr_ms;
+            println!("  fine avg per step:     {:.1} ms/step  (demag only)", avg_fine_ms);
+            println!("  speedup (fine/AMR):    {:.1}×", speedup);
+        }
+    }
+    let other = (wall - t_demag_fine - t_demag_coarse - t_amr_step).max(0.0);
+    println!("  other/unaccounted:     {:.3} s", other);
+    println!();
+    println!("Timing log: {out_dir}/timing_log.csv");
 }

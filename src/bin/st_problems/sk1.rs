@@ -1,18 +1,20 @@
 //! sk1: static demag validation problems.
 //!
-//! Compare DST Poisson demag against FFT/Newell on representative textures.
+//! Compare Poisson+multigrid demag against FFT/Newell on representative textures.
 //!
-//! Dashboard diagnostics:
+//! Dashboard additions:
 //! (D1) Spatial support: distance-to-boundary scalar field + |ΔB| stats vs distance.
-//! (D2) DST phase diagnostics: w/v/boundary integral norms and timings.
-//! (D3) Energy consistency: demag energy from FFT vs DST on the same magnetisation.
+//! (D3) Energy consistency: demag energy from FFT vs MG on the same magnetisation.
+//!
+//! Note: D2 (3D padded-box RHS diagnostics) removed — the new 2D cell-centred MG
+//! solver no longer uses a 3D padded domain.
 
 use std::collections::VecDeque;
 use std::fs::{File, create_dir_all};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use llg_sim::effective_field::{demag_fft_uniform, demag_poisson_dst};
+use llg_sim::effective_field::{demag_fft_uniform, demag_poisson_mg};
 use llg_sim::geometry_mask::{Mask2D, mask_disk, mask_rect};
 use llg_sim::grid::Grid2D;
 use llg_sim::initial_states::{init_skyrmion, init_vortex};
@@ -66,18 +68,42 @@ fn compute_metrics(
     }
 
     if count == 0 {
-        return [CompMetrics {
+        return [
+            CompMetrics {
+                rmse: 0.0,
+                max_abs: 0.0,
+                p95_abs: 0.0,
+            },
+            CompMetrics {
+                rmse: 0.0,
+                max_abs: 0.0,
+                p95_abs: 0.0,
+            },
+            CompMetrics {
+                rmse: 0.0,
+                max_abs: 0.0,
+                p95_abs: 0.0,
+            },
+        ];
+    }
+
+    let mut out = [
+        CompMetrics {
             rmse: 0.0,
             max_abs: 0.0,
             p95_abs: 0.0,
-        }; 3];
-    }
-
-    let mut out = [CompMetrics {
-        rmse: 0.0,
-        max_abs: 0.0,
-        p95_abs: 0.0,
-    }; 3];
+        },
+        CompMetrics {
+            rmse: 0.0,
+            max_abs: 0.0,
+            p95_abs: 0.0,
+        },
+        CompMetrics {
+            rmse: 0.0,
+            max_abs: 0.0,
+            p95_abs: 0.0,
+        },
+    ];
 
     for c in 0..3 {
         abs_vals[c].sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -146,6 +172,7 @@ fn dz_ratio_stats(
         }
     }
 
+    // Only include points where |m_z| is large enough that the ratio is meaningful.
     let mut ratios: Vec<f64> = Vec::new();
     let mut sum = 0.0f64;
 
@@ -231,6 +258,9 @@ fn scalar_to_vfield(grid: Grid2D, s: &[f64]) -> VectorField2D {
 }
 
 /// Distance (in 4-neighbour cell steps) from each magnet cell to the boundary of the mask.
+/// - boundary cells have dist=0
+/// - interior cells have dist>=1
+/// - outside mask has dist=-1
 fn distance_to_boundary_4n(mask: &[bool], grid: &Grid2D) -> Vec<i32> {
     let nx = grid.nx;
     let ny = grid.ny;
@@ -242,6 +272,7 @@ fn distance_to_boundary_4n(mask: &[bool], grid: &Grid2D) -> Vec<i32> {
     let in_bounds =
         |i: isize, j: isize| -> bool { i >= 0 && j >= 0 && (i as usize) < nx && (j as usize) < ny };
 
+    // seed queue with boundary cells
     for j in 0..ny {
         for i in 0..nx {
             let id = j * nx + i;
@@ -250,9 +281,11 @@ fn distance_to_boundary_4n(mask: &[bool], grid: &Grid2D) -> Vec<i32> {
             }
             let mut is_boundary = false;
 
+            // edge of grid counts as boundary
             if i == 0 || j == 0 || i + 1 == nx || j + 1 == ny {
                 is_boundary = true;
             } else {
+                // any 4-neighbour outside the mask => boundary
                 let nb = [
                     (i as isize - 1, j as isize),
                     (i as isize + 1, j as isize),
@@ -277,6 +310,7 @@ fn distance_to_boundary_4n(mask: &[bool], grid: &Grid2D) -> Vec<i32> {
         }
     }
 
+    // BFS inward
     while let Some(id) = q.pop_front() {
         let d0 = dist[id];
         let i = (id % nx) as isize;
@@ -360,11 +394,48 @@ fn demag_energy_j(
         let mdotb = m_phys[0] * b_i[0] + m_phys[1] * b_i[1] + m_phys[2] * b_i[2];
         sum += mdotb * dvol;
     }
+    // Demag energy (SI): E_d = -(1/2) ∫ M · B_d dV.
+    // Here M is in A/m and B is in Tesla, so M·B has units of J/m^3; no division by μ0.
     -0.5 * sum
 }
 
 // ---------------------------------------------------------------------------
-// Cases
+/// Per-component demag energy: returns (E_xy, E_z).
+///
+/// E_xy = -(1/2) integral (Mx*Bx + My*By) dV   (in-plane contribution)
+/// E_z  = -(1/2) integral (Mz*Bz) dV            (out-of-plane contribution)
+///
+/// E_total = E_xy + E_z.  Splitting lets us see that E_z is exact (Kzz FFT)
+/// while E_xy carries the FK/MG approximation error.
+fn demag_energy_j_split(
+    grid: &Grid2D,
+    m: &VectorField2D,
+    b: &VectorField2D,
+    ms: f64,
+    mask: Option<&[bool]>,
+) -> (f64, f64) {
+    let dvol = grid.dx * grid.dy * grid.dz;
+    let mut sum_xy = 0.0f64;
+    let mut sum_z = 0.0f64;
+    for idx in 0..m.data.len() {
+        if let Some(mm) = mask {
+            if !mm[idx] {
+                continue;
+            }
+        }
+        let v = m.data[idx];
+        let n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        if n2 < 1e-30 {
+            continue;
+        }
+        let b_i = b.data[idx];
+        sum_xy += (ms * v[0] * b_i[0] + ms * v[1] * b_i[1]) * dvol;
+        sum_z += (ms * v[2] * b_i[2]) * dvol;
+    }
+    (-0.5 * sum_xy, -0.5 * sum_z)
+}
+
+// Test cases
 // ---------------------------------------------------------------------------
 
 fn build_case(case: char) -> (String, Grid2D, Option<Mask2D>, VectorField2D) {
@@ -419,6 +490,7 @@ fn build_case(case: char) -> (String, Grid2D, Option<Mask2D>, VectorField2D) {
             ("sk1d".to_string(), grid, Some(mask), m)
         }
         'e' | 'E' => {
+            // Uniform out-of-plane magnetisation in a disk.
             let grid = Grid2D::new(256, 256, 2.5e-9, 2.5e-9, 3.0e-9);
             let radius = 0.45 * (grid.nx.min(grid.ny) as f64) * grid.dx;
             let mask = mask_disk(&grid, radius, (0.0, 0.0));
@@ -436,6 +508,7 @@ fn build_case(case: char) -> (String, Grid2D, Option<Mask2D>, VectorField2D) {
             ("sk1e".to_string(), grid, Some(mask), m)
         }
         'f' | 'F' => {
+            // Uniform in-plane magnetisation in a disk.
             let grid = Grid2D::new(256, 256, 2.5e-9, 2.5e-9, 3.0e-9);
             let radius = 0.45 * (grid.nx.min(grid.ny) as f64) * grid.dx;
             let mask = mask_disk(&grid, radius, (0.0, 0.0));
@@ -457,7 +530,7 @@ fn build_case(case: char) -> (String, Grid2D, Option<Mask2D>, VectorField2D) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point (called from src/bin/st_problems/main.rs)
+// Main entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(case: char) -> io::Result<()> {
@@ -475,32 +548,33 @@ pub fn run(case: char) -> io::Result<()> {
     };
 
     eprintln!(
-        "[sk1] case={case_tag}, grid=({}x{}), dx={:.3} nm",
+        "[sk1] case={case_tag}, grid=({}x{}), dx={:.3} nm, dz={:.3} nm",
         grid.nx,
         grid.ny,
-        grid.dx * 1e9
+        grid.dx * 1e9,
+        grid.dz * 1e9,
     );
 
     // --- Compute fields ---
     let mut b_fft = VectorField2D::new(grid);
-    let mut b_dst = VectorField2D::new(grid);
+    let mut b_mg = VectorField2D::new(grid);
     demag_fft_uniform::compute_demag_field(&grid, &m, &mut b_fft, &mat);
-    demag_poisson_dst::compute_demag_field_poisson_dst(&grid, &m, &mut b_dst, &mat);
+    demag_poisson_mg::compute_demag_field_poisson_mg(&grid, &m, &mut b_mg, &mat);
 
     let mut b_diff = VectorField2D::new(grid);
     for idx in 0..b_diff.data.len() {
-        b_diff.data[idx][0] = b_dst.data[idx][0] - b_fft.data[idx][0];
-        b_diff.data[idx][1] = b_dst.data[idx][1] - b_fft.data[idx][1];
-        b_diff.data[idx][2] = b_dst.data[idx][2] - b_fft.data[idx][2];
+        b_diff.data[idx][0] = b_mg.data[idx][0] - b_fft.data[idx][0];
+        b_diff.data[idx][1] = b_mg.data[idx][1] - b_fft.data[idx][1];
+        b_diff.data[idx][2] = b_mg.data[idx][2] - b_fft.data[idx][2];
     }
 
     let mask_slice = mask_opt.as_deref();
 
-    // --- Metrics ---
-    let metrics = compute_metrics(&b_fft, &b_dst, mask_slice);
-    let avg = avg_field(&b_dst, mask_slice);
+    // --- Existing metrics ---
+    let metrics = compute_metrics(&b_fft, &b_mg, mask_slice);
+    let avg = avg_field(&b_mg, mask_slice);
 
-    if let Some(rs) = dz_ratio_stats(&b_fft, &b_dst, mask_slice, &m, mat.ms) {
+    if let Some(rs) = dz_ratio_stats(&b_fft, &b_mg, mask_slice, &m, mat.ms) {
         eprintln!(
             "[sk1] ΔBz/(μ0 Ms m_z) stats over |m_z|>=0.5: n={} mean={:.3e} p50={:.3e} p95={:.3e}",
             rs.n, rs.mean, rs.p50, rs.p95
@@ -509,39 +583,35 @@ pub fn run(case: char) -> io::Result<()> {
         eprintln!("[sk1] ΔBz/(μ0 Ms m_z) stats: insufficient samples (need |m_z|>=0.5)");
     }
 
-    // --- D2: DST phase diagnostics ---
-    let mut b_diag = VectorField2D::new(grid);
-    let dd = demag_poisson_dst::solve_with_diagnostics(&grid, &m, &mat, &mut b_diag);
-
-    let w_max = dd.w_interior.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-    let g_rms = (dd.g_boundary.iter().map(|v| v * v).sum::<f64>()
-        / dd.g_boundary.len().max(1) as f64)
-        .sqrt();
-    let g_max = dd.g_boundary.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-    let v_max = dd.v_boundary.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-    let u_max = dd.u_nodes.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
-
-    eprintln!(
-        "[sk1] DST phases: w={:.2}ms bi={:.2}ms v={:.2}ms grad={:.2}ms total={:.2}ms",
-        dd.timings_ms[0], dd.timings_ms[1], dd.timings_ms[2], dd.timings_ms[3], dd.timings_ms[4]
-    );
-    eprintln!(
-        "[sk1] DST norms: |w|_max={:.3e} |g|_rms={:.3e} |g|_max={:.3e} |v_bdy|_max={:.3e} |U|_max={:.3e}",
-        w_max, g_rms, g_max, v_max, u_max
-    );
-
-    // --- D3: Energy consistency ---
+    // --- D3: Energy consistency (per-component) ---
     let e_fft = demag_energy_j(&grid, &m, &b_fft, mat.ms, mask_slice);
-    let e_dst = demag_energy_j(&grid, &m, &b_dst, mat.ms, mask_slice);
-    let de = e_dst - e_fft;
-    let rel = if e_fft.abs() > 0.0 {
-        de / e_fft
+    let e_mg = demag_energy_j(&grid, &m, &b_mg, mat.ms, mask_slice);
+    let de = e_mg - e_fft;
+
+    let (e_fft_xy, e_fft_z) = demag_energy_j_split(&grid, &m, &b_fft, mat.ms, mask_slice);
+    let (e_mg_xy, e_mg_z) = demag_energy_j_split(&grid, &m, &b_mg, mat.ms, mask_slice);
+
+    // Gate the ratio: only meaningful when |E_fft| is large enough.
+    let e_threshold = 1e-17; // Joules -- below this, ratio is noise/noise
+    if e_fft.abs() >= e_threshold {
+        let rel = de / e_fft;
+        eprintln!(
+            "[sk1] E_demag: E_fft={:.6e} J  E_mg={:.6e} J  dE/E={:.3e}",
+            e_fft, e_mg, rel,
+        );
     } else {
-        f64::NAN
-    };
+        eprintln!(
+            "[sk1] E_demag: E_fft={:.6e} J  E_mg={:.6e} J  dE/E: N/A (|E_fft| < {:.0e})",
+            e_fft, e_mg, e_threshold,
+        );
+    }
     eprintln!(
-        "[sk1] E_demag: E_fft={:.6e} J  E_dst={:.6e} J  ΔE={:.6e} J  (ΔE/E_fft={:.3e})",
-        e_fft, e_dst, de, rel
+        "[sk1]   E_xy: fft={:.6e}  mg={:.6e}  dE_xy={:.3e} J  (FK/MG in-plane)",
+        e_fft_xy, e_mg_xy, e_mg_xy - e_fft_xy,
+    );
+    eprintln!(
+        "[sk1]   E_z:  fft={:.6e}  mg={:.6e}  dE_z ={:.3e} J  (Kzz FFT exact)",
+        e_fft_z, e_mg_z, e_mg_z - e_fft_z,
     );
 
     // --- Write OVFs ---
@@ -553,17 +623,31 @@ pub fn run(case: char) -> io::Result<()> {
         &meta_b(&case_tag, "fft"),
     )?;
     write_ovf2_rectangular_text(
-        &out_dir.join("b_dst.ovf"),
+        &out_dir.join("b_mg_env.ovf"),
         &grid,
-        &b_dst,
-        &meta_b(&case_tag, "dst"),
+        &b_mg,
+        &meta_b(&case_tag, "env"),
     )?;
     write_ovf2_rectangular_text(
-        &out_dir.join("b_diff.ovf"),
+        &out_dir.join("b_diff_env.ovf"),
         &grid,
         &b_diff,
-        &meta_b(&case_tag, "diff_dst"),
+        &meta_b(&case_tag, "diff_env"),
     )?;
+
+    // |dB| magnitude field for spatial visualisation of error
+    {
+        let mut b_diff_mag = VectorField2D::new(grid);
+        for idx in 0..b_diff.data.len() {
+            b_diff_mag.data[idx] = [norm3(b_diff.data[idx]), 0.0, 0.0];
+        }
+        write_ovf2_rectangular_text(
+            &out_dir.join("b_diff_mag.ovf"),
+            &grid,
+            &b_diff_mag,
+            &meta_scalar(&case_tag, "delta_B_magnitude", "T"),
+        )?;
+    }
 
     // --- D1: distance-to-boundary + |ΔB| vs distance ---
     if let Some(mask2d) = mask_slice {
@@ -581,7 +665,8 @@ pub fn run(case: char) -> io::Result<()> {
             &meta_scalar(&case_tag, "dist_to_boundary_4n", "cells"),
         )?;
 
-        let max_bin: i32 = 8;
+        // Bin |ΔB| magnitude by distance.
+        let max_bin: i32 = 8; // 0..7 plus ">=8"
         let mut bins: Vec<Vec<f64>> = (0..=max_bin).map(|_| Vec::new()).collect();
 
         let mut sum_all = 0.0f64;
@@ -614,6 +699,7 @@ pub fn run(case: char) -> io::Result<()> {
             frac_d01
         );
 
+        // Write per-bin stats to CSV and print summary.
         let mut f = File::create(out_dir.join("dbmag_by_dist.csv"))?;
         writeln!(f, "dist_bin,n,mean_T,p50_T,p95_T,max_T")?;
         for (bi, v) in bins.into_iter().enumerate() {
@@ -643,25 +729,18 @@ pub fn run(case: char) -> io::Result<()> {
         for (ci, cname) in ["x", "y", "z"].iter().enumerate() {
             writeln!(
                 f,
-                "dst,{cname},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
+                "env,{cname},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
                 metrics[ci].rmse, metrics[ci].max_abs, metrics[ci].p95_abs, avg[0], avg[1], avg[2]
             )?;
         }
+        // Append energy summary lines (total + per-component)
         writeln!(f, "energy,E_fft_J,{:.16e}", e_fft)?;
-        writeln!(f, "energy,E_dst_J,{:.16e}", e_dst)?;
+        writeln!(f, "energy,E_mg_J,{:.16e}", e_mg)?;
         writeln!(f, "energy,dE_J,{:.16e}", de)?;
-        writeln!(f, "energy,dE_over_Efft,{:.16e}", rel)?;
-        // DST diagnostics
-        writeln!(f, "dst,w_max,{:.16e}", w_max)?;
-        writeln!(f, "dst,g_rms,{:.16e}", g_rms)?;
-        writeln!(f, "dst,g_max,{:.16e}", g_max)?;
-        writeln!(f, "dst,v_bdy_max,{:.16e}", v_max)?;
-        writeln!(f, "dst,u_max,{:.16e}", u_max)?;
-        writeln!(f, "dst,t_w_ms,{:.6}", dd.timings_ms[0])?;
-        writeln!(f, "dst,t_bi_ms,{:.6}", dd.timings_ms[1])?;
-        writeln!(f, "dst,t_v_ms,{:.6}", dd.timings_ms[2])?;
-        writeln!(f, "dst,t_grad_ms,{:.6}", dd.timings_ms[3])?;
-        writeln!(f, "dst,t_total_ms,{:.6}", dd.timings_ms[4])?;
+        writeln!(f, "energy,E_fft_xy_J,{:.16e}", e_fft_xy)?;
+        writeln!(f, "energy,E_fft_z_J,{:.16e}", e_fft_z)?;
+        writeln!(f, "energy,E_mg_xy_J,{:.16e}", e_mg_xy)?;
+        writeln!(f, "energy,E_mg_z_J,{:.16e}", e_mg_z)?;
     }
 
     // --- Terminal summary ---
@@ -670,7 +749,7 @@ pub fn run(case: char) -> io::Result<()> {
         avg[0], avg[1], avg[2]
     );
     eprintln!(
-        "[sk1] ΔB metrics (dst-fft): rmse=[{:.3e},{:.3e},{:.3e}] T  p95=[{:.3e},{:.3e},{:.3e}] T  max=[{:.3e},{:.3e},{:.3e}] T",
+        "[sk1] ΔB metrics (mg-fft): rmse=[{:.3e},{:.3e},{:.3e}] T  p95=[{:.3e},{:.3e},{:.3e}] T  max=[{:.3e},{:.3e},{:.3e}] T",
         metrics[0].rmse,
         metrics[1].rmse,
         metrics[2].rmse,

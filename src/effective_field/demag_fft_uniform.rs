@@ -195,7 +195,7 @@ fn same_grid_pbc(a: &Grid2D, b: &Grid2D, ax: usize, ay: usize, bx: usize, by: us
 }
 
 #[inline]
-fn wrap_index(d: isize, n: usize) -> usize {
+pub(crate) fn wrap_index(d: isize, n: usize) -> usize {
     let n = n as isize;
     let mut v = d % n;
     if v < 0 {
@@ -429,7 +429,7 @@ fn try_load_kernel_kspace(
 }
 
 // Match your MuMax scripts (you set DemagAccuracy=10 there).
-const DEMAG_ACCURACY: f64 = 10.0;
+pub(crate) const DEMAG_ACCURACY: f64 = 10.0;
 
 struct Demag2D {
     grid: Grid2D,
@@ -774,7 +774,7 @@ impl Demag2D {
 /// Hybrid strategy:
 /// - For small padded grids: simple gather-column FFT (often faster).
 /// - For larger padded grids: transpose + parallel column FFT.
-fn fft2_forward_in_place(
+pub(crate) fn fft2_forward_in_place(
     data: &mut [Complex<f64>],
     nx: usize,
     ny: usize,
@@ -843,7 +843,7 @@ fn fft2_forward_in_place(
 /// Hybrid strategy:
 /// - For small padded grids: simple gather-column FFT (often faster).
 /// - For larger padded grids: transpose + parallel column FFT.
-fn fft2_inverse_in_place(
+pub(crate) fn fft2_inverse_in_place(
     data: &mut [Complex<f64>],
     nx: usize,
     ny: usize,
@@ -1073,7 +1073,7 @@ fn build_kernel_realspace_mumax_2d(
 
 /// Compute (Kxx, Kxy, Kyy, Kzz) for 2D Nz=1.
 /// Returns K = μ0 * N in Tesla/(A/m).
-fn kernel_2d_components_mumax_like(
+pub(crate) fn kernel_2d_components_mumax_like(
     dx: f64,
     dy: f64,
     dz: f64,
