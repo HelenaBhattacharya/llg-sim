@@ -9,26 +9,26 @@ pub mod dmi;
 pub mod exchange;
 pub mod zeeman;
 
-// 2D multigrid infrastructure
-pub mod mg_config;
-pub mod mg_stencil;
+// 3D multigrid infrastructure (restored from pre-FK codebase)
 pub mod mg_kernels;
-pub mod mg_solver;
+pub mod mg_treecode;
+
+// Diagnostics (timing infrastructure)
 pub mod mg_diagnostics;
 
-// Boundary integral for open-BC Poisson decomposition (used by MG solver)
-pub mod boundary_integral_2d;
-
-// AMR composite-grid wrapper (legacy — enhanced-RHS Poisson / FK approach)
+// AMR composite-grid wrapper (calls 3D MG solver on coarse grid)
 pub mod mg_composite;
 
 // AMR coarse-FFT wrapper (production — exact Newell-tensor FFT on L0)
 pub mod coarse_fft_demag;
 
-// Retired modules (kept for reference but no longer in the active code path):
-//   mg_treecode.rs     — Barnes-Hut treecode (was used by old 3D padded-box MG)
-//   demag_poisson_dst.rs — DST-based Poisson solver (retired; kernel mismatch)
-//   dst_poisson_2d.rs  — DST spectral solver (retired)
+// Retired / archived modules (2D FK decomposition — broken, see project docs):
+//   boundary_integral_2d.rs  — 2D single-layer potential (sign/node-cell bugs)
+//   mg_stencil.rs            — 2D Laplacian stencils (FK-specific)
+//   mg_solver.rs             — 2D cell-centred MG (FK-specific)
+//   mg_config.rs             — 2D MG config (superseded by config in demag_poisson_mg.rs)
+//   demag_poisson_dst.rs     — DST-based Poisson solver (retired; kernel mismatch)
+//   dst_poisson_2d.rs        — DST spectral solver (retired)
 
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};

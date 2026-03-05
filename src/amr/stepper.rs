@@ -4,6 +4,7 @@ use crate::effective_field::{
     FieldMask, build_h_eff_masked, build_h_eff_masked_geom, coarse_fft_demag,
     demag_fft_uniform, demag_poisson_mg, mg_composite,
 };
+
 use crate::grid::Grid2D;
 use crate::llg::{
     RK4Scratch, step_llg_rk4_recompute_field_masked_add,
@@ -942,6 +943,7 @@ impl AmrStepperRK4 {
                     "coarse_fft",
                 );
             }
+
         }
     }
 

@@ -21,6 +21,7 @@
 //   --bc-check            (run boundary condition self-test and exit)
 
 use llg_sim::effective_field::{demag_fft_uniform, demag_poisson_mg};
+use llg_sim::geometry_mask::{hex_hole_centres, MaskShape};
 use llg_sim::grid::Grid2D;
 use llg_sim::params::{DemagMethod, MU0, Material};
 use llg_sim::vector_field::VectorField2D;
@@ -33,6 +34,8 @@ enum Pattern {
     Smooth,
     Wall,
     Impulse,
+    Saturated,
+    Antidot,
 }
 
 impl Pattern {
@@ -42,6 +45,8 @@ impl Pattern {
             "smooth" | "mode" => Some(Self::Smooth),
             "wall" | "bloch_wall" | "bloch" => Some(Self::Wall),
             "impulse" | "delta" | "single" => Some(Self::Impulse),
+            "saturated" | "sat" | "xhat" => Some(Self::Saturated),
+            "antidot" | "antidots" | "holes" => Some(Self::Antidot),
             _ => None,
         }
     }
@@ -52,13 +57,15 @@ impl Pattern {
             Self::Smooth => "smooth",
             Self::Wall => "wall",
             Self::Impulse => "impulse",
+            Self::Saturated => "saturated",
+            Self::Antidot => "antidot",
         }
     }
 }
 
 fn print_help_and_exit() -> ! {
     eprintln!(
-        "Usage:\n  cargo run --release --bin demag_fft_vs_mg\n  cargo run --release --bin demag_fft_vs_mg -- <nx> <ny> <dx> <dy> <dz> [--pattern random|smooth|wall|impulse] [--seed <u64>] [--wall-width-cells <f64>] [--sweep] [--bc-check]\n\nDefaults: nx=64 ny=64 dx=5e-9 dy=5e-9 dz=1e-9, pattern=random, seed=0x123456789abcdef0, wall-width-cells=8"
+        "Usage:\n  cargo run --release --bin demag_fft_vs_mg\n  cargo run --release --bin demag_fft_vs_mg -- <nx> <ny> <dx> <dy> <dz> [--pattern random|smooth|wall|impulse|saturated|antidot] [--seed <u64>] [--wall-width-cells <f64>] [--sweep] [--bc-check]\n\nDefaults: nx=64 ny=64 dx=5e-9 dy=5e-9 dz=1e-9, pattern=random, seed=0x123456789abcdef0, wall-width-cells=8"
     );
     std::process::exit(2)
 }
@@ -195,6 +202,8 @@ fn run_once(
         Pattern::Smooth => init_smooth_mode(&mut m),
         Pattern::Wall => init_bloch_wall_y(&mut m, wall_width_cells),
         Pattern::Impulse => init_impulse_mz(&mut m),
+        Pattern::Saturated => init_saturated_xhat(&mut m),
+        Pattern::Antidot => init_antidot_xhat(&mut m, dx, dy),
     }
 
     let ms = 8.0e5;
@@ -365,6 +374,51 @@ fn init_impulse_mz(field: &mut VectorField2D) {
     let jc = field.grid.ny / 2;
     let id = field.idx(ic, jc);
     field.data[id][2] = 1.0;
+}
+
+fn init_saturated_xhat(field: &mut VectorField2D) {
+    for v in &mut field.data {
+        *v = [1.0, 0.0, 0.0];
+    }
+}
+
+fn init_antidot_xhat(field: &mut VectorField2D, dx: f64, dy: f64) {
+    // Saturated +x̂ with circular holes punched out (m=0 in holes).
+    // Uses the same geometry as the antidot benchmark.
+    let nx = field.grid.nx;
+    let ny = field.grid.ny;
+    let lx = nx as f64 * dx;
+    let ly = ny as f64 * dy;
+
+    let hole_diam = 80.0e-9;
+    let hole_pitch = 400.0e-9;
+    let hole_radius = hole_diam * 0.5;
+    let hole_centres = hex_hole_centres(lx, ly, hole_pitch);
+    let shape = MaskShape::MultiHole {
+        holes: hole_centres.clone(),
+        radius: hole_radius,
+    };
+
+    let cx = nx as f64 * 0.5;
+    let cy = ny as f64 * 0.5;
+
+    for j in 0..ny {
+        for i in 0..nx {
+            let x = (i as f64 + 0.5 - cx) * dx;
+            let y = (j as f64 + 0.5 - cy) * dy;
+            let k = j * nx + i;
+            if shape.contains(x, y) {
+                field.data[k] = [1.0, 0.0, 0.0];
+            } else {
+                field.data[k] = [0.0, 0.0, 0.0];
+            }
+        }
+    }
+
+    let n_mat = field.data.iter().filter(|v| v[0].abs() > 0.5).count();
+    let n_vac = nx * ny - n_mat;
+    println!("  Antidot: {} holes, {} material cells, {} vacuum cells",
+        hole_centres.len(), n_mat, n_vac);
 }
 
 #[inline]

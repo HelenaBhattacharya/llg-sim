@@ -1073,7 +1073,7 @@ fn build_kernel_realspace_mumax_2d(
 
 /// Compute (Kxx, Kxy, Kyy, Kzz) for 2D Nz=1.
 /// Returns K = μ0 * N in Tesla/(A/m).
-pub(crate) fn kernel_2d_components_mumax_like(
+pub fn kernel_2d_components_mumax_like(
     dx: f64,
     dy: f64,
     dz: f64,
@@ -1087,6 +1087,45 @@ pub(crate) fn kernel_2d_components_mumax_like(
     let hx_from_x = mumax_like_h_from_unit_m(0, r_center, cell, [sx, sy, 0], accuracy);
     let hx_from_y = mumax_like_h_from_unit_m(1, r_center, cell, [sx, sy, 0], accuracy);
     let hx_from_z = mumax_like_h_from_unit_m(2, r_center, cell, [sx, sy, 0], accuracy);
+
+    let nxx = hx_from_x[0];
+    let nxy = hx_from_y[0]; // Hx from My
+    let nyy = hx_from_y[1];
+    let nzz = hx_from_z[2];
+
+    (MU0 * nxx, MU0 * nxy, MU0 * nyy, MU0 * nzz)
+}
+
+pub fn kernel_2d_physical(
+    dx_src: f64,
+    dy_src: f64,
+    dz: f64,
+    rx: f64,
+    ry: f64,
+    accuracy: f64,
+) -> (f64, f64, f64, f64) {
+    let r_center = [rx, ry, 0.0_f64];
+    let cell = [dx_src, dy_src, dz];
+
+    // Compute equivalent integer displacement for accuracy control.
+    // The disp_ijk argument controls the sub-cell integration refinement
+    // via delta_cell().  For non-integer displacements, we round to the
+    // nearest integer in source-cell units, which gives appropriate
+    // refinement for the actual distance.
+    let sx_equiv = if rx.abs() < dx_src * 0.01 {
+        0isize
+    } else {
+        (rx / dx_src).round() as isize
+    };
+    let sy_equiv = if ry.abs() < dy_src * 0.01 {
+        0isize
+    } else {
+        (ry / dy_src).round() as isize
+    };
+
+    let hx_from_x = mumax_like_h_from_unit_m(0, r_center, cell, [sx_equiv, sy_equiv, 0], accuracy);
+    let hx_from_y = mumax_like_h_from_unit_m(1, r_center, cell, [sx_equiv, sy_equiv, 0], accuracy);
+    let hx_from_z = mumax_like_h_from_unit_m(2, r_center, cell, [sx_equiv, sy_equiv, 0], accuracy);
 
     let nxx = hx_from_x[0];
     let nxy = hx_from_y[0]; // Hx from My

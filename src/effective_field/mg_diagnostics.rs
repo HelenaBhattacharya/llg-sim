@@ -1,10 +1,12 @@
 // src/effective_field/mg_diagnostics.rs
 //
-// Timing and diagnostic infrastructure for the 2D multigrid demag solver.
+// Timing and diagnostic infrastructure for the multigrid demag solver.
 //
-// Provides per-phase timing (div, w-solve, boundary integral, v-solve, gradient)
-// and optional convergence logging.  Controlled by environment variables:
+// The 3D padded-box solver (demag_poisson_mg.rs) has its own built-in timing
+// controlled by LLG_DEMAG_MG_TIMING. This module provides shared utilities
+// that can be used by any MG-based solver.
 //
+// Environment variables:
 //   LLG_DEMAG_MG_TIMING=1        Print per-step timing breakdown
 //   LLG_DEMAG_MG_CONVERGENCE=1   Print per-V-cycle residual norms
 
@@ -40,15 +42,9 @@ pub fn convergence_log_enabled() -> bool {
 // Per-phase timing accumulator
 // ---------------------------------------------------------------------------
 
-/// Accumulated wall-clock times for the major phases of the Fredkin-Koehler
-/// demag pipeline, stored as nanoseconds in atomics for thread safety.
+/// Accumulated wall-clock times for the major phases of the demag pipeline,
+/// stored as nanoseconds in atomics for thread safety.
 pub struct DemagTimingAccum {
-    pub div_ns: AtomicU64,
-    pub w_solve_ns: AtomicU64,
-    pub boundary_integral_ns: AtomicU64,
-    pub v_solve_ns: AtomicU64,
-    pub gradient_ns: AtomicU64,
-    pub nzz_ns: AtomicU64,
     pub total_ns: AtomicU64,
     pub call_count: AtomicUsize,
 }
@@ -56,12 +52,6 @@ pub struct DemagTimingAccum {
 impl DemagTimingAccum {
     pub const fn new() -> Self {
         Self {
-            div_ns: AtomicU64::new(0),
-            w_solve_ns: AtomicU64::new(0),
-            boundary_integral_ns: AtomicU64::new(0),
-            v_solve_ns: AtomicU64::new(0),
-            gradient_ns: AtomicU64::new(0),
-            nzz_ns: AtomicU64::new(0),
             total_ns: AtomicU64::new(0),
             call_count: AtomicUsize::new(0),
         }
@@ -71,22 +61,10 @@ impl DemagTimingAccum {
         let n = self.call_count.load(Ordering::Relaxed);
         if n == 0 { return; }
         let to_ms = |ns: u64| ns as f64 / 1e6;
-        let div   = self.div_ns.load(Ordering::Relaxed);
-        let w     = self.w_solve_ns.load(Ordering::Relaxed);
-        let bi    = self.boundary_integral_ns.load(Ordering::Relaxed);
-        let v     = self.v_solve_ns.load(Ordering::Relaxed);
-        let grad  = self.gradient_ns.load(Ordering::Relaxed);
-        let nzz   = self.nzz_ns.load(Ordering::Relaxed);
         let total = self.total_ns.load(Ordering::Relaxed);
-
         eprintln!(
-            "[demag_mg2d timing] calls={}, total={:.1}ms, avg={:.2}ms/call",
+            "[demag_mg timing] calls={}, total={:.1}ms, avg={:.2}ms/call",
             n, to_ms(total), to_ms(total) / n as f64,
-        );
-        eprintln!(
-            "  div={:.1}ms  w_solve={:.1}ms  boundary_integral={:.1}ms  \
-             v_solve={:.1}ms  gradient={:.1}ms  nzz={:.1}ms",
-            to_ms(div), to_ms(w), to_ms(bi), to_ms(v), to_ms(grad), to_ms(nzz),
         );
     }
 }

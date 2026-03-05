@@ -56,6 +56,14 @@ pub enum MaskShape {
         r_outer: f64,
     },
 
+    /// Anti-dot / multi-hole: material everywhere EXCEPT inside any of the
+    /// listed circular holes.  O(n_holes) per point — much cheaper than
+    /// building a deeply nested CSG `Difference` chain.
+    MultiHole {
+        holes: Vec<(f64, f64)>,
+        radius: f64,
+    },
+
     // ---- CSG combinators ----
     /// A ∪ B
     Union(Box<MaskShape>, Box<MaskShape>),
@@ -107,6 +115,15 @@ impl MaskShape {
                 let dy = y - cy;
                 let r2 = dx * dx + dy * dy;
                 r2 >= r_inner * r_inner && r2 <= r_outer * r_outer
+            }
+
+            MaskShape::MultiHole { holes, radius } => {
+                let r2 = radius * radius;
+                !holes.iter().any(|&(cx, cy)| {
+                    let ddx = x - cx;
+                    let ddy = y - cy;
+                    ddx * ddx + ddy * ddy <= r2
+                })
             }
 
             MaskShape::Union(a, b) => a.contains(x, y) || b.contains(x, y),
@@ -350,6 +367,47 @@ pub fn mask_bbox(mask: &[bool], nx: usize, ny: usize) -> Option<(usize, usize, u
 }
 
 // ---------------------------------------------------------------------------
+// Anti-dot array helpers
+// ---------------------------------------------------------------------------
+
+/// Generate centres of a hexagonal hole array within a domain.
+///
+/// Domain is centered at (0, 0), extending from (−lx/2, −ly/2) to (+lx/2, +ly/2).
+/// `pitch` is the centre-to-centre distance between adjacent holes.
+/// Returns centres in **centered** coordinates (meters), consistent with `MaskShape`.
+///
+/// Only holes whose centres lie within the domain (with a half-pitch inset from
+/// each edge) are included — this ensures the outermost ring of holes is fully
+/// inside the sample, avoiding partially-clipped holes at domain boundaries.
+pub fn hex_hole_centres(lx: f64, ly: f64, pitch: f64) -> Vec<(f64, f64)> {
+    hex_hole_centres_inset(lx, ly, pitch, pitch * 0.5)
+}
+
+/// Like [`hex_hole_centres`] but with explicit inset from domain edges.
+pub fn hex_hole_centres_inset(lx: f64, ly: f64, pitch: f64, inset: f64) -> Vec<(f64, f64)> {
+    let mut centres = Vec::new();
+    let row_spacing = pitch * (3.0_f64).sqrt() * 0.5;
+    let half_x = lx * 0.5 - inset;
+    let half_y = ly * 0.5 - inset;
+
+    let n_rows = (half_y / row_spacing).ceil() as i32 + 1;
+    let n_cols = (half_x / pitch).ceil() as i32 + 1;
+
+    for row in -n_rows..=n_rows {
+        let y = row as f64 * row_spacing;
+        if y.abs() > half_y { continue; }
+        let x_offset = if row.abs() % 2 == 1 { pitch * 0.5 } else { 0.0 };
+        for col in -n_cols..=n_cols {
+            let x = col as f64 * pitch + x_offset;
+            if x.abs() <= half_x {
+                centres.push((x, y));
+            }
+        }
+    }
+    centres
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -432,5 +490,38 @@ mod tests {
         .to_mask(&grid);
         assert!(mask_count(&mask) >= mask_count(&m1));
         assert!(mask_count(&mask) >= mask_count(&m2));
+    }
+
+    #[test]
+    fn multihole_matches_csg_difference_chain() {
+        let grid = Grid2D::new(64, 64, 1e-9, 1e-9, 1e-9);
+        let holes = vec![(5e-9, 5e-9), (-5e-9, -5e-9), (10e-9, -10e-9)];
+        let r = 3e-9;
+
+        // Build via MultiHole
+        let mh = MaskShape::MultiHole { holes: holes.clone(), radius: r };
+        let mask_mh = mh.to_mask(&grid);
+
+        // Build via chained CSG Difference
+        let mut shape = MaskShape::Full;
+        for &(cx, cy) in &holes {
+            shape = shape.difference(MaskShape::Disk { center: (cx, cy), radius: r });
+        }
+        let mask_csg = shape.to_mask(&grid);
+
+        assert_eq!(mask_mh, mask_csg);
+    }
+
+    #[test]
+    fn hex_hole_centres_reasonable_count() {
+        let centres = hex_hole_centres(2e-6, 2e-6, 200e-9);
+        // 2 μm domain, 200 nm pitch → ~10×10 = ~100 holes
+        assert!(centres.len() > 50, "expected ~100 holes, got {}", centres.len());
+        assert!(centres.len() < 200, "expected ~100 holes, got {}", centres.len());
+        // All centres should be within domain
+        for &(x, y) in &centres {
+            assert!(x.abs() <= 1e-6, "hole at x={:.0e} outside domain", x);
+            assert!(y.abs() <= 1e-6, "hole at y={:.0e} outside domain", y);
+        }
     }
 }

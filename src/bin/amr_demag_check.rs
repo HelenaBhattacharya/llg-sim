@@ -15,10 +15,13 @@
 // Physics setup (matching García-Cervera & Roma, IEEE Trans. Magn. 2005):
 //   - 500 nm × 500 nm Permalloy square, dz = dx ≈ 3.9 nm (CUBIC cells)
 //   - García-Cervera's formulation assumes infinite thickness in z.
-//     The 2D log-kernel Green's function is exact for dz → ∞, and
-//     approaches exact for cubic cells (dz = dx = dy).  Setting dz = dx
-//     is the correct regime to validate the FK pipeline in isolation.
-//     Use LLG_CHECK_DZ to sweep dz and measure the thin-film degradation.
+//     The 2D log-kernel Green's function is exact for dz → ∞ and
+//     increasingly approximate as dz → dx.  For cubic cells (dz = dx),
+//     the 2D kernel overestimates in-plane demag factors (Nxx ≈ 0.5
+//     instead of 0.33).  This is a known limitation, not a bug.
+//     Use LLG_CHECK_DZ to sweep dz and measure the thickness dependence.
+//     Set LLG_CHECK_DZ=100e-9 to test the near-infinite-thickness regime
+//     where the FK pipeline should achieve < 1% RMSE.
 //   - No geometry mask (full square domain)
 //   - Analytic Usov-type vortex:
 //       θ = atan2(y − cy, x − cx)    (azimuthal angle)
@@ -454,7 +457,7 @@ fn main() {
     let ghost = 2usize;
 
     // ---- Physical domain ----
-    // 500 nm × 500 nm Permalloy square, dz = dx (cubic cells → García-Cervera regime)
+    // 500 nm × 500 nm Permalloy square, dz = dx (cubic cells, stresses FK 2D kernel)
     // Use LLG_CHECK_DZ to override (e.g. 1e-9 for thin-film, 100e-9 for near-infinite)
     let base_nx: usize = env_or("LLG_CHECK_BASE_NX", 128);
     let base_ny: usize = env_or("LLG_CHECK_BASE_NY", 128);
@@ -464,7 +467,9 @@ fn main() {
     let dx = lx / base_nx as f64;
     let dy = ly / base_ny as f64;
 
-    // Default dz = dx (cubic cells) — the regime where FK 2D log kernel is valid.
+    // Default dz = dx (cubic cells) — stresses the FK 2D kernel with finite
+    // thickness.  The 2D log kernel is exact only for dz → ∞.
+    // Set LLG_CHECK_DZ=100e-9 to test the near-infinite-thickness regime.
     // Set LLG_CHECK_DZ=1e-9 to test thin-film regime (expect FK degradation).
     let dz: f64 = env_or("LLG_CHECK_DZ", dx);
 
@@ -523,7 +528,7 @@ fn main() {
         println!("  LLG_AMR_DEMAG_MODE={m}: running selected mode only");
     }
     let regime = if (dz / dx - 1.0).abs() < 0.01 {
-        "cubic cells — FK 2D kernel valid"
+        "cubic cells — FK 2D kernel approximate (exact only for dz → ∞)"
     } else if dz / dx < 0.5 {
         "THIN FILM — FK 2D kernel will overestimate in-plane fields"
     } else if dz / dx > 2.0 {
@@ -730,6 +735,16 @@ fn main() {
 
     // Mode 2: CoarseFft (Phase 1 solver: M-restriction + L0 FFT)
     if should_run("coarse_fft") {
+        // Warm-up: pre-build and cache the Demag2D operator for whatever grid
+        // size compute_coarse_fft_demag will use (base grid at R=1, or the
+        // super-coarse demag grid at R>1).  Without this, the first call pays
+        // the one-time FFT-planning + kernel-loading cost (~0.5–1s), which
+        // dominates the timing and masks the actual per-step FFT speedup.
+        {
+            let mut b_warmup = VectorField2D::new(base_grid);
+            let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut b_warmup);
+        }
+
         println!("Mode: coarse_fft (M-restriction + L0 FFT) ...");
         let t1 = Instant::now();
         let mut b_coarse = VectorField2D::new(base_grid);

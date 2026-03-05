@@ -5,14 +5,11 @@
 // This file intentionally contains *no new physics*.
 // It routes calls to one of:
 //   - demag_fft_uniform.rs    (FFT convolution on a uniform FD grid)
-//   - demag_poisson_mg.rs     (2D MG + boundary integral; Fredkin-Koehler decomposition)
-//
-// The DST solver has been retired — the 2D MG solver uses the same Fredkin-
-// Koehler decomposition with multigrid replacing the spectral solve.
+//   - demag_poisson_mg.rs     (3D padded-box MG + treecode BCs)
 //
 // Runtime override:
 //   export LLG_DEMAG_METHOD=fft   (FFT convolution — default)
-//   export LLG_DEMAG_METHOD=mg    (2D multigrid + boundary integral)
+//   export LLG_DEMAG_METHOD=mg    (3D multigrid on padded box)
 
 use crate::grid::Grid2D;
 use crate::params::{DemagMethod, Material};
@@ -69,7 +66,7 @@ pub fn compute_demag_field(
 /// Add demag field with periodic boundary conditions in x/y.
 ///
 /// *FFT method*: supports MuMax-style finite-image PBC sums.
-/// *MG method*: open-BC only (Fredkin-Koehler); falls back to FFT for PBC.
+/// *MG method*: open-BC only (3D padded box); falls back to FFT for PBC.
 pub fn add_demag_field_pbc(
     grid: &Grid2D,
     m: &VectorField2D,
@@ -127,14 +124,13 @@ pub fn add_demag_field_pbc(
                 demag_poisson_mg::add_demag_field_poisson_mg(grid, m, b_eff, mat)
             }
         }
-        // DST variant retired — accept the enum value but route to MG.
-        // This prevents compile errors if old configs still specify "dst".
+        // DST variant retired — route to MG (3D padded box).
         DemagMethod::PoissonDst => {
             static WARN_DST_RETIRED: Once = Once::new();
             WARN_DST_RETIRED.call_once(|| {
                 eprintln!(
                     "[demag] INFO: demag_method=dst has been retired. \
-                     Using demag_method=mg (2D MG + boundary integral) instead."
+                     Using demag_method=mg (3D padded-box MG) instead."
                 );
             });
             if pbc_x > 0 || pbc_y > 0 {
