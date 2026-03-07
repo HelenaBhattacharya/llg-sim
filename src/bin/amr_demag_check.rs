@@ -632,6 +632,7 @@ fn main() {
     // =====================================================================
 
     let b_ref_coarse: VectorField2D;
+    let mut b_fine_opt: Option<VectorField2D> = None;
 
     if !skip_fine {
         println!("Computing FFT reference on {} × {} fine grid ...", fine_nx, fine_ny);
@@ -658,6 +659,10 @@ fn main() {
         if do_csv {
             write_b_csv(&format!("{out_dir}/b_ref_coarse.csv"), &b_ref_coarse);
         }
+        
+        // Save for patch-level comparison in Step 6
+        b_fine_opt = Some(b_fine);
+        
         println!();
     } else {
         // Use coarse-only FFT as reference
@@ -925,4 +930,127 @@ fn main() {
 
     println!();
     println!("Done.");
+
+    // =====================================================================
+    // Step 6: Patch-level B accuracy (the composite V-cycle test)
+    //
+    // This compares B at FINE-RESOLUTION patch cells, not on the coarse grid.
+    // This is where the composite V-cycle's advantage should appear:
+    //   - coarse_fft gives interpolated coarse B at patch cells
+    //   - composite vcycle gives -μ₀∇φ from patch-level φ
+    //
+    // Reference: b_fine sampled at each patch cell's physical position.
+    // =====================================================================
+
+    if let Some(ref b_fine) = b_fine_opt {
+        println!();
+        println!("╔════════════════════════════════════════════════════════════════╗");
+        println!("║  Patch-Level B Accuracy (fine-resolution comparison)          ║");
+        println!("╚════════════════════════════════════════════════════════════════╝");
+        println!();
+
+        // Run coarse_fft to get interpolated patch B.
+        let mut b_coarse_tmp = VectorField2D::new(base_grid);
+        let (b_l1_cfft, _) = coarse_fft_demag::compute_coarse_fft_demag(
+            &h, &mat, &mut b_coarse_tmp);
+
+        // Run composite (uses vcycle if LLG_DEMAG_COMPOSITE_VCYCLE=1).
+        let mut b_coarse_comp = VectorField2D::new(base_grid);
+        let (b_l1_comp, _) = mg_composite::compute_composite_demag(
+            &h, &mat, &mut b_coarse_comp);
+
+        // For each L1 patch, compare both b_l1 arrays against the fine reference.
+        println!("  {:>5} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10}",
+            "patch", "nx", "ny", "cfft_rmse", "comp_rmse", "cfft_rel%", "comp_rel%");
+        println!("  (relative errors normalised to global max|B| = {:.4e} T)", bref_max);
+        println!("  {:->5} {:->8} {:->8} {:->10} {:->10} {:->10} {:->10}",
+            "", "", "", "", "", "", "");
+
+        let mut total_cfft_se = 0.0f64;
+        let mut total_comp_se = 0.0f64;
+        let mut total_cells = 0usize;
+
+        for (pi, patch) in h.patches.iter().enumerate() {
+            let pnx = patch.grid.nx;
+            let pny = patch.grid.ny;
+            let gi0 = patch.interior_i0();
+            let gj0 = patch.interior_j0();
+            let gi1 = patch.interior_i1();
+            let gj1 = patch.interior_j1();
+
+            let b_cfft = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
+            let b_comp = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
+
+            let mut se_cfft = 0.0f64;
+            let mut se_comp = 0.0f64;
+            let mut n_cells = 0usize;
+
+            for j in gj0..gj1 {
+                for i in gi0..gi1 {
+                    let (x, y) = patch.cell_center_xy(i, j);
+                    let b_ref = sample_bilinear(b_fine, x, y);
+                    let idx = j * pnx + i;
+
+                    let b_cf = b_cfft[idx];
+                    let b_co = b_comp[idx];
+
+                    // Squared error (Bx + By only — Bz is the same for both)
+                    let err_cfft = (b_cf[0] - b_ref[0]).powi(2) + (b_cf[1] - b_ref[1]).powi(2);
+                    let err_comp = (b_co[0] - b_ref[0]).powi(2) + (b_co[1] - b_ref[1]).powi(2);
+
+                    se_cfft += err_cfft;
+                    se_comp += err_comp;
+                    n_cells += 1;
+                }
+            }
+
+            if n_cells > 0 {
+                let rmse_cfft = (se_cfft / n_cells as f64).sqrt();
+                let rmse_comp = (se_comp / n_cells as f64).sqrt();
+                // Normalize to GLOBAL B_max, not patch-local
+                let rel_cfft = if bref_max > 0.0 { rmse_cfft / bref_max * 100.0 } else { 0.0 };
+                let rel_comp = if bref_max > 0.0 { rmse_comp / bref_max * 100.0 } else { 0.0 };
+
+                println!("  {:>5} {:>8} {:>8} {:>10.4e} {:>10.4e} {:>9.2}% {:>9.2}%",
+                    pi, pnx, pny, rmse_cfft, rmse_comp, rel_cfft, rel_comp);
+
+                total_cfft_se += se_cfft;
+                total_comp_se += se_comp;
+                total_cells += n_cells;
+            }
+        }
+
+        if total_cells > 0 {
+            let total_rmse_cfft = (total_cfft_se / total_cells as f64).sqrt();
+            let total_rmse_comp = (total_comp_se / total_cells as f64).sqrt();
+            let total_rel_cfft = if bref_max > 0.0 { total_rmse_cfft / bref_max * 100.0 } else { 0.0 };
+            let total_rel_comp = if bref_max > 0.0 { total_rmse_comp / bref_max * 100.0 } else { 0.0 };
+
+            println!();
+            println!("  TOTAL ({} interior cells across {} L1 patches):", total_cells, h.patches.len());
+            println!("    coarse_fft (interpolated):  RMSE = {:.4e} T  ({:.2}%)", total_rmse_cfft, total_rel_cfft);
+            println!("    composite  (from patch φ):  RMSE = {:.4e} T  ({:.2}%)", total_rmse_comp, total_rel_comp);
+
+            if total_rmse_comp < total_rmse_cfft {
+                let improvement = (1.0 - total_rmse_comp / total_rmse_cfft) * 100.0;
+                println!("    → composite is {:.1}% more accurate at patch cells", improvement);
+            } else {
+                let degradation = (total_rmse_comp / total_rmse_cfft - 1.0) * 100.0;
+                println!("    → composite is {:.1}% WORSE at patch cells (L0 MG discretisation error dominates)", degradation);
+                println!("    → enable PPPM hybrid: LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_HYBRID_RADIUS=14");
+            }
+
+            let vcycle_on = std::env::var("LLG_DEMAG_COMPOSITE_VCYCLE")
+                .map(|v| v == "1").unwrap_or(false);
+            println!();
+            println!("    V-cycle mode: {}", if vcycle_on { "ON (fine ∇φ on patches)" } else { "OFF (interpolated coarse B)" });
+            if !vcycle_on {
+                println!("    → To test fine-resolution B: LLG_DEMAG_COMPOSITE_VCYCLE=1");
+            }
+        }
+        println!();
+    } else {
+        println!();
+        println!("  (Patch-level comparison skipped — run without --skip-fine-ref to enable)");
+    }
 }

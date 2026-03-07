@@ -541,7 +541,7 @@ fn save_mesh_zoom_multilevel(
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a == "--plots");
-    let do_ovf = args.iter().any(|a| a == "--ovf");
+    let do_ovf = args.iter().any(|a| a == "--ovf" || a == "--ovfs");
 
     let out_dir = "out/amr_bloch_relax";
     ensure_dir(out_dir);
@@ -757,6 +757,9 @@ fn main() -> std::io::Result<()> {
     if do_plots {
         println!("[amr_bloch_relax] --plots enabled: writing PNGs to {out_dir}");
     }
+    if do_ovf {
+        println!("[amr_bloch_relax] --ovf enabled: will write OVFs to {out_dir}/ovf_*");
+    }
 
     // Step 0 outputs
     {
@@ -810,9 +813,12 @@ fn main() -> std::io::Result<()> {
 
     let t0 = Instant::now();
     let mut t_amr_step = 0.0;
+    let mut amr_step_count = 0usize;
+    let mut t_fine_step = 0.0;
 
     for step in 1..=steps {
         // uniform fine step
+        let tf = Instant::now();
         step_llg_rk4_recompute_field_masked_relax(
             &mut m_fine,
             &llg,
@@ -820,6 +826,7 @@ fn main() -> std::io::Result<()> {
             &mut scratch_fine,
             FieldMask::ExchAnis,
         );
+        t_fine_step += tf.elapsed().as_secs_f64();
         // uniform coarse step
         step_llg_rk4_recompute_field_masked_relax(
             &mut m_coarse,
@@ -835,6 +842,7 @@ fn main() -> std::io::Result<()> {
             let t3 = Instant::now();
             stepper.step(&mut h, &llg, &mat, FieldMask::ExchAnis);
             t_amr_step += t3.elapsed().as_secs_f64();
+            amr_step_count += 1;
         }
 
         // Regrid
@@ -965,29 +973,95 @@ fn main() -> std::io::Result<()> {
     );
 
     println!();
-    println!("AMR Bloch-wall relaxation benchmark (demag OFF)");
-    println!(
-        "Base grid: {} x {}   dx={:.3e} dy={:.3e} dz={:.3e}",
-        base_grid.nx, base_grid.ny, base_grid.dx, base_grid.dy, base_grid.dz
-    );
-    println!(
-        "Fine grid: {} x {}   dx={:.3e} dy={:.3e}",
-        fine_grid.nx, fine_grid.ny, fine_grid.dx, fine_grid.dy
-    );
-    println!("Steps: {}   dt={:.3e}", steps, dt);
+    let (rmse_final, maxd_final) = rmse_and_max_delta(&m_amr_fine_final, &m_fine);
+
+    let fine_cells_total = fine_grid.nx * fine_grid.ny;
+    let fine_cells_in_patches: usize = current_patches.iter()
+        .map(|r| (r.nx * ref_ratio_total) * (r.ny * ref_ratio_total)).sum();
+    let coverage = fine_cells_in_patches as f64 / fine_cells_total as f64;
+
+    let bar = "═".repeat(64);
+    let thin = "─".repeat(64);
+
+    let avg_amr_ms = if amr_step_count > 0 { (t_amr_step / amr_step_count as f64) * 1e3 } else { f64::NAN };
+    let avg_fine_ms = if steps > 0 { (t_fine_step / steps as f64) * 1e3 } else { f64::NAN };
+    let speedup_per_step = if avg_amr_ms > 0.0 && avg_fine_ms.is_finite() { avg_fine_ms / avg_amr_ms } else { f64::NAN };
+    let speedup_wall = if t_amr_step > 0.0 { t_fine_step / t_amr_step } else { f64::NAN };
+
+    println!("╔{}╗", bar);
+    println!("║{:^64}║", "AMR BLOCH-WALL RELAXATION — RESULTS SUMMARY");
+    println!("╚{}╝", bar);
+
+    println!();
+    println!("  PROBLEM SETUP");
+    println!("  {thin}");
+    println!("  Coarse grid        {:>6} × {:<6}    dx = {:.2e} m", base_grid.nx, base_grid.ny, base_grid.dx);
+    println!("  Fine-equivalent    {:>6} × {:<6}    dx = {:.2e} m", fine_grid.nx, fine_grid.ny, fine_grid.dx);
+    println!("  Thickness                              dz = {:.2e} m", base_grid.dz);
+    println!("  Refinement         {} levels (ratio {}:1 per level, {}:1 total)",
+        amr_max_level, ratio, ref_ratio_total);
+    println!("  Time steps         {}  (dt = {:.2e} s)", steps, dt);
     if subcycle_active {
-        println!(
-            "Subcycling: ON  n_levels={}  ratio={}  AMR coarse steps: ~{}",
-            h.num_levels(), subcycle_ratio, steps / subcycle_ratio.max(1)
-        );
+        println!("  Subcycling         ON   ratio={}   coarse steps={}",
+            subcycle_ratio, steps / subcycle_ratio.max(1));
     } else {
-        println!("Subcycling: OFF");
+        println!("  Subcycling         OFF (flat stepping)");
     }
-    println!("Outputs: {out_dir}");
-    println!(
-        "Timing: total wall {:.3} s | amr_step {:.3} s",
-        wall, t_amr_step
-    );
+    println!("  Demag              OFF (exchange + anisotropy only)");
+
+    println!();
+    println!("  AMR PATCHES (final state)");
+    println!("  {thin}");
+    for lvl in 1..=amr_max_level {
+        println!("  Level {} patches    {}", lvl, level_patch_count(&h, lvl));
+    }
+    println!("  Fine cells total   {:>12}   ({} × {})", fine_cells_total, fine_grid.nx, fine_grid.ny);
+    println!("  Fine cells in AMR  {:>12}   ({:.1}% coverage)", fine_cells_in_patches, coverage * 100.0);
+    println!("  Cell savings       {:>12}   ({:.1}% fewer cells)",
+        fine_cells_total - fine_cells_in_patches, (1.0 - coverage) * 100.0);
+
+    println!();
+    println!("  ACCURACY (AMR vs uniform fine reference)");
+    println!("  {thin}");
+    println!("  Final RMSE(|Δm|)   {:.4e}", rmse_final);
+    println!("  Final max |Δm|     {:.4e}", maxd_final);
+
+    println!();
+    println!("  TIMING");
+    println!("  {thin}");
+    println!("  Total wall clock           {:>8.1} s", wall);
+    println!();
+    println!("  Uniform fine (reference)   {:>8.1} s   ({} steps × {:.1} ms/step)",
+        t_fine_step, steps, avg_fine_ms);
+    println!("  AMR (subcycled)            {:>8.1} s   ({} steps × {:.1} ms/step)",
+        t_amr_step, amr_step_count, avg_amr_ms);
+
+    println!();
+    println!("  SPEEDUP");
+    println!("  {thin}");
+    if speedup_per_step.is_finite() {
+        println!("  Per-step:  {:.1} ms (fine)  vs  {:.1} ms (AMR)  →  {:.1}× faster",
+            avg_fine_ms, avg_amr_ms, speedup_per_step);
+    }
+    if speedup_wall.is_finite() {
+        println!("  Wall time: {:.1} s  (fine)  vs  {:.1} s  (AMR)  →  {:.1}× faster",
+            t_fine_step, t_amr_step, speedup_wall);
+    }
+
+    println!();
+    println!("  OUTPUT: {out_dir}/");
+    println!("  {thin}");
+    println!("  rmse_log.csv       RMSE vs step");
+    println!("  regrid_log.csv     regrid events");
+    if do_ovf {
+        println!("  ovf_coarse/        coarse OVF snapshots");
+        println!("  ovf_fine/          fine reference OVF snapshots");
+        println!("  ovf_amr/           AMR composite OVF snapshots");
+    }
+    if do_plots {
+        println!("  *.png              patch maps + mesh zoom plots");
+    }
+    println!();
 
     Ok(())
 }

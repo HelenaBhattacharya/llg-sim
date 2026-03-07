@@ -968,7 +968,7 @@ fn main() {
     // ---- CLI flags ----
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a == "--plots");
-    let do_ovf = args.iter().any(|a| a == "--ovf");
+    let do_ovf = args.iter().any(|a| a == "--ovf" || a == "--ovfs");
     let amr_only = args.iter().any(|a| a == "--amr-only");
     let do_fine = !amr_only && !args.iter().any(|a| a == "--skip-fine-ref" || a == "--no-fine");
     let skip_coarse_ref = amr_only;
@@ -1298,6 +1298,7 @@ fn main() {
 
     // ---- OVF directories ----
     if do_ovf {
+        println!("[amr_skyrmion_relax] --ovf enabled: will write OVFs to {out_dir}/ovf_*");
         ensure_dir(&format!("{out_dir}/ovf_coarse"));
         if do_fine {
             ensure_dir(&format!("{out_dir}/ovf_fine"));
@@ -1853,141 +1854,137 @@ fn main() {
     let nsk_final_fine = if do_fine { count_skyrmion_cores(&m_fine, 0.0) } else { 0 };
     let nsk_final_amr = count_skyrmion_cores(&m_amr_fine_final, 0.0);
 
+    let bar = "═".repeat(64);
+    let thin = "─".repeat(64);
+
+    let avg_amr_ms = if amr_step_count > 0 { (t_amr_step / amr_step_count as f64) * 1e3 } else { f64::NAN };
+    let avg_fine_ms = if do_fine && steps > 0 { (t_demag_fine / steps as f64) * 1e3 } else { f64::NAN };
+    let speedup_per_step = if avg_amr_ms > 0.0 && avg_fine_ms.is_finite() { avg_fine_ms / avg_amr_ms } else { f64::NAN };
+    let speedup_wall = if t_amr_step > 0.0 && do_fine { t_demag_fine / t_amr_step } else { f64::NAN };
+
     println!();
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  AMR Skyrmion Bubble Relaxation — Final Summary");
-    println!("═══════════════════════════════════════════════════════════════");
+    println!("╔{}╗", bar);
+    println!("║{:^64}║", "AMR SKYRMION RELAXATION — RESULTS SUMMARY");
+    println!("╚{}╝", bar);
+
     println!();
-    println!(
-        "Domain:  {:.0}nm × {:.0}nm × {:.1}nm",
-        lx * 1e9,
-        ly * 1e9,
-        dz * 1e9
-    );
-    println!("Base grid:    {base_nx} × {base_ny}   dx={dx:.3e}  dy={dy:.3e}  dz={dz:.3e}");
-    println!(
-        "Fine grid:    {fine_nx} × {fine_ny}   dx={:.3e}  dy={:.3e}",
-        fine_grid.dx, fine_grid.dy
-    );
-    println!("AMR levels:   {}   ratio={}", amr_max_level, ratio);
+    println!("  PROBLEM SETUP");
+    println!("  {thin}");
+    println!("  Domain             {:.0}nm × {:.0}nm × {:.1}nm", lx * 1e9, ly * 1e9, dz * 1e9);
+    println!("  Coarse grid        {:>6} × {:<6}    dx = {:.2e} m", base_grid.nx, base_grid.ny, base_grid.dx);
+    println!("  Fine-equivalent    {:>6} × {:<6}    dx = {:.2e} m", fine_grid.nx, fine_grid.ny, fine_grid.dx);
+    println!("  Refinement         {} levels (ratio {}:1 per level, {}:1 total)",
+        amr_max_level, ratio, ref_ratio_total);
+    println!("  Time steps         {}  (dt = {:.2e} s,  total = {:.3} ns)", steps, dt, steps as f64 * dt * 1e9);
     if subcycle_active {
-        println!(
-            "Subcycling:   ON  ratio={}  dt_coarse={:.2e}  coarse_steps={}",
-            subcycle_ratio,
-            subcycle_ratio as f64 * dt,
-            steps / subcycle_ratio.max(1)
-        );
-    }
-    println!();
-    println!("Material: Ms={ms:.2e}  A_ex={a_ex:.2e}  K_u={k_u:.2e}  DMI={dmi_d:.2e}");
-    println!(
-        "  K_eff={k_eff:.3e}  l_ex={:.2}nm  δ={:.2}nm  κ={kappa:.3}",
-        l_ex * 1e9,
-        delta_w * 1e9
-    );
-    println!();
-    println!(
-        "Steps: {steps}   dt={dt:.3e}   total_time={:.3} ns   Bz={bz:.3} T",
-        steps as f64 * dt * 1e9
-    );
-    println!("α = {alpha:.4}");
-    println!();
-    println!("╔═══════════════════════════════════════════════════════════╗");
-    println!("║  Skyrmion Physics                                       ║");
-    println!("╠═══════════════════════════════════════════════════════════╣");
-    println!(
-        "║  Topological charge Q (fine):    {:>8.4}  (expect ≈ –{})  ║",
-        q_final_fine, n_skyrmions
-    );
-    println!(
-        "║  Topological charge Q (AMR):     {:>8.4}                 ║",
-        q_final_amr
-    );
-    println!(
-        "║  Skyrmion count (fine):          {:>3}       (seeded: {})   ║",
-        nsk_final_fine, n_skyrmions
-    );
-    println!(
-        "║  Skyrmion count (AMR):           {:>3}                      ║",
-        nsk_final_amr
-    );
-    if do_fine {
-        println!(
-            "║  min(mz) fine:                   {:>8.4}  (core depth)    ║",
-            min_mz(&m_fine)
-        );
-    }
-    println!(
-        "║  min(mz) AMR:                    {:>8.4}                  ║",
-        min_mz(&m_amr_fine_final)
-    );
-    println!("╚═══════════════════════════════════════════════════════════╝");
-    println!();
-    println!("Final RMSE(|Δm|):  {:.6e}", rmse_final);
-    println!("Final max |Δm|:    {:.6e}", maxd_final);
-    println!("Final <mz> coarse: {:.6}", avg_mz(&m_coarse));
-    if do_fine {
-        println!("Final <mz> fine:   {:.6}", avg_mz(&m_fine));
-    }
-    println!("Final <mz> AMR:    {:.6}", avg_mz(&m_amr_fine_final));
-    println!();
-    println!("Fine cells (uniform):   {fine_cells_total}");
-    println!("Fine cells in patches:  {fine_cells_in_patches}");
-    println!(
-        "Patch coverage fraction: {:.4} ({:.1}%)",
-        coverage,
-        coverage * 100.0
-    );
-    println!("  → Expected: ~5–15% (skyrmion walls + buffer only)");
-    println!();
-    println!("Timing (demag mode: {}):", amr_demag_mode_label);
-    println!("  total wall time:       {:.3} s", wall);
-    if do_fine {
-        println!(
-            "  fine demag FFT:        {:.3} s ({:.1}%)",
-            t_demag_fine,
-            100.0 * t_demag_fine / wall
-        );
+        println!("  Subcycling         ON   ratio={}   coarse steps={}",
+            subcycle_ratio, steps / subcycle_ratio.max(1));
+        println!("                     dt_coarse = {:.2e} s", dt * subcycle_ratio as f64);
     } else {
-        println!("  fine demag FFT:        (skipped --skip-fine-ref)");
+        println!("  Subcycling         OFF (flat stepping)");
+    }
+    println!("  Demag mode         {}", amr_demag_mode_label);
+    println!("  α = {alpha:.4}   Bz = {bz:.3} T");
+
+    println!();
+    println!("  MATERIAL");
+    println!("  {thin}");
+    println!("  Ms = {ms:.2e}   A_ex = {a_ex:.2e}   K_u = {k_u:.2e}   DMI = {dmi_d:.2e}");
+    println!("  K_eff = {k_eff:.3e}   l_ex = {:.2}nm   δ = {:.2}nm   κ = {kappa:.3}",
+        l_ex * 1e9, delta_w * 1e9);
+
+    println!();
+    println!("  SKYRMION PHYSICS");
+    println!("  {thin}");
+    println!("  Topological charge Q (fine):  {:>8.4}  (expect ≈ –{})", q_final_fine, n_skyrmions);
+    println!("  Topological charge Q (AMR):   {:>8.4}", q_final_amr);
+    println!("  Skyrmion count (fine):        {:>3}       (seeded: {})", nsk_final_fine, n_skyrmions);
+    println!("  Skyrmion count (AMR):         {:>3}", nsk_final_amr);
+    if do_fine {
+        println!("  min(mz) fine:                 {:>8.4}  (core depth)", min_mz(&m_fine));
+    }
+    println!("  min(mz) AMR:                  {:>8.4}", min_mz(&m_amr_fine_final));
+    println!("  <mz> coarse:                  {:.6}", avg_mz(&m_coarse));
+    if do_fine {
+        println!("  <mz> fine:                    {:.6}", avg_mz(&m_fine));
+    }
+    println!("  <mz> AMR:                     {:.6}", avg_mz(&m_amr_fine_final));
+
+    println!();
+    println!("  AMR PATCHES (final state)");
+    println!("  {thin}");
+    for lvl in 1..=amr_max_level {
+        println!("  Level {} patches    {}", lvl, level_patch_count(&h, lvl));
+    }
+    println!("  Fine cells total   {:>12}   ({} × {})", fine_cells_total, fine_grid.nx, fine_grid.ny);
+    println!("  Fine cells in AMR  {:>12}   ({:.1}% coverage)", fine_cells_in_patches, coverage * 100.0);
+    println!("  Cell savings       {:>12}   ({:.1}% fewer cells)",
+        fine_cells_total - fine_cells_in_patches, (1.0 - coverage) * 100.0);
+
+    println!();
+    println!("  ACCURACY (AMR vs uniform fine reference)");
+    println!("  {thin}");
+    if do_fine {
+        println!("  Final RMSE(|Δm|)   {:.4e}", rmse_final);
+        println!("  Final max |Δm|     {:.4e}", maxd_final);
+    } else {
+        println!("  (fine reference skipped — no RMSE data)");
+    }
+
+    println!();
+    println!("  TIMING");
+    println!("  {thin}");
+    println!("  Total wall clock           {:>8.1} s", wall);
+    println!();
+    if do_fine {
+        println!("  Uniform fine (reference)   {:>8.1} s   ({} steps × {:.1} ms/step)",
+            t_demag_fine, steps, avg_fine_ms);
+    } else {
+        println!("  Uniform fine (reference)   skipped (--skip-fine-ref)");
     }
     if !skip_coarse_ref {
-        println!(
-            "  coarse demag FFT:      {:.3} s ({:.1}%)",
-            t_demag_coarse,
-            100.0 * t_demag_coarse / wall
-        );
+        println!("  Uniform coarse (baseline)  {:>8.1} s", t_demag_coarse);
     } else {
-        println!("  coarse demag FFT:      (skipped --amr-only)");
+        println!("  Uniform coarse (baseline)  skipped (--amr-only)");
     }
-    println!(
-        "  AMR step (incl. demag):{:.3} s ({:.1}%)  ({} AMR steps)",
-        t_amr_step,
-        100.0 * t_amr_step / wall,
-        amr_step_count
-    );
-    if amr_step_count > 0 {
-        let avg_amr_ms = (t_amr_step / amr_step_count as f64) * 1e3;
-        println!("  AMR avg per step:      {:.1} ms/step", avg_amr_ms);
-        if do_fine && steps > 0 {
-            let avg_fine_ms = (t_demag_fine / steps as f64) * 1e3;
-            let speedup = avg_fine_ms / avg_amr_ms;
-            println!("  fine avg per step:     {:.1} ms/step  (demag only)", avg_fine_ms);
-            println!("  speedup (fine/AMR):    {:.1}×", speedup);
-        }
+    println!("  AMR (coarse FFT + patches) {:>8.1} s   ({} steps × {:.1} ms/step)",
+        t_amr_step, amr_step_count, avg_amr_ms);
+
+    println!();
+    println!("  SPEEDUP");
+    println!("  {thin}");
+    if speedup_per_step.is_finite() {
+        println!("  Per-step:  {:.1} ms (fine)  vs  {:.1} ms (AMR)  →  {:.1}× faster",
+            avg_fine_ms, avg_amr_ms, speedup_per_step);
     }
-    let other = (wall - t_demag_fine - t_demag_coarse - t_amr_step).max(0.0);
-    println!(
-        "  other/overhead:        {:.3} s ({:.1}%)",
-        other,
-        100.0 * other / wall
-    );
+    if speedup_wall.is_finite() {
+        println!("  Wall time: {:.1} s  (fine)  vs  {:.1} s  (AMR)  →  {:.1}× faster",
+            t_demag_fine, t_amr_step, speedup_wall);
+    }
+    if !speedup_per_step.is_finite() && !speedup_wall.is_finite() {
+        println!("  (no fine reference — speedup not computed)");
+    }
+
     println!();
-    println!("Demag FFT grid sizes:");
-    println!("  uniform fine FFT:      {} × {} = {} cells", fine_grid.nx, fine_grid.ny, fine_grid.nx * fine_grid.ny);
-    println!("  coarse_fft FFT:        {} × {} = {} cells", base_grid.nx, base_grid.ny, base_grid.nx * base_grid.ny);
-    println!("  cell ratio (fine/coarse): {}×", (fine_grid.nx * fine_grid.ny) / (base_grid.nx * base_grid.ny));
+    println!("  FFT GRID SIZES");
+    println!("  {thin}");
+    println!("  Uniform fine FFT   {:>6} × {:<6} = {:>10} cells", fine_grid.nx, fine_grid.ny, fine_grid.nx * fine_grid.ny);
+    println!("  Coarse FFT         {:>6} × {:<6} = {:>10} cells", base_grid.nx, base_grid.ny, base_grid.nx * base_grid.ny);
+    println!("  Cell ratio         {}× (fine / coarse)", (fine_grid.nx * fine_grid.ny) / (base_grid.nx * base_grid.ny));
+
     println!();
-    println!("Outputs: {out_dir}");
-    println!("Timing log: {out_dir}/timing_log.csv");
+    println!("  OUTPUT: {out_dir}/");
+    println!("  {thin}");
+    println!("  timing_log.csv     per-step wall times");
+    println!("  rmse_log.csv       RMSE vs step");
+    println!("  regrid_log.csv     regrid events");
+    if do_ovf {
+        println!("  ovf_coarse/        coarse OVF snapshots");
+        if do_fine { println!("  ovf_fine/          fine reference OVF snapshots"); }
+        println!("  ovf_amr/           AMR composite OVF snapshots");
+    }
+    if do_plots {
+        println!("  *.png              patch maps + mesh zoom plots");
+    }
+    println!();
 }

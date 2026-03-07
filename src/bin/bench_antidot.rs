@@ -61,6 +61,22 @@
 //   LLG_DEMAG_COARSEN_RATIO=2 cargo run --release --bin bench_antidot
 //   LLG_DEMAG_COARSEN_RATIO=4 cargo run --release --bin bench_antidot
 //
+//   # MG+hybrid composite crossover test:
+//   LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \
+//     cargo run --release --bin bench_antidot -- --no-plots
+//
+//   # Crossover sweep (increasing grid size):
+//   for NX in 256 512 1024 2048; do
+//     LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \
+//       LLG_AD_BASE_NX=$NX LLG_AD_BASE_NY=$NX \
+//       cargo run --release --bin bench_antidot -- --no-plots
+//   done
+//
+//   # Sparse holes (wider pitch → lower AMR coverage → earlier crossover):
+//   LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \
+//     LLG_AD_HOLE_PITCH=800e-9 LLG_AD_BASE_NX=1024 \
+//     cargo run --release --bin bench_antidot -- --no-plots
+//
 //   # Skip fine reference (timing mode only):
 //   cargo run --release --bin bench_antidot -- --skip-fine-ref
 //
@@ -224,10 +240,77 @@ fn region_rmse(a: &VectorField2D, b: &VectorField2D, region: &[bool]) -> (f64, u
 }
 
 // =====================================================================
+// Magnetisation initialisation: flower state or saturated
+// =====================================================================
+
+/// Compute flower-state magnetisation at position (x_cent, y_cent) in centred coords.
+///
+/// Uses potential flow around cylinders: M follows the streamlines of an
+/// ideal fluid flowing in +x̂ around circular obstacles. Near each hole,
+/// M curves tangentially to reduce the normal component M·n̂ (and thus
+/// the surface charge σ = M·n̂). Far from holes, M → [1, 0, 0].
+///
+/// This is the magnetostatic equilibrium (ignoring exchange), and creates
+/// genuine ∇·M variation near hole boundaries that fine patches resolve
+/// better than the coarse staircase.
+fn flower_m_at(
+    x: f64, y: f64,
+    holes: &[(f64, f64)],
+    radius: f64,
+    shape: &MaskShape,
+) -> [f64; 3] {
+    if !shape.contains(x, y) {
+        return [0.0, 0.0, 0.0];
+    }
+
+    let r2_h = radius * radius;
+    let mut mx = 1.0_f64;
+    let mut my = 0.0_f64;
+
+    for &(hx, hy) in holes {
+        let rx = x - hx;
+        let ry = y - hy;
+        let r2 = rx * rx + ry * ry;
+        if r2 < 1e-30 { continue; }
+        let r4 = r2 * r2;
+
+        // Potential flow correction: dipolar field from each hole
+        mx -= r2_h * (rx * rx - ry * ry) / r4;
+        my -= r2_h * 2.0 * rx * ry / r4;
+    }
+
+    // Normalize to unit vector
+    let mag = (mx * mx + my * my).sqrt();
+    if mag < 1e-15 { return [1.0, 0.0, 0.0]; }
+    [mx / mag, my / mag, 0.0]
+}
+
+/// Compute magnetisation at (x_cent, y_cent) — dispatches on init mode.
+fn init_m_at(
+    x: f64, y: f64,
+    holes: &[(f64, f64)],
+    radius: f64,
+    shape: &MaskShape,
+    use_flower: bool,
+) -> [f64; 3] {
+    if use_flower {
+        flower_m_at(x, y, holes, radius, shape)
+    } else {
+        if shape.contains(x, y) { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] }
+    }
+}
+
+// =====================================================================
 // Fine-grid reference
 // =====================================================================
 
-fn build_fine_m(fine_grid: &Grid2D, shape: &MaskShape) -> VectorField2D {
+fn build_fine_m(
+    fine_grid: &Grid2D,
+    shape: &MaskShape,
+    holes: &[(f64, f64)],
+    radius: f64,
+    use_flower: bool,
+) -> VectorField2D {
     let mut m = VectorField2D::new(*fine_grid);
     let half_lx = fine_grid.nx as f64 * fine_grid.dx * 0.5;
     let half_ly = fine_grid.ny as f64 * fine_grid.dy * 0.5;
@@ -236,11 +319,7 @@ fn build_fine_m(fine_grid: &Grid2D, shape: &MaskShape) -> VectorField2D {
         for i in 0..fine_grid.nx {
             let x_cent = (i as f64 + 0.5) * fine_grid.dx - half_lx;
             let k = j * fine_grid.nx + i;
-            m.data[k] = if shape.contains(x_cent, y_cent) {
-                [1.0, 0.0, 0.0]
-            } else {
-                [0.0, 0.0, 0.0]
-            };
+            m.data[k] = init_m_at(x_cent, y_cent, holes, radius, shape, use_flower);
         }
     }
     m
@@ -273,7 +352,13 @@ fn downsample_b_to_l0(
 // Reinitialise AMR patch magnetisation at fine resolution
 // =====================================================================
 
-fn reinit_patches_saturated_xhat(h: &mut AmrHierarchy2D, shape: &MaskShape) {
+fn reinit_patches(
+    h: &mut AmrHierarchy2D,
+    shape: &MaskShape,
+    holes: &[(f64, f64)],
+    radius: f64,
+    use_flower: bool,
+) {
     let base_dx = h.base_grid.dx;
     let base_dy = h.base_grid.dy;
     let half_lx = h.base_grid.nx as f64 * base_dx * 0.5;
@@ -289,11 +374,7 @@ fn reinit_patches_saturated_xhat(h: &mut AmrHierarchy2D, shape: &MaskShape) {
             let y_cent = y0 + (j as f64 + 0.5) * pdy - half_ly;
             for i in 0..pnx {
                 let x_cent = x0 + (i as f64 + 0.5) * pdx - half_lx;
-                p.m.data[j * pnx + i] = if shape.contains(x_cent, y_cent) {
-                    [1.0, 0.0, 0.0]
-                } else {
-                    [0.0, 0.0, 0.0]
-                };
+                p.m.data[j * pnx + i] = init_m_at(x_cent, y_cent, holes, radius, shape, use_flower);
             }
         }
     }
@@ -308,11 +389,7 @@ fn reinit_patches_saturated_xhat(h: &mut AmrHierarchy2D, shape: &MaskShape) {
                 let y_cent = y0 + (j as f64 + 0.5) * pdy - half_ly;
                 for i in 0..pnx {
                     let x_cent = x0 + (i as f64 + 0.5) * pdx - half_lx;
-                    p.m.data[j * pnx + i] = if shape.contains(x_cent, y_cent) {
-                        [1.0, 0.0, 0.0]
-                    } else {
-                        [0.0, 0.0, 0.0]
-                    };
+                    p.m.data[j * pnx + i] = init_m_at(x_cent, y_cent, holes, radius, shape, use_flower);
                 }
             }
         }
@@ -808,6 +885,11 @@ fn main() {
     let fine_dy = dy / fine_ratio as f64;
 
     // ---- Anti-dot geometry ----
+    // CROSSOVER TUNING: Edit hole_pitch to control feature sparsity.
+    // Wider pitch = fewer holes = less AMR coverage = lower N_eff = earlier crossover.
+    //   400e-9  (default) — dense, ~17 holes in 2μm domain
+    //   800e-9            — sparse, ~4 holes
+    //   1000e-9           — very sparse, ~2 holes
     let hole_diam: f64 = env_or("LLG_AD_HOLE_DIAM", 80.0e-9);
     let hole_pitch: f64 = env_or("LLG_AD_HOLE_PITCH", 400.0e-9);
     let hole_radius = hole_diam * 0.5;
@@ -849,10 +931,24 @@ fn main() {
     let n_bulk = mask_count(&bulk_mask);
     let n_transition = n_material - n_edge - n_bulk;
 
-    // ---- Initialise L0 magnetisation: saturated +x̂ (binary mask) ----
+    // ---- Initialise L0 magnetisation ----
+    // LLG_AD_INIT=flower  → potential-flow flower state (non-trivial ∇·M near holes)
+    // LLG_AD_INIT=saturated (default) → uniform +x̂ (binary mask, trivial ∇·M)
+    let use_flower = std::env::var("LLG_AD_INIT")
+        .map(|s| s.trim().to_ascii_lowercase() == "flower")
+        .unwrap_or(false);
+    let init_label = if use_flower { "flower (+x̂ curling around holes)" } else { "saturated +x̂" };
+
+    let half_lx = base_nx as f64 * dx * 0.5;
+    let half_ly = base_ny as f64 * dy * 0.5;
     let mut m_binary = VectorField2D::new(base_grid);
-    for k in 0..base_nx * base_ny {
-        m_binary.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+    for j in 0..base_ny {
+        let y_cent = (j as f64 + 0.5) * dy - half_ly;
+        for i in 0..base_nx {
+            let x_cent = (i as f64 + 0.5) * dx - half_lx;
+            let k = j * base_nx + i;
+            m_binary.data[k] = init_m_at(x_cent, y_cent, &hole_centres, hole_radius, &antidot_shape, use_flower);
+        }
     }
 
     let mode_filter: Option<String> = std::env::var("LLG_AMR_DEMAG_MODE").ok()
@@ -876,7 +972,7 @@ fn main() {
         100.0 * n_material as f64 / (base_nx*base_ny) as f64, n_vacuum);
     println!("            {} edge (≤{}), {} bulk (>{}), {} transition",
         n_edge, edge_dist, n_bulk, bulk_dist, n_transition);
-    println!("Init:       saturated +x̂ (maximal surface charges at hole edges)");
+    println!("Init:       {} (set LLG_AD_INIT=flower for non-trivial M near holes)", init_label);
     println!("AMR:        {} level(s), ratio={}, ghost={}", amr_max_level, ratio, ghost);
     println!("Output:     {out_dir}");
     if skip_fine { println!("  --skip-fine-ref: skipping fine-grid FFT reference"); }
@@ -901,7 +997,7 @@ fn main() {
         println!("═══════════════════════════════════════════════════════════════");
 
         let t_setup = Instant::now();
-        let m_fine = build_fine_m(&fine_grid, &antidot_shape);
+        let m_fine = build_fine_m(&fine_grid, &antidot_shape, &hole_centres, hole_radius, use_flower);
         let fine_mask = antidot_shape.to_mask(&fine_grid);
         let fine_n_mat = mask_count(&fine_mask);
         let setup_ms = t_setup.elapsed().as_secs_f64() * 1e3;
@@ -1017,7 +1113,7 @@ fn main() {
     }
 
     h.fill_patch_ghosts();
-    reinit_patches_saturated_xhat(&mut h, &antidot_shape);
+    reinit_patches(&mut h, &antidot_shape, &hole_centres, hole_radius, use_flower);
     h.restrict_patches_to_coarse();
 
     let amr_setup_ms = t_amr_setup.elapsed().as_secs_f64() * 1e3;
@@ -1584,6 +1680,131 @@ fn main() {
     }
     println!("  P-FFT target: edge RMSE < 3%, bulk < 1%, eval time close to coarse_fft.");
 
+    // =====================================================================
+    // CROSSOVER ANALYSIS: Uniform-Fine FFT vs AMR + Composite MG
+    // =====================================================================
+    {
+        let fft_fine_r = results.iter().find(|r| r.name == "fft_fine");
+        let composite_r = results.iter().find(|r| r.name == "composite_grid");
+        let coarse_fft_r = results.iter().find(|r| r.name.starts_with("coarse_fft"));
+
+        if fft_fine_r.is_some() || composite_r.is_some() || coarse_fft_r.is_some() {
+            println!();
+            println!("╔══════════════════════════════════════════════════════════════╗");
+            println!("║  CROSSOVER ANALYSIS: FFT (uniform) vs AMR+MG (adaptive)    ║");
+            println!("╚══════════════════════════════════════════════════════════════╝");
+
+            // --- Cell counts ---
+            let n_fine_cells = fine_nx * fine_ny;
+            let n_fine_fft_padded = (2 * fine_nx) * (2 * fine_ny);
+            let n_l0_cells = base_nx * base_ny;
+            let n_l0_fft_padded = (2 * base_nx) * (2 * base_ny);
+
+            // MG padded box estimate
+            let mg_pad: usize = env_or("LLG_DEMAG_MG_PAD_XY", 6);
+            let mg_nvac: usize = env_or("LLG_DEMAG_MG_NVAC_Z", 16);
+            let mg_px = base_nx + 2 * mg_pad;
+            let mg_py = base_ny + 2 * mg_pad;
+            let mg_pz = 1 + 2 * mg_nvac;
+            let n_mg_padded = mg_px * mg_py * mg_pz;
+
+            // Patch coverage
+            let n_amr_patch_cells = n_fine_cells;
+            let patch_coverage_pct = 100.0 * n_amr_patch_cells as f64 / n_fine_cells as f64;
+
+            // N_eff for composite MG: MG padded box + patch cells for exchange/DMI
+            let n_eff_composite = n_mg_padded + n_amr_patch_cells;
+
+            // N_eff for coarse FFT: L0 padded FFT + patch cells
+            let n_eff_coarse_fft = n_l0_fft_padded + n_amr_patch_cells;
+
+            // Ratios
+            let ratio_vs_fine = n_fine_fft_padded as f64 / n_eff_composite as f64;
+            let ratio_coarse_fft = n_fine_fft_padded as f64 / n_eff_coarse_fft as f64;
+
+            println!();
+            println!("  Cell counts:");
+            println!("    Uniform-fine FFT:    {} × {} = {} cells (padded: {})",
+                fine_nx, fine_ny, n_fine_cells, n_fine_fft_padded);
+            println!("    L0 grid:             {} × {} = {} cells",
+                base_nx, base_ny, n_l0_cells);
+            println!("    MG padded box:       {} × {} × {} = {} cells",
+                mg_px, mg_py, mg_pz, n_mg_padded);
+            println!("    AMR patch cells:     {} ({:.1}% of fine-equiv)",
+                n_amr_patch_cells, patch_coverage_pct);
+            println!();
+            println!("    N_eff (composite MG): {} (MG padded + patches)", n_eff_composite);
+            println!("    N_eff (coarse FFT):   {} (L0 FFT padded + patches)", n_eff_coarse_fft);
+            println!("    Cell ratio (fine/composite): {:.1}×", ratio_vs_fine);
+            println!("    Cell ratio (fine/coarse_fft): {:.1}×", ratio_coarse_fft);
+
+            // --- Timing comparison ---
+            println!();
+            println!("  Timing comparison:");
+
+            if let Some(r) = fft_fine_r {
+                println!("    fft_fine:        {:.1} ms (setup) + {:.1} ms (eval)", r.setup_ms, r.eval_ms);
+            }
+            if let Some(r) = coarse_fft_r {
+                println!("    coarse_fft:      {:.1} ms (setup) + {:.1} ms (eval)", r.setup_ms, r.eval_ms);
+            }
+            if let Some(r) = composite_r {
+                println!("    composite_mg:    {:.1} ms (setup) + {:.1} ms (eval)", r.setup_ms, r.eval_ms);
+            }
+
+            // --- Speedup ratios ---
+            if let (Some(fine_r), Some(comp_r)) = (fft_fine_r, composite_r) {
+                let speedup_eval = fine_r.eval_ms / comp_r.eval_ms;
+                let per_unknown_ratio = if n_eff_composite > 0 && n_fine_fft_padded > 0 {
+                    (comp_r.eval_ms / n_eff_composite as f64)
+                        / (fine_r.eval_ms / n_fine_fft_padded as f64)
+                } else { f64::NAN };
+
+                println!();
+                if speedup_eval > 1.0 {
+                    println!("  >>> COMPOSITE MG IS {:.1}× FASTER than uniform-fine FFT <<<", speedup_eval);
+                } else {
+                    println!("  >>> FFT is still {:.1}× faster (composite MG {:.1}× slower) <<<",
+                        1.0/speedup_eval, 1.0/speedup_eval);
+                }
+                println!("    Per-unknown: MG is {:.0}× slower than FFT", per_unknown_ratio);
+                println!("    Cell reduction: {:.1}× (fine/composite)", ratio_vs_fine);
+                println!("    Needed for crossover: cell reduction > {:.0}×", per_unknown_ratio);
+
+                // Accuracy comparison
+                println!();
+                println!("  Accuracy:");
+                let fine_grel = if bref_max > 0.0 { fine_r.rmse_global / bref_max * 100.0 } else { 0.0 };
+                let comp_grel = if bref_max > 0.0 { comp_r.rmse_global / bref_max * 100.0 } else { 0.0 };
+                println!("    fft_fine:     {:.2}% global RMSE (reference)", fine_grel);
+                println!("    composite_mg: {:.2}% global RMSE", comp_grel);
+            }
+
+            if let (Some(fine_r), Some(cfft_r)) = (fft_fine_r, coarse_fft_r) {
+                let speedup_cfft = fine_r.eval_ms / cfft_r.eval_ms;
+                println!();
+                println!("  Coarse-FFT speedup: {:.1}× vs uniform-fine FFT", speedup_cfft);
+            }
+
+            // --- Crossover guidance ---
+            println!();
+            println!("  To find the crossover point, increase the grid size:");
+            println!("    LLG_AD_BASE_NX=1024  (fine-equiv: 2048²)");
+            println!("    LLG_AD_BASE_NX=2048  (fine-equiv: 4096²)");
+            println!("    LLG_AD_BASE_NX=4096  (fine-equiv: 8192²)");
+            println!("  To reduce patch coverage (earlier crossover):");
+            println!("    LLG_AD_HOLE_PITCH=800e-9   (sparse holes)");
+            println!("    LLG_AD_HOLE_PITCH=1000e-9  (very sparse)");
+            println!();
+            println!("  Quick crossover sweep:");
+            println!("    for NX in 256 512 1024 2048; do");
+            println!("      LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \\");
+            println!("        LLG_AD_BASE_NX=$NX LLG_AD_BASE_NY=$NX \\");
+            println!("        cargo run --release --bin bench_antidot -- --no-plots");
+            println!("    done");
+        }
+    }
+
     // ---- CSV ----
     {
         let csv_path = format!("{out_dir}/results.csv");
@@ -1597,6 +1818,24 @@ fn main() {
                 r.max_delta, n_holes, r.n_edge, r.n_bulk).unwrap();
         }
         println!("CSV:        {csv_path}");
+    }
+
+    // ---- Crossover CSV (for plotting across grid sizes) ----
+    {
+        let cross_csv = format!("{out_dir}/crossover.csv");
+        let f = File::create(&cross_csv).unwrap();
+        let mut w = BufWriter::new(f);
+        writeln!(w, "base_nx,fine_nx,n_fine_cells,n_l0_cells,n_patch_cells,n_holes,patch_coverage_pct").unwrap();
+        let n_patch = total_patch_fine_cells(&h);
+        let patch_cov = 100.0 * n_patch as f64 / (fine_nx * fine_ny) as f64;
+        writeln!(w, "{},{},{},{},{},{},{:.2}",
+            base_nx, fine_nx, fine_nx*fine_ny, base_nx*base_ny, n_patch, n_holes, patch_cov).unwrap();
+        // Append timing per mode
+        for r in &results {
+            writeln!(w, "# {}: setup={:.1}ms eval={:.1}ms rmse={:.6e}",
+                r.name, r.setup_ms, r.eval_ms, r.rmse_global).unwrap();
+        }
+        println!("Crossover:  {cross_csv}");
     }
 
     // ---- Summary text ----

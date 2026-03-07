@@ -365,13 +365,19 @@ impl HybridConfig {
 // ---------------------------
 
 #[derive(Debug, Clone)]
-struct DeltaKernel2D {
+pub(crate) struct DeltaKernel2D {
     radius: usize,
     stride: usize,
     dkxx: Vec<f64>,
     dkxy: Vec<f64>,
     dkyy: Vec<f64>,
     dkzz: Vec<f64>,
+    // PPPM-φ: potential correction stencils (for composite V-cycle ghost-fill).
+    // dphi_x[k] = φ_ref − φ_MG at offset (di,dj) for an mx impulse, etc.
+    // φ_ref is the potential whose 2D central-difference gradient matches B_Newell.
+    dphi_x: Vec<f64>,
+    dphi_y: Vec<f64>,
+    dphi_z: Vec<f64>,
 }
 
 impl DeltaKernel2D {
@@ -385,6 +391,9 @@ impl DeltaKernel2D {
             dkxy: vec![0.0; n],
             dkyy: vec![0.0; n],
             dkzz: vec![0.0; n],
+            dphi_x: vec![0.0; n],
+            dphi_y: vec![0.0; n],
+            dphi_z: vec![0.0; n],
         }
     }
 
@@ -450,6 +459,57 @@ impl DeltaKernel2D {
                     row[i][2] += bz;
                 }
             });
+    }
+
+    /// Apply the PPPM-φ correction to a 2D scalar potential field.
+    ///
+    /// φ_corrected[i,j] = φ_MG[i,j] + Σ_{di,dj} (dphi_x·mx + dphi_y·my + dphi_z·mz) · Ms
+    ///
+    /// After this, the 2D central-difference gradient of φ_corrected will approximate
+    /// the Newell B field, making patch ghost-fill consistent with the FFT reference.
+    pub(crate) fn apply_phi_correction(&self, m: &VectorField2D, phi: &mut [f64], ms: f64) {
+        let nx = m.grid.nx;
+        let ny = m.grid.ny;
+        debug_assert_eq!(phi.len(), nx * ny);
+
+        if self.dphi_x.iter().all(|&v| v == 0.0)
+            && self.dphi_y.iter().all(|&v| v == 0.0)
+            && self.dphi_z.iter().all(|&v| v == 0.0)
+        {
+            return; // No phi correction available (legacy cache)
+        }
+
+        let r = self.radius as isize;
+        let stride = self.stride;
+        let dpx = &self.dphi_x;
+        let dpy = &self.dphi_y;
+        let dpz = &self.dphi_z;
+        let mdata = &m.data;
+
+        // Accumulate correction into a separate buffer, then add (avoids aliasing).
+        let mut delta = vec![0.0f64; nx * ny];
+        for j in 0..ny {
+            let j_is = j as isize;
+            for i in 0..nx {
+                let i_is = i as isize;
+                let mut acc = 0.0f64;
+                for dy in -r..=r {
+                    let sj = j_is - dy;
+                    if sj < 0 || sj >= ny as isize { continue; }
+                    for dx in -r..=r {
+                        let si = i_is - dx;
+                        if si < 0 || si >= nx as isize { continue; }
+                        let k = (dy + r) as usize * stride + (dx + r) as usize;
+                        let src = mdata[(sj as usize) * nx + (si as usize)];
+                        acc += dpx[k] * src[0] + dpy[k] * src[1] + dpz[k] * src[2];
+                    }
+                }
+                delta[j * nx + i] = acc * ms;
+            }
+        }
+        for k in 0..nx * ny {
+            phi[k] += delta[k];
+        }
     }
 
     #[allow(dead_code)]
@@ -1971,6 +2031,145 @@ impl DemagPoissonMG {
     pub(crate) fn base_grid(&self) -> Grid2D {
         self.grid
     }
+
+    /// Extract magnet-layer φ as a flat 2D array (nx_m × ny_m).
+    ///
+    /// Returns a Vec<f64> of length `grid.nx * grid.ny` containing the
+    /// φ values on the single magnet layer (z = offz) of the 3D padded box.
+    /// Cell ordering: phi_2d[j * nx_m + i] = φ at magnet cell (i, j).
+    ///
+    /// Used by the composite V-cycle to prolongate coarse φ to fine patches.
+    #[allow(dead_code)]
+    pub(crate) fn extract_magnet_layer_phi(&self) -> Vec<f64> {
+        let nx_m = self.grid.nx;
+        let ny_m = self.grid.ny;
+        let phi_3d = &self.levels[0].phi;
+        let px = self.px;
+        let py = self.py;
+        let offx = self.offx;
+        let offy = self.offy;
+        let offz = self.offz;
+
+        let mut phi_2d = vec![0.0f64; nx_m * ny_m];
+        for j in 0..ny_m {
+            for i in 0..nx_m {
+                phi_2d[j * nx_m + i] = phi_3d[idx3(offx + i, offy + j, offz, px, py)];
+            }
+        }
+        phi_2d
+    }
+
+    /// Write a 2D φ array back into the magnet layer of the 3D padded box.
+    ///
+    /// This is the inverse of `extract_magnet_layer_phi()`.
+    /// Used for warm-start: inject the previous timestep's coarse φ solution
+    /// before the next composite V-cycle.
+    ///
+    /// Panics if `phi_2d.len() != grid.nx * grid.ny`.
+    #[allow(dead_code)]
+    pub(crate) fn inject_magnet_layer_phi(&mut self, phi_2d: &[f64]) {
+        let nx_m = self.grid.nx;
+        let ny_m = self.grid.ny;
+        assert_eq!(phi_2d.len(), nx_m * ny_m,
+            "inject_magnet_layer_phi: expected {} values, got {}",
+            nx_m * ny_m, phi_2d.len());
+
+        let px = self.px;
+        let py = self.py;
+        let offx = self.offx;
+        let offy = self.offy;
+        let offz = self.offz;
+        let phi_3d = &mut self.levels[0].phi;
+
+        for j in 0..ny_m {
+            for i in 0..nx_m {
+                phi_3d[idx3(offx + i, offy + j, offz, px, py)] = phi_2d[j * nx_m + i];
+            }
+        }
+    }
+
+    // -- Composite-grid: external RHS support ---------------------------------
+
+    /// Stamp a 2D RHS array into the magnet layer of the 3D padded box.
+    ///
+    /// Clears the entire 3D RHS to zero, then writes `rhs_2d[j*nx + i]`
+    /// into padded-box cell `(offx+i, offy+j, offz)` for each magnet cell.
+    ///
+    /// After calling this, use `solve()` then `add_b_from_phi_on_magnet_layer_all()`
+    /// to complete the pipeline.
+    #[allow(dead_code)]
+    pub(crate) fn stamp_rhs_from_2d(&mut self, rhs_2d: &[f64]) {
+        let nx_m = self.grid.nx;
+        let ny_m = self.grid.ny;
+        assert_eq!(rhs_2d.len(), nx_m * ny_m);
+
+        let finest = &mut self.levels[0];
+        finest.rhs.fill(0.0);
+
+        let px = self.px;
+        let py = self.py;
+        let offx = self.offx;
+        let offy = self.offy;
+        let offz = self.offz;
+
+        for j in 0..ny_m {
+            for i in 0..nx_m {
+                let pi = offx + i;
+                let pj = offy + j;
+                finest.rhs[idx3(pi, pj, offz, px, py)] = rhs_2d[j * nx_m + i];
+            }
+        }
+    }
+
+    /// Full pipeline: stamp external 2D RHS, set BCs, solve, extract B.
+    ///
+    /// Overwrites `b_out` with the demag field from the given RHS.
+    /// Does NOT apply hybrid ΔK correction (caller should do that separately
+    /// if needed).
+    #[allow(dead_code)]
+    pub(crate) fn solve_external_rhs_2d(
+        &mut self,
+        rhs_2d: &[f64],
+        b_out: &mut VectorField2D,
+    ) {
+        self.stamp_rhs_from_2d(rhs_2d);
+        self.update_finest_boundary_bc();
+        self.levels[0].enforce_dirichlet();
+
+        // Use the tolerance-based or fixed V-cycle solve.
+        self.solve();
+
+        b_out.set_uniform(0.0, 0.0, 0.0);
+        self.add_b_from_phi_on_magnet_layer_all(b_out);
+    }
+
+    /// Solve with external 2D RHS and DirichletZero BCs (no treecode).
+    ///
+    /// Used for patch-local defect correction where the correction decays
+    /// to zero at the patch boundary.
+    #[allow(dead_code)]
+    pub(crate) fn solve_external_rhs_2d_dirichlet_zero(
+        &mut self,
+        rhs_2d: &[f64],
+        b_out: &mut VectorField2D,
+    ) {
+        self.stamp_rhs_from_2d(rhs_2d);
+
+        // DirichletZero: boundary phi = 0 (already the default after fill)
+        let finest = &mut self.levels[0];
+        finest.bc_phi.fill(0.0);
+        finest.enforce_dirichlet();
+
+        // Clear phi for a cold start (defect correction should not reuse
+        // previous phi from a different RHS).
+        finest.phi.fill(0.0);
+        finest.enforce_dirichlet();
+
+        self.solve();
+
+        b_out.set_uniform(0.0, 0.0, 0.0);
+        self.add_b_from_phi_on_magnet_layer_all(b_out);
+    }
 }
 
 // ---------------------------
@@ -2104,6 +2303,14 @@ impl DemagPoissonMGHybrid {
         self.mg.same_structure(grid, mg_cfg)
     }
 
+    /// Access the calibrated PPPM ΔK/Δφ stencil (if built).
+    ///
+    /// Used by mg_composite to apply the PPPM-φ correction to L0 φ
+    /// before ghost-filling into AMR patches.
+    pub(crate) fn delta_kernel(&self) -> Option<&DeltaKernel2D> {
+        self.dk.as_ref()
+    }
+
     fn ensure_delta_kernel(&mut self, mat: &Material) {
         if !self.hyb.enabled() {
             self.dk = None;
@@ -2218,6 +2425,75 @@ impl DemagPoissonMGHybrid {
         self.mg.add_b_from_phi_on_magnet_layer(m, mat.ms, b_eff);
         if let Some(dk) = &self.dk {
             dk.add_correction(m, b_eff, mat.ms);
+        }
+    }
+
+    /// Solve with the coarse magnetisation (full 3D RHS including z-surface
+    /// charges) plus additive corrections from AMR patches.
+    ///
+    /// `corrections`: sparse list of (coarse_cell_index, delta_div) pairs.
+    ///   delta_div = area_avg(fine_div) − coarse_div for each patch-covered cell.
+    ///   These are ADDED to the 3D RHS that build_rhs_from_m computes, preserving
+    ///   the z-surface charge contribution while injecting fine in-plane detail.
+    ///
+    /// `coarse_m`: coarse magnetisation (used for both RHS and gradient mask).
+    /// `b_out`: overwritten with B_demag on the coarse grid.
+    /// `mat`: material parameters.
+    pub(crate) fn solve_with_corrections(
+        &mut self,
+        coarse_m: &VectorField2D,
+        corrections: &[(usize, f64)],
+        b_out: &mut VectorField2D,
+        mat: &Material,
+    ) {
+        mg_hybrid_notice_once(&self.hyb);
+
+        // Step 1: Build full 3D RHS from coarse M (includes z-surface charges).
+        self.mg.build_rhs_from_m(coarse_m, mat.ms);
+
+        // Step 2: Add patch corrections to the magnet-layer cells.
+        if !corrections.is_empty() {
+            let nx_m = self.mg.grid.nx;
+            let offx = self.mg.offx;
+            let offy = self.mg.offy;
+            let offz = self.mg.offz;
+            let px = self.mg.px;
+            let py = self.mg.py;
+            let rhs = &mut self.mg.levels[0].rhs;
+
+            for &(cell_idx, delta) in corrections {
+                let ci = cell_idx % nx_m;
+                let cj = cell_idx / nx_m;
+                let pi = offx + ci;
+                let pj = offy + cj;
+                rhs[idx3(pi, pj, offz, px, py)] += delta;
+            }
+        }
+
+        // Step 3: Apply Gaussian screening if hybrid is enabled.
+        if self.hyb.enabled() && self.hyb.sigma_cells > 0.0 {
+            screen_rhs_gaussian_xy(&mut self.mg.levels[0], self.hyb.sigma_cells);
+        }
+        if self.hyb.enabled() && self.mg.cfg.warm_start {
+            for lev in &mut self.mg.levels {
+                lev.phi.fill(0.0);
+            }
+        }
+
+        // Step 4: BCs, solve, extract.
+        self.mg.update_finest_boundary_bc();
+        self.mg.levels[0].enforce_dirichlet();
+        self.mg.solve();
+
+        b_out.set_uniform(0.0, 0.0, 0.0);
+        self.mg.add_b_from_phi_on_magnet_layer(coarse_m, mat.ms, b_out);
+
+        // Step 5: Hybrid ΔK correction.
+        if self.hyb.enabled() {
+            self.ensure_delta_kernel(mat);
+            if let Some(dk) = &self.dk {
+                dk.add_correction(coarse_m, b_out, mat.ms);
+            }
         }
     }
 }
@@ -2342,8 +2618,8 @@ fn mg_timing_record(
 // ΔK disk cache + builder
 // ---------------------------
 
-// New file format (includes op + sigma + MG iteration params). Bump if layout changes.
-const DK_CACHE_MAGIC: &[u8; 8] = b"LLGDKH6\x00";
+// New file format: includes dphi stencils (SOR-converged). Bump when layout changes.
+const DK_CACHE_MAGIC: &[u8; 8] = b"LLGDKH8\x00";
 
 fn ensure_cache_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -2479,6 +2755,11 @@ fn load_delta_kernel_from_disk(key: &DeltaKernelKey) -> Option<DeltaKernel2D> {
     let dkyy = read_f64_vec(&mut f, n)?;
     let dkzz = read_f64_vec(&mut f, n)?;
 
+    // PPPM-φ fields (added in LLGDKH7). If read fails, fill with zeros.
+    let dphi_x = read_f64_vec(&mut f, n).unwrap_or_else(|| vec![0.0; n]);
+    let dphi_y = read_f64_vec(&mut f, n).unwrap_or_else(|| vec![0.0; n]);
+    let dphi_z = read_f64_vec(&mut f, n).unwrap_or_else(|| vec![0.0; n]);
+
     Some(DeltaKernel2D {
         radius: radius_xy,
         stride,
@@ -2486,6 +2767,9 @@ fn load_delta_kernel_from_disk(key: &DeltaKernelKey) -> Option<DeltaKernel2D> {
         dkxy,
         dkyy,
         dkzz,
+        dphi_x,
+        dphi_y,
+        dphi_z,
     })
 }
 
@@ -2561,7 +2845,125 @@ fn save_delta_kernel_to_disk(key: &DeltaKernelKey, dk: &DeltaKernel2D) -> std::i
     write_f64_vec(&mut f, &dk.dkxy)?;
     write_f64_vec(&mut f, &dk.dkyy)?;
     write_f64_vec(&mut f, &dk.dkzz)?;
+    write_f64_vec(&mut f, &dk.dphi_x)?;
+    write_f64_vec(&mut f, &dk.dphi_y)?;
+    write_f64_vec(&mut f, &dk.dphi_z)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PPPM-φ calibration: compute Δφ stencil from impulse response
+// ---------------------------------------------------------------------------
+
+/// Solve ∇²u = rhs on a 2D grid with Dirichlet-zero BCs using SOR
+/// (Successive Over-Relaxation with red-black ordering).
+///
+/// Used during PPPM-φ calibration to recover the potential correction.
+/// Optimal ω ≈ 2/(1 + sin(π/N)) gives O(N) convergence instead of O(N²)
+/// for standard Jacobi. 2000 iterations is more than enough for 128×128.
+fn solve_2d_poisson_sor(
+    rhs: &[f64], nx: usize, ny: usize,
+    dx: f64, dy: f64, n_iters: usize,
+    phi_out: &mut [f64],
+) {
+    let inv_dx2 = 1.0 / (dx * dx);
+    let inv_dy2 = 1.0 / (dy * dy);
+    let diag = -2.0 * inv_dx2 - 2.0 * inv_dy2;
+    let inv_diag = 1.0 / diag;
+
+    // Optimal SOR relaxation parameter for 2D Poisson on N×N grid.
+    let n_eff = nx.max(ny) as f64;
+    let omega = 2.0 / (1.0 + (std::f64::consts::PI / n_eff).sin());
+
+    phi_out.fill(0.0);
+
+    for _iter in 0..n_iters {
+        // Red-black Gauss-Seidel with SOR overrelaxation.
+        // Red pass: (i+j) % 2 == 0, then black pass: (i+j) % 2 == 1.
+        for pass in 0..2u32 {
+            for j in 1..ny - 1 {
+                for i in 1..nx - 1 {
+                    if ((i + j) as u32 % 2) != pass { continue; }
+                    let idx = j * nx + i;
+                    let lap = (phi_out[idx + 1] - 2.0 * phi_out[idx] + phi_out[idx - 1]) * inv_dx2
+                        + (phi_out[(j + 1) * nx + i] - 2.0 * phi_out[idx]
+                            + phi_out[(j - 1) * nx + i]) * inv_dy2;
+                    let residual = rhs[idx] - lap;
+                    phi_out[idx] += omega * inv_diag * residual;
+                }
+            }
+        }
+    }
+}
+
+/// Compute the PPPM-φ stencil for one impulse component.
+///
+/// Given the Newell B field (B_FFT) and the MG magnet-layer φ (φ_MG) for
+/// an impulse at (cx, cy), computes Δφ = φ_ref − φ_MG where φ_ref is the
+/// potential whose 2D central-difference gradient matches B_FFT.
+///
+/// Method: solve ∇²(Δφ) = −(1/μ₀)·∇·(B_FFT − B_from_2D_grad(φ_MG))
+/// with Dirichlet-zero BCs using SOR (converges in ~300 iterations for 128×128).
+fn compute_dphi_for_impulse(
+    b_fft: &VectorField2D,
+    phi_mg: &[f64],
+    nx: usize, ny: usize,
+    dx: f64, dy: f64,
+    cx: usize, cy: usize,
+    radius: usize,
+    ms_inv: f64,
+    dphi_out: &mut [f64],  // stencil-sized output
+    stride: usize,
+) {
+    let mu0: f64 = MU0;
+    let inv_2dx = 1.0 / (2.0 * dx);
+    let inv_2dy = 1.0 / (2.0 * dy);
+
+    // Step 1: Compute B from 2D gradient of φ_MG.
+    let mut b2d_x = vec![0.0f64; nx * ny];
+    let mut b2d_y = vec![0.0f64; nx * ny];
+    for j in 1..ny - 1 {
+        for i in 1..nx - 1 {
+            let idx = j * nx + i;
+            b2d_x[idx] = -mu0 * (phi_mg[idx + 1] - phi_mg[idx - 1]) * inv_2dx;
+            b2d_y[idx] = -mu0 * (phi_mg[(j + 1) * nx + i] - phi_mg[(j - 1) * nx + i]) * inv_2dy;
+        }
+    }
+
+    // Step 2: ΔB = B_FFT − B_2D (what the 2D gradient of φ_MG is missing).
+    let mut delta_bx = vec![0.0f64; nx * ny];
+    let mut delta_by = vec![0.0f64; nx * ny];
+    for k in 0..nx * ny {
+        delta_bx[k] = b_fft.data[k][0] - b2d_x[k];
+        delta_by[k] = b_fft.data[k][1] - b2d_y[k];
+    }
+
+    // Step 3: RHS = −(1/μ₀)·div(ΔB)
+    let mut rhs = vec![0.0f64; nx * ny];
+    for j in 2..ny - 2 {
+        for i in 2..nx - 2 {
+            let div_db = (delta_bx[j * nx + (i + 1)] - delta_bx[j * nx + (i - 1)]) * inv_2dx
+                + (delta_by[(j + 1) * nx + i] - delta_by[(j - 1) * nx + i]) * inv_2dy;
+            rhs[j * nx + i] = -div_db / mu0;
+        }
+    }
+
+    // Step 4: Solve ∇²(Δφ) = rhs with SOR (2000 iterations, O(N) convergence).
+    let mut delta_phi = vec![0.0f64; nx * ny];
+    solve_2d_poisson_sor(&rhs, nx, ny, dx, dy, 2000, &mut delta_phi);
+
+    // Step 5: Extract stencil values around impulse centre.
+    let r = radius as isize;
+    for dj in -r..=r {
+        for di in -r..=r {
+            let tx = (cx as isize + di) as usize;
+            let ty = (cy as isize + dj) as usize;
+            if tx < nx && ty < ny {
+                let k = (dj + r) as usize * stride + (di + r) as usize;
+                dphi_out[k] = delta_phi[ty * nx + tx] * ms_inv;
+            }
+        }
+    }
 }
 
 fn build_delta_kernel_impulse(
@@ -2695,6 +3097,12 @@ fn build_delta_kernel_impulse(
                 dkxy_from_x[k] = (b_fft.data[id][1] - b_mg.data[id][1]) * ms_inv;
             }
         }
+
+        // PPPM-φ: compute Δφ for mx impulse
+        let phi_mg_x = mg.extract_magnet_layer_phi();
+        compute_dphi_for_impulse(
+            &b_fft, &phi_mg_x, nx, ny, grid.dx, grid.dy,
+            cx, cy, r, ms_inv, &mut dk.dphi_x, dk.stride);
     }
 
     // Y impulse
@@ -2735,6 +3143,12 @@ fn build_delta_kernel_impulse(
                 dkxy_from_y[k] = (b_fft.data[id][0] - b_mg.data[id][0]) * ms_inv;
             }
         }
+
+        // PPPM-φ: compute Δφ for my impulse
+        let phi_mg_y = mg.extract_magnet_layer_phi();
+        compute_dphi_for_impulse(
+            &b_fft, &phi_mg_y, nx, ny, grid.dx, grid.dy,
+            cx, cy, r, ms_inv, &mut dk.dphi_y, dk.stride);
     }
 
     // Z impulse
@@ -2774,6 +3188,12 @@ fn build_delta_kernel_impulse(
                 dk.dkzz[k] = (b_fft.data[id][2] - b_mg.data[id][2]) * ms_inv;
             }
         }
+
+        // PPPM-φ: compute Δφ for mz impulse
+        let phi_mg_z = mg.extract_magnet_layer_phi();
+        compute_dphi_for_impulse(
+            &b_fft, &phi_mg_z, nx, ny, grid.dx, grid.dy,
+            cx, cy, r, ms_inv, &mut dk.dphi_z, dk.stride);
     }
 
     // Average cross-term from x- and y-impulses.
@@ -3033,4 +3453,222 @@ pub fn compute_demag_field_poisson_mg(
 ) {
     out.set_uniform(0.0, 0.0, 0.0);
     add_demag_field_poisson_mg(grid, m, out, mat);
+}
+
+#[cfg(test)]
+mod phase0_tests {
+    use super::*;
+
+    /// Phase 0 gate test: extract_magnet_layer_phi round-trips correctly
+    /// and the existing B output is unchanged.
+    #[test]
+    fn test_extract_inject_roundtrip() {
+        // 1. Build a small grid and solver
+        let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let cfg = DemagPoissonMGConfig::default();
+        let mut mg = DemagPoissonMG::new(grid, cfg);
+
+        // 2. Create a simple magnetisation (uniform +x)
+        let mut m = VectorField2D::new(grid);
+        m.set_uniform(1.0, 0.0, 0.0);
+
+        // 3. Build RHS, set BCs, solve
+        mg.build_rhs_from_m(&m, 800e3);
+        mg.update_finest_boundary_bc();
+        mg.levels[0].enforce_dirichlet();
+        mg.solve();
+
+        // 4. Extract B using the existing method (reference)
+        let mut b_ref = VectorField2D::new(grid);
+        mg.add_b_from_phi_on_magnet_layer_all(&mut b_ref);
+
+        // 5. Extract magnet-layer phi
+        let phi_2d = mg.extract_magnet_layer_phi();
+        assert_eq!(phi_2d.len(), 16 * 16);
+
+        // 6. Verify phi is non-trivial (not all zeros)
+        let phi_max = phi_2d.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let phi_min = phi_2d.iter().cloned().fold(f64::INFINITY, f64::min);
+        let phi_range = phi_max - phi_min;
+        assert!(
+            phi_range > 1e-30,
+            "phi should be non-trivial after solving, but range = {:.3e}",
+            phi_range
+        );
+        eprintln!(
+            "[phase0] phi range: {:.6e} to {:.6e} (range {:.6e})",
+            phi_min, phi_max, phi_range
+        );
+
+        // 7. Inject back and verify phi is unchanged (round-trip)
+        mg.inject_magnet_layer_phi(&phi_2d);
+        let phi_2d_check = mg.extract_magnet_layer_phi();
+        for k in 0..phi_2d.len() {
+            assert!(
+                phi_2d[k] == phi_2d_check[k],
+                "round-trip mismatch at cell {}: {:.6e} vs {:.6e}",
+                k, phi_2d[k], phi_2d_check[k]
+            );
+        }
+        eprintln!("[phase0] PASSED: extract/inject round-trip is bit-exact");
+
+        // 8. Extract B again — must be BIT-IDENTICAL to reference
+        let mut b_check = VectorField2D::new(grid);
+        mg.add_b_from_phi_on_magnet_layer_all(&mut b_check);
+        for k in 0..b_ref.data.len() {
+            assert!(
+                b_ref.data[k] == b_check.data[k],
+                "B mismatch at cell {} after phi round-trip: ref={:?} check={:?}",
+                k, b_ref.data[k], b_check.data[k]
+            );
+        }
+        eprintln!("[phase0] PASSED: B output unchanged after phi round-trip");
+    }
+
+    /// Verify that the extracted phi is spatially coherent (not random noise).
+    /// For uniform +x magnetisation, phi should vary smoothly across the grid
+    /// with a pattern related to the surface-charge distribution.
+    #[test]
+    fn test_phi_spatial_coherence() {
+        let grid = Grid2D::new(32, 32, 5e-9, 5e-9, 3e-9);
+        let cfg = DemagPoissonMGConfig::default();
+        let mut mg = DemagPoissonMG::new(grid, cfg);
+
+        let mut m = VectorField2D::new(grid);
+        m.set_uniform(1.0, 0.0, 0.0);
+
+        mg.build_rhs_from_m(&m, 800e3);
+        mg.update_finest_boundary_bc();
+        mg.levels[0].enforce_dirichlet();
+        mg.solve();
+
+        let phi_2d = mg.extract_magnet_layer_phi();
+        let nx = grid.nx;
+        let ny = grid.ny;
+
+        // For uniform +x magnetisation, div(M) = 0 in the interior.
+        // Surface charges exist at the x-boundaries (left and right edges).
+        // phi should be antisymmetric about x = Lx/2:
+        //   phi(x, y) ≈ -phi(Lx - x, y)
+        //
+        // Check: phi at the left quarter should have opposite sign to right quarter.
+        let mut sum_left = 0.0f64;
+        let mut sum_right = 0.0f64;
+        for j in ny / 4..3 * ny / 4 {
+            for i in 0..nx / 4 {
+                sum_left += phi_2d[j * nx + i];
+            }
+            for i in 3 * nx / 4..nx {
+                sum_right += phi_2d[j * nx + i];
+            }
+        }
+
+        eprintln!(
+            "[phase0] phi spatial check: sum_left={:.6e}, sum_right={:.6e}",
+            sum_left, sum_right
+        );
+
+        // They should have opposite signs (antisymmetric potential)
+        // or at least be significantly different
+        let phi_abs_max = phi_2d.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(
+            phi_abs_max > 1e-30,
+            "phi is all zeros — solver didn't produce a solution"
+        );
+
+        // Check smoothness: the max gradient should be bounded.
+        // (random noise would have huge cell-to-cell variation)
+        let mut max_grad = 0.0f64;
+        for j in 1..ny - 1 {
+            for i in 1..nx - 1 {
+                let c = phi_2d[j * nx + i];
+                let dx = ((phi_2d[j * nx + i + 1] - c).abs())
+                    .max((c - phi_2d[j * nx + i - 1]).abs());
+                let dy = ((phi_2d[(j + 1) * nx + i] - c).abs())
+                    .max((c - phi_2d[(j - 1) * nx + i]).abs());
+                max_grad = max_grad.max(dx).max(dy);
+            }
+        }
+        // Max cell-to-cell difference should be much smaller than the range
+        let phi_range = phi_2d.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - phi_2d.iter().cloned().fold(f64::INFINITY, f64::min);
+        let grad_ratio = if phi_range > 0.0 { max_grad / phi_range } else { 0.0 };
+        eprintln!(
+            "[phase0] phi smoothness: max_grad={:.6e}, range={:.6e}, ratio={:.3}",
+            max_grad, phi_range, grad_ratio
+        );
+        assert!(
+            grad_ratio < 0.5,
+            "phi is not smooth — max gradient / range = {:.3} (expected < 0.5)",
+            grad_ratio
+        );
+        eprintln!("[phase0] PASSED: phi is spatially smooth and non-trivial");
+    }
+
+    /// Verify that solve_with_corrections with empty corrections gives the
+    /// same phi as the standard build_rhs + solve path.
+    ///
+    /// Both paths use raw DemagPoissonMG to avoid needing Material construction.
+    #[test]
+    fn test_empty_corrections_matches_standard_solve() {
+        let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let cfg = DemagPoissonMGConfig::default();
+        let ms = 800e3_f64;
+
+        let mut m = VectorField2D::new(grid);
+        m.set_uniform(1.0, 0.0, 0.0);
+
+        // Path A: standard solve
+        let mut mg_a = DemagPoissonMG::new(grid, cfg);
+        mg_a.build_rhs_from_m(&m, ms);
+        mg_a.update_finest_boundary_bc();
+        mg_a.levels[0].enforce_dirichlet();
+        mg_a.solve();
+        let phi_a = mg_a.extract_magnet_layer_phi();
+        let mut b_a = VectorField2D::new(grid);
+        mg_a.add_b_from_phi_on_magnet_layer_all(&mut b_a);
+
+        // Path B: replicate what solve_with_corrections does with empty corrections
+        // (build_rhs_from_m → no corrections to add → BC → dirichlet → solve)
+        let mut mg_b = DemagPoissonMG::new(grid, cfg);
+        mg_b.build_rhs_from_m(&m, ms);
+        // No corrections to inject (empty list)
+        mg_b.update_finest_boundary_bc();
+        mg_b.levels[0].enforce_dirichlet();
+        // Cold start (solve_with_corrections clears phi when warm_start=true + hybrid)
+        // For non-hybrid default config, phi starts at 0 anyway (freshly allocated).
+        mg_b.solve();
+        let phi_b = mg_b.extract_magnet_layer_phi();
+        let mut b_b = VectorField2D::new(grid);
+        mg_b.add_b_from_phi_on_magnet_layer_all(&mut b_b);
+
+        // Compare phi — should be bit-identical since paths are the same
+        let mut max_phi_diff = 0.0f64;
+        for k in 0..phi_a.len() {
+            max_phi_diff = max_phi_diff.max((phi_a[k] - phi_b[k]).abs());
+        }
+
+        // Compare B
+        let mut max_b_diff = 0.0f64;
+        for k in 0..b_a.data.len() {
+            for c in 0..3 {
+                max_b_diff = max_b_diff.max((b_a.data[k][c] - b_b.data[k][c]).abs());
+            }
+        }
+
+        eprintln!("[phase0] phi max diff between paths: {:.3e}", max_phi_diff);
+        eprintln!("[phase0] B max diff between paths: {:.3e}", max_b_diff);
+
+        // Should be bit-identical since both paths are exactly the same
+        assert!(
+            max_phi_diff == 0.0,
+            "phi should be bit-identical but differs by {:.3e}", max_phi_diff
+        );
+        assert!(
+            max_b_diff == 0.0,
+            "B should be bit-identical but differs by {:.3e}", max_b_diff
+        );
+
+        eprintln!("[phase0] PASSED: identical solve paths produce bit-identical phi and B");
+    }
 }

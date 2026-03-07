@@ -1,19 +1,33 @@
-// src/bin/amr_vortex_relax.rs
+// src/bin/amr_diamond_relax.rs
 //
-// AMR vortex relaxation benchmark with:
-//  - uniform coarse baseline
-//  - uniform fine reference
-//  - AMR (coarse + patches) using demag mode from LLG_AMR_DEMAG_MODE env var
-//  - Per-step wall-clock timing (timing_log.csv) for mode comparison
-//  - --skip-fine-ref flag to disable uniform-fine reference (fast timing mode)
-//  - --amr-only flag to disable both fine and coarse references
+// García-Cervera & Roma (2005) diamond-domain benchmark, adapted for llg-sim.
 //
-// Demag modes (set via LLG_AMR_DEMAG_MODE):
-//  - all_fft      : flatten to uniform fine (1536²), FFT demag → gold reference, ~29s/step
-//  - composite    : enhanced-RHS Poisson-MG on L0 → ~4.7s/step, ~11% RMSE
-//  - coarse_fft   : exact Newell-tensor FFT on L0 (192²) with M-restriction → target <1s/step, <3% RMSE
+// Physics: 1µm × 250nm rectangular Permalloy film with strong out-of-plane
+// anisotropy K_u = −µ₀ M_s² (easy-plane: penalises mz).  Starting from m = x̂ + noise,
+// the diamond domain pattern (four triangular domains with in-plane M along
+// ±x̂ / ±ŷ, domain walls, and vortex cores at intersections).
 //
-// Outputs in out/amr_vortex_relax:
+// Reference parameters (García-Cervera §IV):
+//   M_s = 8×10⁵ A/m,  C_ex = 1.3×10⁻¹¹ J/m,  K_u = −µ₀ M_s² ≈ −8.04×10⁵ J/m³
+//   α = 0.01 (paper) — we default to α = 0.5 for explicit RK4 stability
+//   128×32 base grid, 3 refinement levels → 1024×256 fine-equivalent
+//   3000 steps of dt = 0.5 ps → 1.5 ns total
+//
+// Adaptations for llg-sim:
+//   - α = 0.5 default (overridable via LLG_DIAMOND_ALPHA): eliminates the
+//     precessional CFL problem with subcycling. The paper uses an unconditionally
+//     stable implicit scheme; we use explicit RK4, so heavy damping is needed.
+//   - 10% perturbation on m=x̂ to seed the instability fast.
+//   - Composite indicator replaces divergence-of-inplane; boundary_layer OFF.
+//   - Clustering tuned for the narrow 4:1 rectangle (small patches, low merge).
+//   - Demag mode controlled by LLG_AMR_DEMAG_MODE (all_fft / coarse_fft).
+//
+// Run:
+//   cargo run --release --bin amr_diamond_relax -- --plots --ovfs
+//   LLG_AMR_DEMAG_MODE=coarse_fft cargo run --release --bin amr_diamond_relax -- --plots --ovfs
+//   LLG_DIAMOND_ALPHA=0.01 LLG_DIAMOND_DT=5e-14 cargo run --release --bin amr_diamond_relax -- --plots
+//
+// Outputs in out/amr_diamond_relax:
 //  - timing_log.csv                       : per-AMR-step wall time (ms) + fine/coarse for comparison
 //  - patch_map_stepXXXX.png              : patch rectangles by refinement level (Fig.4-style) [--plots only]
 //  - mesh_zoom_stepXXXX.png              : in-plane angle + multi-level grid overlay (Fig.5-style) [--plots only]
@@ -37,7 +51,6 @@ use plotters::prelude::*;
 use llg_sim::effective_field::{FieldMask, demag_fft_uniform};
 use llg_sim::geometry_mask::Mask2D;
 use llg_sim::grid::Grid2D;
-use llg_sim::initial_states;
 use llg_sim::llg::{RK4Scratch, step_llg_rk4_recompute_field_masked_relax_add};
 use llg_sim::params::{DemagMethod, GAMMA_E_RAD_PER_S_T, LLGParams, Material};
 use llg_sim::vector_field::VectorField2D;
@@ -47,6 +60,39 @@ use llg_sim::amr::regrid::maybe_regrid_nested_levels;
 use llg_sim::amr::{
     AmrHierarchy2D, AmrStepperRK4, ClusterPolicy, Connectivity, Rect2i, RegridPolicy,
 };
+
+const MU_0: f64 = 4.0e-7 * std::f64::consts::PI;
+
+/// Env-var helper: parse env var or return default.
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Initialise m = x̂ + small random perturbation, then normalise.
+/// The perturbation breaks symmetry so the system doesn't stay stuck
+/// on the unstable uniform state.
+fn init_uniform_x_perturbed(m: &mut VectorField2D, seed: u64, amp: f64) {
+    // Simple LCG PRNG (no external dependency)
+    let mut rng = seed;
+    let next = |state: &mut u64| -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        // Map to [-1, 1]
+        ((*state >> 33) as f64 / (1u64 << 31) as f64) - 1.0
+    };
+    for v in m.data.iter_mut() {
+        let px = next(&mut rng) * amp;
+        let py = next(&mut rng) * amp;
+        let pz = next(&mut rng) * amp;
+        let mx = 1.0 + px;
+        let my = py;
+        let mz = pz;
+        let norm = (mx * mx + my * my + mz * mz).sqrt();
+        *v = [mx / norm, my / norm, mz / norm];
+    }
+}
 
 fn ensure_dir(path: &str) {
     if !Path::new(path).exists() {
@@ -1001,7 +1047,7 @@ fn main() {
     // ---- CLI flags (small + explicit) ----
     // Default: NO plots (fast), only CSV outputs.
     // Enable plots with:
-    //   cargo run --release --bin amr_vortex_relax -- --plots
+    //   cargo run --release --bin amr_diamond_relax -- --plots
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a == "--plots");
 
@@ -1025,7 +1071,7 @@ fn main() {
         .unwrap_or(3);
 
     // ---------- parameters ----------
-    let out_dir = "out/amr_vortex_relax";
+    let out_dir = "out/amr_diamond_relax";
     ensure_dir(out_dir);
     if do_ovf {
         ensure_dir(&format!("{out_dir}/ovf_coarse"));
@@ -1033,11 +1079,15 @@ fn main() {
         ensure_dir(&format!("{out_dir}/ovf_amr"));
     }
 
-    let base_nx = 192usize;
-    let base_ny = 192usize;
-    let dx = 5.0e-9;
-    let dy = 5.0e-9;
-    let dz = 1.0e-9;
+    // ---------- García-Cervera diamond parameters ----------
+    // Domain: 1µm × 250nm rectangle (4:1 aspect ratio)
+    let base_nx: usize = env_or("LLG_DIAMOND_BASE_NX", 128);
+    let base_ny: usize = env_or("LLG_DIAMOND_BASE_NY", 32);
+    let lx = 1.0e-6;   // 1 µm
+    let ly = 250.0e-9;  // 250 nm
+    let dx = lx / base_nx as f64;  // ≈ 7.8 nm
+    let dy = ly / base_ny as f64;  // ≈ 7.8 nm
+    let dz = 1.0e-9;    // thin film (not used in 2D demag, but needed for grid)
     let refine_ratio = 2usize;
     let ghost = 2usize;
 
@@ -1045,13 +1095,17 @@ fn main() {
     let fine_nx = base_nx * ref_ratio_total;
     let fine_ny = base_ny * ref_ratio_total;
 
-    let dt = 5.0e-14;
-    let steps_base = 300usize;
+    // dt = 0.5 ps: half the paper's 1ps. With α=0.5, the precessional term is
+    // heavily damped so the stiff timescale is exchange, not anisotropy precession.
+    // dt_coarse = 64 × 0.5ps = 32ps — safe margin for the anisotropy field.
+    // 3000 steps = 1.5 ns total (same physical time as García-Cervera).
+    let dt: f64 = env_or("LLG_DIAMOND_DT", 5.0e-13);
+    let steps_base: usize = env_or("LLG_DIAMOND_STEPS", 3000);
 
-    // Logging cadence (always on); plotting cadence is tied to this when --plots is enabled.
-    // These may be snapped to multiples of subcycle_ratio later.
-    let out_every_base = 100usize;
-    let regrid_every_base = 100usize;
+    // Output every 50 coarse steps → lots of snapshots to see the evolution.
+    // Regrid every 25 coarse steps to track the moving walls.
+    let out_every_base: usize = env_or("LLG_DIAMOND_OUT_EVERY", 50);
+    let regrid_every_base: usize = env_or("LLG_DIAMOND_REGRID_EVERY", 25);
 
     let pbcx = 0usize;
     let pbcy = 0usize;
@@ -1069,67 +1123,62 @@ fn main() {
     let base_mask: Mask2D = vec![true; base_grid.n_cells()];
 
     // ---------- material + params ----------
+    // Permalloy with strong out-of-plane PENALTY (easy-plane anisotropy).
+    //
+    // García-Cervera energy: E = (K_u/2M_s²)∫M_3² dx — penalises mz.
+    // In the standard uniaxial framework H_an = (2K_u/µ₀M_s)(m·ê)ê,
+    // a NEGATIVE K_u with ê=ẑ makes z a HARD axis, producing an effective
+    // field that pushes mz → 0 (forces magnetisation in-plane).
+    let ms: f64 = 8.0e5;
+    let a_ex: f64 = 1.3e-11;
+    let k_u: f64 = -(MU_0 * ms * ms);  // ≈ −8.04×10⁵ J/m³ → easy-PLANE
+
     let mat = Material {
-        ms: 8.0e5,
-        a_ex: 1.3e-11,
-        k_u: 0.0,
-        easy_axis: [0.0, 0.0, 1.0],
+        ms,
+        a_ex,
+        k_u,
+        easy_axis: [0.0, 0.0, 1.0],  // HARD axis = z → penalises mz
         dmi: None,
         demag: true,
         demag_method: DemagMethod::FftUniform,
     };
 
+    // α = 0.5: heavy damping eliminates the precessional stability problem entirely.
+    // With α=0.5, the LLG is dominated by the damping term (M × M × B), which
+    // drives m straight toward the local energy minimum without oscillating.
+    // This makes dt_coarse safe even with strong anisotropy, and means the diamond
+    // structure forms via direct relaxation rather than precessional dynamics.
+    // Use LLG_DIAMOND_ALPHA=0.01 for paper-exact dynamics (needs dt ≤ 5e-14).
+    let alpha: f64 = env_or("LLG_DIAMOND_ALPHA", 0.5);
+
     let llg = LLGParams {
         gamma: GAMMA_E_RAD_PER_S_T,
-        alpha: 0.5,
+        alpha,
         dt,
         b_ext: [0.0, 0.0, 0.0],
     };
 
     // ---------- initial states ----------
-    let vortex_center = (0.0, 0.0);
-    let polarity = 1.0;
-    let chirality = 1.0;
-    let core_radius = 3.0 * base_grid.dx;
+    // Uniform m = x̂ + 5% random perturbation to break symmetry.
+    // With the correct easy-plane anisotropy, the demag charges at the short
+    // edges (x=0, x=Lx) naturally seed domain wall nucleation.  The perturbation
+    // just ensures symmetry-breaking happens within ~100 steps.
+    let perturb_amp: f64 = env_or("LLG_DIAMOND_PERTURB", 0.05);
 
     // Uniform coarse baseline
     let mut m_coarse = VectorField2D::new(base_grid);
-    initial_states::init_vortex(
-        &mut m_coarse,
-        &base_grid,
-        vortex_center,
-        polarity,
-        chirality,
-        core_radius,
-        None,
-    );
+    init_uniform_x_perturbed(&mut m_coarse, 42, perturb_amp);
 
-    // AMR hierarchy starts from its own coarse field
+    // AMR hierarchy starts from its own coarse field (same seed → identical init)
     let mut m_coarse_amr = VectorField2D::new(base_grid);
-    initial_states::init_vortex(
-        &mut m_coarse_amr,
-        &base_grid,
-        vortex_center,
-        polarity,
-        chirality,
-        core_radius,
-        None,
-    );
+    init_uniform_x_perturbed(&mut m_coarse_amr, 42, perturb_amp);
 
     let mut h = AmrHierarchy2D::new(base_grid, m_coarse_amr, refine_ratio, ghost);
     h.set_geom_mask(base_mask);
 
     // Uniform fine reference (temporary init; will be overwritten for fair comparison)
     let mut m_fine = VectorField2D::new(fine_grid);
-    initial_states::init_vortex(
-        &mut m_fine,
-        &fine_grid,
-        vortex_center,
-        polarity,
-        chirality,
-        core_radius,
-        None,
-    );
+    init_uniform_x_perturbed(&mut m_fine, 42, perturb_amp);
 
     // ---------- AMR policies (IndicatorKind enum dispatch) ----------
     //
@@ -1141,26 +1190,32 @@ fn main() {
     let boundary_layer: usize = std::env::var("LLG_AMR_BOUNDARY_LAYER")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(0);  // OFF by default: the indicator catches wall regions naturally
 
     let regrid_policy = RegridPolicy {
         indicator: indicator_kind,
-        buffer_cells: 6,
+        buffer_cells: 3,   // narrower buffer for 32-tall grid (6 was half the domain)
         boundary_layer,
         min_change_cells: 1,
         min_area_change_frac: 0.02,
     };
 
+    // Clustering tuned for the 128×32 elongated rectangle.
+    // - min_patch_area=16: allow small patches (grid is only 32 cells tall)
+    // - merge_distance=1: don't aggressively merge patches across the whole domain
+    // - min_efficiency=0.50: accept rectangular patches that aren't perfectly tight
+    //   (walls in a rectangle are long and thin, so boxes will have some wasted area)
+    // - max_flagged_fraction=0.40: if >40% of cells flagged, keep coarse (no point refining everything)
     let cluster_policy = ClusterPolicy {
         indicator: indicator_kind,
         buffer_cells: regrid_policy.buffer_cells,
         boundary_layer,
-        min_patch_area: 64,
-        merge_distance: 2,
+        min_patch_area: 16,
+        merge_distance: 1,
         max_patches: 0,
         connectivity: Connectivity::Eight,
-        min_efficiency: 0.70,
-        max_flagged_fraction: 0.50,  // ADD
+        min_efficiency: 0.50,
+        max_flagged_fraction: 0.40,
     };
 
     // Logs
@@ -1287,7 +1342,7 @@ fn main() {
     };
     if subcycle_active {
         eprintln!(
-            "[amr_vortex_relax] SUBCYCLING ACTIVE: n_levels={}, subcycle_ratio={} (dt_coarse = {} × dt_fine)",
+            "[amr_diamond_relax] SUBCYCLING ACTIVE: n_levels={}, subcycle_ratio={} (dt_coarse = {} × dt_fine)",
             h.num_levels(), subcycle_ratio, subcycle_ratio
         );
     }
@@ -1303,11 +1358,11 @@ fn main() {
 
     if subcycle_active && steps != steps_base {
         eprintln!(
-            "[amr_vortex_relax] steps adjusted: {} → {} (multiple of subcycle_ratio={})",
+            "[amr_diamond_relax] steps adjusted: {} → {} (multiple of subcycle_ratio={})",
             steps_base, steps, subcycle_ratio
         );
         eprintln!(
-            "[amr_vortex_relax] out_every={}, regrid_every={}",
+            "[amr_diamond_relax] out_every={}, regrid_every={}",
             out_every, regrid_every
         );
     }
@@ -1330,32 +1385,32 @@ fn main() {
     let fine_cells_total = fine_grid.nx * fine_grid.ny;
 
     if do_plots {
-        println!("[amr_vortex_relax] --plots enabled: will write PNGs to {out_dir}");
+        println!("[amr_diamond_relax] --plots enabled: will write PNGs to {out_dir}");
     } else {
         println!(
-            "[amr_vortex_relax] plots disabled (default): writing CSV outputs only. Use `-- --plots` to enable PNGs."
+            "[amr_diamond_relax] plots disabled (default): writing CSV outputs only. Use `-- --plots` to enable PNGs."
         );
     }
 
     println!(
-        "[amr_vortex_relax] refinement indicator: {} (threshold param={:.4}), boundary_layer={}",
+        "[amr_diamond_relax] refinement indicator: {} (threshold param={:.4}), boundary_layer={}",
         regrid_policy.indicator.label(),
         regrid_policy.indicator.threshold_param(),
         regrid_policy.boundary_layer,
     );
 
     println!(
-        "[amr_vortex_relax] AMR demag mode: {}",
+        "[amr_diamond_relax] AMR demag mode: {}",
         amr_demag_mode_label,
     );
     if skip_fine_ref {
-        println!("[amr_vortex_relax] --skip-fine-ref: fine reference DISABLED (no RMSE tracking)");
+        println!("[amr_diamond_relax] --skip-fine-ref: fine reference DISABLED (no RMSE tracking)");
     }
     if skip_coarse_ref {
-        println!("[amr_vortex_relax] --amr-only: coarse baseline DISABLED");
+        println!("[amr_diamond_relax] --amr-only: coarse baseline DISABLED");
     }
     if do_ovf {
-        println!("[amr_vortex_relax] --ovf enabled: will write OVFs to {out_dir}/ovf_*");
+        println!("[amr_diamond_relax] --ovf enabled: will write OVFs to {out_dir}/ovf_*");
     }
 
 
@@ -1631,12 +1686,13 @@ fn main() {
             let l3 = h.patches_l2plus.get(1).map(|v| v.len()).unwrap_or(0);
             let step_fine_cells: usize = fine_patches.iter().map(|r| r.nx * r.ny).sum();
             let step_cov = step_fine_cells as f64 / fine_cells_total as f64;
+            let t_ns = step as f64 * dt * 1e9;
             println!(
-                "  step {:>4}  │  rmse {:.3e}  │  maxΔ {:.3e}  │  L1 {:2}  L2 {:2}  L3 {:2}  │  {:.1}% coverage",
-                step, rmse, maxd, l1, l2, l3, step_cov * 100.0
+                "  step {:>4} ({:.2}ns)  │  rmse {:.3e}  │  maxΔ {:.3e}  │  L1 {:2}  L2 {:2}  L3 {:2}  │  {:.1}% coverage",
+                step, t_ns, rmse, maxd, l1, l2, l3, step_cov * 100.0
             );
 
-            if do_plots && (step == steps) {
+            if do_plots {
                 let l1 = current_patches.clone();
                 let l2 = level_rects_l2(&h);
                 let l3 = level_rects_l3(&h);
@@ -1737,19 +1793,20 @@ fn main() {
 
     println!();
     println!("╔{}╗", bar);
-    println!("║{:^64}║", "AMR VORTEX RELAXATION — RESULTS SUMMARY");
+    println!("║{:^64}║", "AMR DIAMOND RELAXATION — RESULTS SUMMARY");
     println!("╚{}╝", bar);
 
     // ── Problem Setup ──
     println!();
-    println!("  PROBLEM SETUP");
+    println!("  PROBLEM SETUP (García-Cervera diamond)");
     println!("  {thin}");
+    println!("  Domain             {:.0}nm × {:.0}nm × {:.1}nm", lx * 1e9, ly * 1e9, dz * 1e9);
     println!("  Coarse grid        {:>6} × {:<6}    dx = {:.2e} m", base_nx, base_ny, dx);
     println!("  Fine-equivalent    {:>6} × {:<6}    dx = {:.2e} m", fine_nx, fine_ny, dx / ref_ratio_total as f64);
     println!("  Thickness                              dz = {:.2e} m", dz);
     println!("  Refinement         {} levels (ratio {}:1 per level, {}:1 total)",
         amr_max_level, refine_ratio, ref_ratio_total);
-    println!("  Time steps         {}  (dt = {:.2e} s)", steps, dt);
+    println!("  Time steps         {}  (dt = {:.2e} s,  total = {:.2} ns)", steps, dt, steps as f64 * dt * 1e9);
     if subcycle_active {
         println!("  Subcycling         ON   ratio={}   coarse steps={}", final_ratio, amr_coarse_steps);
         println!("                     dt_coarse = {:.2e} s", dt * final_ratio as f64);
@@ -1757,6 +1814,12 @@ fn main() {
         println!("  Subcycling         OFF (flat stepping)");
     }
     println!("  Demag mode         {}", amr_demag_mode_label);
+    println!("  α = {:.4}   K_u = {:.2e} J/m³ (easy-plane, HARD axis = z)", alpha, k_u);
+    let l_ex = (a_ex / (MU_0 * ms * ms)).sqrt();
+    println!("  l_ex = {:.1} nm   (finest dx = {:.2} nm → {:.1} cells/l_ex)",
+        l_ex * 1e9,
+        fine_grid.dx * 1e9,
+        l_ex / fine_grid.dx);
 
     // ── AMR Patch Summary ──
     println!();
