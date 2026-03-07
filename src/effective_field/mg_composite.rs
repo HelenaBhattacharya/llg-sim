@@ -452,6 +452,228 @@ pub(crate) fn prolongate_phi_correction(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-level helpers: parent-patch operations for true composite V-cycle
+// ---------------------------------------------------------------------------
+
+/// Check if base-grid rect `a` fully contains rect `b`.
+fn rect_contains(a: &crate::amr::rect::Rect2i, b: &crate::amr::rect::Rect2i) -> bool {
+    b.i0 >= a.i0 && b.j0 >= a.j0
+        && b.i0 + b.nx <= a.i0 + a.nx
+        && b.j0 + b.ny <= a.j0 + a.ny
+}
+
+/// Find the index of the parent-level patch that encloses `child`.
+///
+/// Uses coarse_rect containment (same check as hierarchy nesting enforcement).
+/// Returns None if no enclosing parent is found (shouldn't happen if nesting
+/// is enforced, but we handle it gracefully).
+fn find_enclosing_patch_idx(
+    child: &Patch2D,
+    parent_patches: &[Patch2D],
+) -> Option<usize> {
+    for (i, parent) in parent_patches.iter().enumerate() {
+        if rect_contains(&parent.coarse_rect, &child.coarse_rect) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Fill ghost cells in a child patch's φ from the enclosing parent patch's φ.
+///
+/// For each ghost cell in the child patch, compute its physical (x,y),
+/// convert to the parent patch's local coordinate system, and bilinearly
+/// interpolate from the parent patch's φ field.
+///
+/// This replaces `fill_phi_ghosts_from_coarse` for L2+ patches so that
+/// ghost values come from the parent level rather than jumping to L0.
+fn fill_phi_ghosts_from_parent_patch(
+    child_patch: &Patch2D,
+    child_phi: &mut [f64],
+    parent_patch: &Patch2D,
+    parent_phi: &[f64],
+) {
+    let cnx = child_patch.grid.nx;
+    let cny = child_patch.grid.ny;
+    let gi0 = child_patch.interior_i0();
+    let gj0 = child_patch.interior_j0();
+    let gi1 = child_patch.interior_i1();
+    let gj1 = child_patch.interior_j1();
+
+    let pnx = parent_patch.grid.nx;
+    let pny = parent_patch.grid.ny;
+    let pdx = parent_patch.grid.dx;
+    let pdy = parent_patch.grid.dy;
+
+    // The parent patch grid origin in physical coordinates.
+    // cell_center_xy(0,0) returns the physical (x,y) of the first cell
+    // (including ghosts). sample_bilinear_scalar expects coordinates where
+    // cell i has centre at (i+0.5)*dx, so the grid origin is at
+    // cell_center_xy(0,0) - (0.5*dx, 0.5*dy).
+    let (px0, py0) = parent_patch.cell_center_xy(0, 0);
+    let origin_x = px0 - 0.5 * pdx;
+    let origin_y = py0 - 0.5 * pdy;
+
+    for j in 0..cny {
+        for i in 0..cnx {
+            let is_interior = i >= gi0 && i < gi1 && j >= gj0 && j < gj1;
+            if is_interior { continue; }
+
+            // Physical position of this child ghost cell.
+            let (x, y) = child_patch.cell_center_xy(i, j);
+
+            // Convert to parent patch's local coordinate system.
+            let local_x = x - origin_x;
+            let local_y = y - origin_y;
+
+            child_phi[j * cnx + i] = sample_bilinear_scalar(
+                parent_phi, pnx, pny, pdx, pdy,
+                local_x, local_y,
+            );
+        }
+    }
+}
+
+/// Restrict child patch residual into the enclosing parent patch's residual.
+///
+/// For each parent fine cell covered by the child, REPLACES the parent's
+/// residual with the area-average of the child fine cells that map to it.
+/// This is the composite V-cycle reflux step at coarse-fine interfaces.
+///
+/// `step_ratio` is the refinement ratio between adjacent levels (h.ratio,
+/// typically 2). Each parent fine cell maps to step_ratio × step_ratio
+/// child fine cells.
+fn restrict_residual_to_parent_patch(
+    child_patch: &Patch2D,
+    child_residual: &[f64],
+    child_nx: usize,
+    parent_patch: &Patch2D,
+    parent_residual: &mut [f64],
+    parent_nx: usize,
+    step_ratio: usize,
+) {
+    let ccr = &child_patch.coarse_rect;
+    let pcr = &parent_patch.coarse_rect;
+
+    // Overlap of child and parent in base-grid coordinates.
+    let oi0 = ccr.i0.max(pcr.i0);
+    let oj0 = ccr.j0.max(pcr.j0);
+    let oi1 = (ccr.i0 + ccr.nx).min(pcr.i0 + pcr.nx);
+    let oj1 = (ccr.j0 + ccr.ny).min(pcr.j0 + pcr.ny);
+    if oi1 <= oi0 || oj1 <= oj0 { return; }
+
+    let c_ratio = child_patch.ratio;   // child's total ratio vs base grid
+    let p_ratio = parent_patch.ratio;   // parent's total ratio vs base grid
+    let c_ghost = child_patch.ghost;
+    let p_ghost = parent_patch.ghost;
+
+    // For each base-grid cell in the overlap:
+    for bj in oj0..oj1 {
+        for bi in oi0..oi1 {
+            // For each parent fine cell within this base cell:
+            for py in 0..p_ratio {
+                for px in 0..p_ratio {
+                    let pfi = p_ghost + (bi - pcr.i0) * p_ratio + px;
+                    let pfj = p_ghost + (bj - pcr.j0) * p_ratio + py;
+
+                    // Area-average the step_ratio × step_ratio child cells
+                    // that map to this parent fine cell.
+                    let mut sum = 0.0f64;
+                    let mut count = 0usize;
+                    for dy in 0..step_ratio {
+                        for dx in 0..step_ratio {
+                            let cfi = c_ghost + (bi - ccr.i0) * c_ratio + px * step_ratio + dx;
+                            let cfj = c_ghost + (bj - ccr.j0) * c_ratio + py * step_ratio + dy;
+                            if cfi < child_nx && cfj < child_patch.grid.ny {
+                                sum += child_residual[cfj * child_nx + cfi];
+                                count += 1;
+                            }
+                        }
+                    }
+
+                    if count > 0 {
+                        parent_residual[pfj * parent_nx + pfi] = sum / count as f64;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prolongate φ correction from parent patch to child patch.
+///
+/// Computes delta = parent_phi_new - parent_phi_old on the parent patch grid,
+/// bilinearly interpolates delta to each child interior cell, and ADDS to
+/// child_phi. Ghost cells are not modified (they get updated by ghost-fill).
+fn prolongate_phi_correction_from_parent_patch(
+    parent_patch: &Patch2D,
+    parent_phi_new: &[f64],
+    parent_phi_old: &[f64],
+    child_patch: &Patch2D,
+    child_phi: &mut [f64],
+) {
+    let pnx = parent_patch.grid.nx;
+    let pny = parent_patch.grid.ny;
+    let pdx = parent_patch.grid.dx;
+    let pdy = parent_patch.grid.dy;
+
+    // Parent patch grid origin in physical coordinates.
+    let (px0, py0) = parent_patch.cell_center_xy(0, 0);
+    let origin_x = px0 - 0.5 * pdx;
+    let origin_y = py0 - 0.5 * pdy;
+
+    // Compute the correction on the parent patch grid.
+    let delta_parent: Vec<f64> = parent_phi_new.iter()
+        .zip(parent_phi_old.iter())
+        .map(|(new, old)| new - old)
+        .collect();
+
+    let cnx = child_patch.grid.nx;
+    let gi0 = child_patch.interior_i0();
+    let gj0 = child_patch.interior_j0();
+    let gi1 = child_patch.interior_i1();
+    let gj1 = child_patch.interior_j1();
+
+    // Interpolate delta to each child interior cell and add.
+    for j in gj0..gj1 {
+        for i in gi0..gi1 {
+            let (x, y) = child_patch.cell_center_xy(i, j);
+            let local_x = x - origin_x;
+            let local_y = y - origin_y;
+            let delta_interp = sample_bilinear_scalar(
+                &delta_parent, pnx, pny, pdx, pdy,
+                local_x, local_y,
+            );
+            child_phi[j * cnx + i] += delta_interp;
+        }
+    }
+}
+
+/// Pre-compute parent-patch index maps for all L2+ levels.
+///
+/// Returns a Vec<Vec<usize>> where result[lvl_idx][patch_idx] gives the
+/// index of the enclosing parent patch. Panics if nesting is violated.
+fn build_parent_index_maps(h: &AmrHierarchy2D) -> Vec<Vec<usize>> {
+    let mut maps: Vec<Vec<usize>> = Vec::with_capacity(h.patches_l2plus.len());
+    for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+        let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+            &h.patches
+        } else {
+            &h.patches_l2plus[lvl_idx - 1]
+        };
+        let lvl_map: Vec<usize> = lvl_patches.iter().map(|child| {
+            find_enclosing_patch_idx(child, parent_patches)
+                .unwrap_or_else(|| panic!(
+                    "L{} patch at ({},{}) has no enclosing parent",
+                    lvl_idx + 2, child.coarse_rect.i0, child.coarse_rect.j0
+                ))
+        }).collect();
+        maps.push(lvl_map);
+    }
+    maps
+}
+
+// ---------------------------------------------------------------------------
 // Phase 6: Fine-level gradient extraction
 // ---------------------------------------------------------------------------
 
@@ -636,18 +858,123 @@ fn sample_coarse_to_patch(b_coarse: &VectorField2D, patch: &Patch2D) -> Vec<[f64
 }
 
 // ---------------------------------------------------------------------------
+// Composite field builders for multi-level defect hierarchy
+// ---------------------------------------------------------------------------
+//
+// García-Cervera / AMReX multi-level defect correction requires each level
+// to correct against its parent's *composite* field, not against L0 directly.
+//
+// After processing all patches at level L, we build:
+//   composite_div: L0 div with L's fine-averaged div at covered coarse cells
+//   composite_B:   L0 B with L's fine-averaged B at covered coarse cells
+//
+// Level L+1 then defect-corrects against these composite fields.
+
+/// Update a divergence field on the L0 grid with area-averaged fine div
+/// from patches at the current level.
+///
+/// For each coarse cell covered by a patch, the divergence value is REPLACED
+/// with the area-average of the patch's fine ∇·(Ms·m) (stored in pd.rhs).
+/// This builds the "composite level" divergence that the next finer level
+/// computes its defect against.
+fn update_composite_div(
+    composite_div: &mut [f64],
+    patches: &[Patch2D],
+    patch_data: &[PatchPoissonData],
+    base_nx: usize,
+) {
+    for (patch, pd) in patches.iter().zip(patch_data.iter()) {
+        let cr = &patch.coarse_rect;
+        let ratio = patch.ratio;
+        let ghost = pd.ghost;
+
+        for jc in 0..cr.ny {
+            for ic in 0..cr.nx {
+                let coarse_i = cr.i0 + ic;
+                let coarse_j = cr.j0 + jc;
+                let cell_idx = coarse_j * base_nx + coarse_i;
+
+                // Use the existing area-averaging method on PatchPoissonData.
+                composite_div[cell_idx] =
+                    pd.area_avg_rhs_at_coarse_cell(ic, jc, ratio, ghost);
+            }
+        }
+    }
+}
+
+/// Update a B field on the L0 grid with area-averaged fine B from patches
+/// at the current level.
+///
+/// For each coarse cell covered by a patch, the B value is REPLACED with
+/// the area-average of the patch's fine B (the full corrected B, not just δB).
+/// This builds the "composite level" B field that the next finer level
+/// interpolates from when computing B_patch = interp(composite_B) + δB.
+fn update_composite_b(
+    composite_b_data: &mut [[f64; 3]],
+    patches: &[Patch2D],
+    patch_b: &[Vec<[f64; 3]>],
+    base_nx: usize,
+) {
+    for (patch, pb) in patches.iter().zip(patch_b.iter()) {
+        let cr = &patch.coarse_rect;
+        let ratio = patch.ratio;
+        let ghost = patch.ghost;
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+
+        for jc in 0..cr.ny {
+            for ic in 0..cr.nx {
+                let coarse_i = cr.i0 + ic;
+                let coarse_j = cr.j0 + jc;
+                let cell_idx = coarse_j * base_nx + coarse_i;
+
+                // Area-average fine B over the ratio×ratio fine cells
+                // corresponding to this coarse cell.
+                let fi0 = ghost + ic * ratio;
+                let fj0 = ghost + jc * ratio;
+                let mut sum = [0.0f64; 3];
+                let mut count = 0usize;
+                for fj in fj0..fj0 + ratio {
+                    for fi in fi0..fi0 + ratio {
+                        if fi < pnx && fj < pny {
+                            let b = pb[fj * pnx + fi];
+                            sum[0] += b[0];
+                            sum[1] += b[1];
+                            sum[2] += b[2];
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    let inv = 1.0 / count as f64;
+                    composite_b_data[cell_idx] = [
+                        sum[0] * inv, sum[1] * inv, sum[2] * inv,
+                    ];
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Defect-correction per patch (García-Cervera / AMReX approach)
 // ---------------------------------------------------------------------------
 
 /// Compute defect-corrected B on a single patch.
 ///
 /// Steps:
-///   1. δrhs = fine_∇·M − interpolate(coarse_∇·M)
+///   1. δrhs = fine_∇·M − interpolate(parent_∇·M)
 ///   2. Smooth ∇²(δφ) = δrhs with DirichletZero BCs
 ///   3. δB = −μ₀∇(δφ)
-///   4. B_patch = interpolate(B_L0) + δB
+///   4. B_patch = interpolate(parent_B) + δB
 ///
-/// The defect RHS is HIGH-FREQUENCY (fine detail the coarse grid missed).
+/// `coarse_div` and `b_l0` are the PARENT level's fields. For L1 patches
+/// these are L0 fields; for L2+ patches these are composite fields built
+/// from the parent level (containing area-averaged fine data from the
+/// parent level's patches). This is the García-Cervera / AMReX multi-level
+/// defect correction: each level corrects only what its parent missed.
+///
+/// The defect RHS is HIGH-FREQUENCY (fine detail the parent grid missed).
 /// For high-k modes, 2D and 3D Green's functions agree, so the 2D Laplacian
 /// is correct for the defect even though it's wrong for the full equation.
 fn compute_defect_correction_on_patch(
@@ -682,13 +1009,71 @@ fn compute_defect_correction_on_patch(
     let defect_rhs = pd.residual.clone();
     let mut tmp = vec![0.0f64; pnx * pny];
 
-    smooth_jacobi_2d(
-        &mut pd.phi, &defect_rhs, &mut tmp,
-        pnx, pny, ghost, pd.dx, pd.dy,
-        omega, n_smooth,
-    );
+    // Adaptive smoothing: check defect magnitude before iterating.
+    // At large L0 where the coarse grid already resolves the boundary,
+    // the defect RHS is near-zero and fixed iterations introduce noise
+    // that exceeds the correction magnitude (see §2.1 of Roadmap).
+    let max_defect_rhs = defect_rhs.iter()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max);
 
-    // Step 3+4: Extract δB = −μ₀∇(δφ) and combine with interpolated B_L0.
+    // Scale tolerance by dx² (the expected magnitude of the correction is
+    // O(defect_rhs * dx²) from the Poisson Green's function).
+    let defect_tol_rel: f64 = 1e-3; // relative tolerance on correction
+    let defect_tol_abs: f64 = 1e-25; // absolute floor (skip if defect is negligible)
+
+    let effective_n_smooth = if max_defect_rhs < defect_tol_abs {
+        // Defect is negligible — skip smoothing entirely.
+        0
+    } else {
+        // Run smoothing in batches of 2, monitoring max|δφ| change.
+        // Exit early if the correction has converged.
+        let batch_size = 2;
+        let mut iters_done = 0;
+        let dx_sq = pd.dx * pd.dx;
+        let tol = defect_tol_rel * max_defect_rhs * dx_sq;
+
+        while iters_done < n_smooth {
+            let this_batch = batch_size.min(n_smooth - iters_done);
+
+            // Record phi before this batch for convergence check
+            let phi_max_before = pd.phi.iter()
+                .map(|v| v.abs())
+                .fold(0.0f64, f64::max);
+
+            smooth_jacobi_2d(
+                &mut pd.phi, &defect_rhs, &mut tmp,
+                pnx, pny, ghost, pd.dx, pd.dy,
+                omega, this_batch,
+            );
+
+            iters_done += this_batch;
+
+            // Check convergence: if the correction φ has stabilised, stop.
+            let phi_max_after = pd.phi.iter()
+                .map(|v| v.abs())
+                .fold(0.0f64, f64::max);
+
+            // After the first batch (starting from φ=0), phi_max_after IS the
+            // change. For subsequent batches, check the delta.
+            let change = if iters_done <= batch_size {
+                phi_max_after
+            } else {
+                (phi_max_after - phi_max_before).abs()
+            };
+
+            // If the change per batch is below tolerance, the smoother has
+            // captured all it can. Further iterations add noise.
+            if iters_done > batch_size && change < tol {
+                break;
+            }
+        }
+        iters_done
+    };
+
+    let _ = effective_n_smooth; // suppress unused warning when diag is off
+
+    // Step 3+4: Extract δB = −μ₀∇(δφ) and combine with interpolated parent B.
     let inv_2dx = 1.0 / (2.0 * pd.dx);
     let inv_2dy = 1.0 / (2.0 * pd.dy);
 
@@ -719,12 +1104,12 @@ fn compute_defect_correction_on_patch(
                 0.0
             };
 
-            // Interpolate B_L0 at this fine cell's position.
+            // Interpolate parent-level B at this fine cell's position.
             let (x, y) = patch.cell_center_xy(i, j);
             let b_coarse = sample_bilinear(b_l0, x, y);
 
-            // Combine: B_patch = B_L0_interp + δB
-            // Bz purely from L0 (3D z-physics captured by the 3D padded-box solve).
+            // Combine: B_patch = B_parent_interp + δB
+            // Bz purely from parent (3D z-physics captured by the 3D padded-box solve).
             b_out[idx] = [
                 b_coarse[0] + dbx,
                 b_coarse[1] + dby,
@@ -756,11 +1141,13 @@ pub(crate) struct CompositeVCycleConfig {
 
 impl Default for CompositeVCycleConfig {
     fn default() -> Self {
+        let max_cycles: usize = std::env::var("LLG_COMPOSITE_MAX_CYCLES")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
         Self {
             n_pre: 3,
             n_post: 3,
             omega: 2.0 / 3.0,
-            max_cycles: 5,
+            max_cycles,
         }
     }
 }
@@ -821,28 +1208,85 @@ impl CompositeGridPoisson {
     // Phase 5: Composite V-cycle
     // ------------------------------------------------------------------
 
-    /// Run one composite V-cycle iteration.
+    /// Run one composite V-cycle iteration (García-Cervera / AMReX pattern).
     ///
-    /// Downstroke: fill ghost φ from coarse → pre-smooth → compute residual → restrict.
-    /// L0 solve: existing 3D MG+PPPM with restricted fine residuals as corrections.
-    /// Upstroke: prolongate correction → fill ghosts → post-smooth.
+    /// Downstroke (finest → coarsest):
+    ///   For each level from L_finest down to L1:
+    ///     Ghost-fill φ from PARENT level → pre-smooth → compute residual
+    ///     Restrict residual into parent level patches
+    ///   Restrict L1 residuals to L0.
     ///
+    /// L0 solve: existing 3D MG+PPPM with restricted fine residuals.
+    ///
+    /// Upstroke (coarsest → finest):
+    ///   L1: prolongate from L0 → ghost-fill from L0 → post-smooth.
+    ///   For each level from L2 up to L_finest:
+    ///     Prolongate from PARENT patch → ghost-fill from parent → post-smooth.
+    ///
+    /// `parent_maps` is the pre-computed parent-index map from `build_parent_index_maps`.
     /// `b_scratch` is a temporary VectorField2D used by solve_with_corrections.
-    #[allow(dead_code)]
     fn vcycle_iteration(
         &mut self,
         h: &AmrHierarchy2D,
         mat: &Material,
+        parent_maps: &[Vec<usize>],
         b_scratch: &mut VectorField2D,
     ) {
         let cnx = h.base_grid.nx;
         let cny = h.base_grid.ny;
         let cdx = h.base_grid.dx;
         let cdy = h.base_grid.dy;
+        let step_ratio = h.ratio; // ratio between adjacent AMR levels
 
-        // ═══════ DOWNSTROKE: fine → coarse ═══════
+        // ═══════ DOWNSTROKE: finest → coarsest ═══════
+        //
+        // Two-pass approach to avoid the ordering issue where restriction
+        // from a child level would be overwritten by the parent's
+        // compute_residual_2d.
+        //
+        // Pass 1: All levels ghost-fill + smooth + compute residual.
+        //         Processed finest-first so ghost values are current.
+        // Pass 2: Cascade restrictions from finest to coarsest.
+        //         Each level's residual at covered cells is REPLACED with
+        //         the restricted fine residual. This cascades L3→L2→L1.
 
-        // Process L1 patches.
+        // ── Pass 1: Ghost-fill + smooth + residual on ALL levels ──
+
+        // L2+ from finest to coarsest
+        for lvl_idx in (0..h.patches_l2plus.len()).rev() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+            if lvl_patches.is_empty() { continue; }
+
+            // Clone parent φ arrays for ghost-fill (avoids borrow conflicts).
+            let parent_phis: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data.iter().map(|pd| pd.phi.clone()).collect()
+            } else {
+                self.l2plus_data[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+            };
+            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+                &h.patches
+            } else {
+                &h.patches_l2plus[lvl_idx - 1]
+            };
+
+            for (pi, (patch, pd)) in lvl_patches.iter()
+                .zip(self.l2plus_data[lvl_idx].iter_mut()).enumerate()
+            {
+                let parent_idx = parent_maps[lvl_idx][pi];
+                fill_phi_ghosts_from_parent_patch(
+                    patch, &mut pd.phi,
+                    &parent_patches[parent_idx], &parent_phis[parent_idx]);
+
+                smooth_jacobi_2d(
+                    &mut pd.phi, &pd.rhs, &mut pd.residual,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
+                    self.vcfg.omega, self.vcfg.n_pre);
+
+                compute_residual_2d(pd);
+            }
+        }
+
+        // L1 patches
         for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
             fill_phi_ghosts_from_coarse(
                 patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
@@ -855,35 +1299,64 @@ impl CompositeGridPoisson {
             compute_residual_2d(pd);
         }
 
-        // Process L2+ patches (same: ghost-fill from L0, smooth, residual).
-        for (lvl_patches, lvl_data) in
-            h.patches_l2plus.iter().zip(self.l2plus_data.iter_mut())
-        {
-            for (patch, pd) in lvl_patches.iter().zip(lvl_data.iter_mut()) {
-                fill_phi_ghosts_from_coarse(
-                    patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
+        // ── Pass 2: Cascade restrictions from finest to coarsest ──
+        //
+        // At each level, restrict its residual into the parent level's
+        // residual (REPLACING covered cells). Process from finest first
+        // so that when L2's residual is restricted into L1, the L2 residual
+        // already includes L3's contributions at covered cells.
 
-                smooth_jacobi_2d(
-                    &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
-                    self.vcfg.omega, self.vcfg.n_pre);
+        for lvl_idx in (0..h.patches_l2plus.len()).rev() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+            if lvl_patches.is_empty() { continue; }
 
-                compute_residual_2d(pd);
+            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+                &h.patches
+            } else {
+                &h.patches_l2plus[lvl_idx - 1]
+            };
+
+            // Collect restriction operations, then apply.
+            let restrict_ops: Vec<(usize, usize, f64)> = {
+                let lvl_data = &self.l2plus_data[lvl_idx];
+                let mut ops = Vec::new();
+                for (pi, (patch, pd)) in lvl_patches.iter()
+                    .zip(lvl_data.iter()).enumerate()
+                {
+                    let parent_idx = parent_maps[lvl_idx][pi];
+                    let parent_patch = &parent_patches[parent_idx];
+                    let pnx = parent_patch.grid.nx;
+                    let pny = parent_patch.grid.ny;
+                    let mut tmp_res = vec![f64::NAN; pnx * pny];
+                    restrict_residual_to_parent_patch(
+                        patch, &pd.residual, pd.nx,
+                        parent_patch, &mut tmp_res, pnx,
+                        step_ratio);
+                    for idx in 0..pnx * pny {
+                        if !tmp_res[idx].is_nan() {
+                            ops.push((parent_idx, idx, tmp_res[idx]));
+                        }
+                    }
+                }
+                ops
+            };
+
+            // Apply into parent's residual.
+            if lvl_idx == 0 {
+                for (parent_idx, cell_idx, val) in restrict_ops {
+                    self.l1_data[parent_idx].residual[cell_idx] = val;
+                }
+            } else {
+                for (parent_idx, cell_idx, val) in restrict_ops {
+                    self.l2plus_data[lvl_idx - 1][parent_idx].residual[cell_idx] = val;
+                }
             }
         }
 
-        // Restrict residuals to coarse corrections.
-        //
-        // delta = restricted_fine_residual - coarse_in_plane_div
-        //
-        // This ensures solve_with_corrections produces:
-        //   3d_rhs = (coarse_3d_div) + delta
-        //          = z_surface_charges + restricted_fine_residual
-        //
-        // For V-cycle 1 with φ=0: fine_residual = fine_rhs = fine ∇·M,
-        // so delta = area_avg(fine_rhs) - coarse_div — identical to the
-        // existing enhanced-RHS path.
-
+        // Restrict L1 residuals to L0 corrections.
+        // delta = restricted_fine_residual - coarse_div
+        // so that solve_with_corrections produces:
+        //   3d_rhs = coarse_3d_div + delta = z_surface + restricted_fine_residual
         let mut all_corrections: Vec<(usize, f64)> = Vec::new();
 
         for (patch, pd) in h.patches.iter().zip(self.l1_data.iter()) {
@@ -897,111 +1370,33 @@ impl CompositeGridPoisson {
             }
         }
 
-        for (lvl_patches, lvl_data) in
-            h.patches_l2plus.iter().zip(self.l2plus_data.iter())
-        {
-            for (patch, pd) in lvl_patches.iter().zip(lvl_data.iter()) {
-                let restricted = restrict_residual_to_coarse(
-                    patch, &pd.residual, cnx);
-                for (cell_idx, avg_res) in restricted {
-                    let delta = avg_res - self.coarse_div[cell_idx];
-                    if delta.abs() > 1e-30 {
-                        all_corrections.push((cell_idx, delta));
-                    }
-                }
-            }
-        }
-
         // ═══════ L0 SOLVE ═══════
 
-        let phi_old = self.coarse_phi.clone();
+        let phi_old_l0 = self.coarse_phi.clone();
 
         self.l0_solver.solve_with_corrections(
             &h.coarse, &all_corrections, b_scratch, mat);
 
         // Extract updated L0 φ.
-        // DIAGNOSTIC NOTE: The MG solver produces φ_MG which differs from the
-        // Newell-equivalent φ due to the FD stencil vs Newell kernel mismatch.
-        // The PPPM-φ correction (above) applies a calibrated Δφ stencil to fix this.
-        // The diagnostic below measures the remaining gap AFTER correction.
         let new_phi = self.l0_solver.mg.extract_magnet_layer_phi();
         self.coarse_phi.copy_from_slice(&new_phi);
 
-        // ═══════ PPPM-φ CORRECTION ═══════
-        // Apply the calibrated Δφ stencil to correct the MG potential.
-        // After this, the 2D central-difference gradient of coarse_phi will
-        // approximate the Newell B field, giving patches correct ghost BCs.
+        // Apply PPPM-φ correction so that ∇(coarse_phi) approximates
+        // the Newell B field, giving patches correct ghost BCs.
         if let Some(dk) = self.l0_solver.delta_kernel() {
             dk.apply_phi_correction(&h.coarse, &mut self.coarse_phi, mat.ms);
-            if composite_diag() {
-                let phi_min = self.coarse_phi.iter().cloned().fold(f64::INFINITY, f64::min);
-                let phi_max = self.coarse_phi.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                eprintln!(
-                    "[composite DIAG] Applied PPPM-φ correction. L0 φ range: [{:.4e}, {:.4e}]",
-                    phi_min, phi_max);
-            }
         }
 
-        // ---- DIAGNOSTIC: measure φ-B inconsistency ----
-        if composite_diag() {
-            // Compute B from raw φ gradient (what patches will "see" via ghost-fill + ∇φ)
-            // vs the ΔK-corrected B in b_scratch (what enhanced-RHS path uses).
-            let phi = &self.coarse_phi;
-            let cnx = h.base_grid.nx;
-            let cny = h.base_grid.ny;
-            let cdx = h.base_grid.dx;
-            let cdy = h.base_grid.dy;
-            let inv_2dx = 1.0 / (2.0 * cdx);
-            let inv_2dy = 1.0 / (2.0 * cdy);
+        // ═══════ UPSTROKE: coarsest → finest ═══════
 
-            let mut sum_b_corr_sq = 0.0f64;
-            let mut sum_gap_sq = 0.0f64;
-            let mut max_gap = 0.0f64;
-            let mut n_cells = 0usize;
-
-            for j in 1..cny-1 {
-                for i in 1..cnx-1 {
-                    let idx = j * cnx + i;
-                    // B from raw φ gradient (no PPPM)
-                    let bx_phi = -MU0 * (phi[j * cnx + (i+1)] - phi[j * cnx + (i-1)]) * inv_2dx;
-                    let by_phi = -MU0 * (phi[(j+1) * cnx + i] - phi[(j-1) * cnx + i]) * inv_2dy;
-                    // B from ΔK-corrected solve
-                    let bc = b_scratch.data[idx];
-                    let bx_corr = bc[0];
-                    let by_corr = bc[1];
-                    // Gap = what PPPM adds that φ doesn't have
-                    let gap_x = bx_corr - bx_phi;
-                    let gap_y = by_corr - by_phi;
-                    let gap2 = gap_x * gap_x + gap_y * gap_y;
-                    let bcorr2 = bx_corr * bx_corr + by_corr * by_corr;
-
-                    sum_gap_sq += gap2;
-                    sum_b_corr_sq += bcorr2;
-                    max_gap = max_gap.max(gap2.sqrt());
-                    n_cells += 1;
-                }
-            }
-
-            if n_cells > 0 {
-                let rmse_gap = (sum_gap_sq / n_cells as f64).sqrt();
-                let rmse_b = (sum_b_corr_sq / n_cells as f64).sqrt();
-                let rel = if rmse_b > 0.0 { rmse_gap / rmse_b * 100.0 } else { 0.0 };
-                eprintln!(
-                    "[composite DIAG] φ-B gap: RMSE(B_corrected - B_from_φ) = {:.4e} T ({:.1}% of |B|), max={:.4e} T",
-                    rmse_gap, rel, max_gap,
-                );
-                eprintln!(
-                    "[composite DIAG] → This gap is the PPPM ΔK correction that φ_long is MISSING.");
-                eprintln!(
-                    "[composite DIAG] → Patch ghost-fill uses φ_long, so patches don't see the ΔK physics.");
-            }
-        }
-
-        // ═══════ UPSTROKE: coarse → fine ═══════
+        // L1 patches: prolongate correction from L0, ghost-fill, post-smooth.
+        // Save L1 phi_old for L2 prolongation.
+        let l1_phi_old: Vec<Vec<f64>> = self.l1_data.iter()
+            .map(|pd| pd.phi.clone()).collect();
 
         for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
             prolongate_phi_correction(
-                &self.coarse_phi, &phi_old, cnx, cny, cdx, cdy,
+                &self.coarse_phi, &phi_old_l0, cnx, cny, cdx, cdy,
                 patch, &mut pd.phi);
 
             fill_phi_ghosts_from_coarse(
@@ -1013,46 +1408,81 @@ impl CompositeGridPoisson {
                 self.vcfg.omega, self.vcfg.n_post);
         }
 
-        for (lvl_patches, lvl_data) in
-            h.patches_l2plus.iter().zip(self.l2plus_data.iter_mut())
-        {
-            for (patch, pd) in lvl_patches.iter().zip(lvl_data.iter_mut()) {
-                prolongate_phi_correction(
-                    &self.coarse_phi, &phi_old, cnx, cny, cdx, cdy,
+        // L2+ levels: prolongate from parent, ghost-fill, post-smooth.
+        // Process from coarsest (L2) to finest (L_max).
+        // prev_phi_old tracks each level's φ before prolongation so the
+        // next finer level can compute the correction delta.
+        let mut prev_phi_old: Vec<Vec<f64>> = l1_phi_old; // starts with L1 old
+
+        for lvl_idx in 0..h.patches_l2plus.len() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+            if lvl_patches.is_empty() {
+                // Carry forward: set prev_phi_old to current level's phi
+                prev_phi_old = self.l2plus_data[lvl_idx].iter()
+                    .map(|pd| pd.phi.clone()).collect();
+                continue;
+            }
+
+            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+                &h.patches
+            } else {
+                &h.patches_l2plus[lvl_idx - 1]
+            };
+
+            // Clone parent φ to avoid borrow conflict: we need immutable
+            // parent data while mutating child data in l2plus_data.
+            let parent_phis_new: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data.iter().map(|pd| pd.phi.clone()).collect()
+            } else {
+                self.l2plus_data[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+            };
+
+            // Save this level's phi_old for the next level.
+            let this_phi_old: Vec<Vec<f64>> = self.l2plus_data[lvl_idx].iter()
+                .map(|pd| pd.phi.clone()).collect();
+
+            for (pi, (patch, pd)) in lvl_patches.iter()
+                .zip(self.l2plus_data[lvl_idx].iter_mut()).enumerate()
+            {
+                let parent_idx = parent_maps[lvl_idx][pi];
+
+                prolongate_phi_correction_from_parent_patch(
+                    &parent_patches[parent_idx],
+                    &parent_phis_new[parent_idx],
+                    &prev_phi_old[parent_idx],
                     patch, &mut pd.phi);
 
-                fill_phi_ghosts_from_coarse(
-                    patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
+                fill_phi_ghosts_from_parent_patch(
+                    patch, &mut pd.phi,
+                    &parent_patches[parent_idx], &parent_phis_new[parent_idx]);
 
                 smooth_jacobi_2d(
                     &mut pd.phi, &pd.rhs, &mut pd.residual,
                     pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
                     self.vcfg.omega, self.vcfg.n_post);
             }
+
+            prev_phi_old = this_phi_old;
         }
     }
 
-    /// Run the full composite V-cycle solve.
-    ///
-    /// 1. Allocate/update patch data if needed.
-    /// 2. Compute fine RHS on all patches.
-    /// 3. Compute coarse in-plane div (for correction deltas).
-    /// 4. Run V-cycle iterations.
-    /// 5. Extract B on L0 and on patches at fine resolution.
-    /// Composite V-cycle with defect correction.
+    /// Composite V-cycle solve (true iterative V-cycle).
     ///
     /// Architecture (following García-Cervera / AMReX):
-    ///   1. L0 solve with enhanced RHS (fine ∇·M injected) → B_L0 (PPPM-corrected)
-    ///   2. Per-patch DEFECT correction:
-    ///        δrhs = ∇·M_fine − interpolate(∇·M_coarse)
-    ///        Smooth ∇²(δφ) = δrhs with DirichletZero BCs
-    ///        δB = −μ₀∇(δφ)
-    ///   3. Final: B_patch = interpolate(B_L0) + δB
+    ///   1. Allocate/populate patch φ/rhs data.
+    ///   2. Iterate the composite V-cycle:
+    ///        Downstroke: finest → coarsest (smooth + restrict residuals)
+    ///        L0 solve: 3D MG+PPPM with restricted fine residuals
+    ///        Upstroke: coarsest → finest (prolongate + smooth)
+    ///   3. Extract B from converged φ:
+    ///        L0: from the MG solve (ΔK-corrected)
+    ///        Patches: B = −μ₀∇(φ_patch) at fine resolution
     ///
-    /// Why DirichletZero works: The defect RHS is high-frequency (fine-scale
-    /// detail the coarse grid missed). High-k corrections decay exponentially
-    /// away from sources, so δφ→0 at patch boundaries. This avoids the
-    /// 2D-vs-3D Green's function mismatch that broke the full-solve approach.
+    /// Key difference from the old defect-correction path:
+    ///   - Patches solve the FULL Poisson equation (rhs = fine ∇·M), not a defect
+    ///   - Ghost values come from parent-level φ (hierarchical, not from L0)
+    ///   - Multiple V-cycle iterations allow φ to converge across all levels
+    ///   - B is extracted from the converged φ gradient, not from interp(B_L0)+δB
     pub(crate) fn compute_vcycle(
         &mut self,
         h: &AmrHierarchy2D,
@@ -1091,89 +1521,112 @@ impl CompositeGridPoisson {
             self.coarse_div = vec![0.0; n_coarse];
         }
 
-        // ---- Compute fine ∇·M on all patches ----
+        // ---- Compute fine ∇·M on all patches (patch RHS) ----
         if has_patches {
             compute_all_patch_rhs(h, &mut self.l1_data, &mut self.l2plus_data, mat.ms);
         }
 
-        // ---- Compute coarse ∇·M on L0 ----
+        // ---- Compute coarse ∇·M on L0 (for restriction delta) ----
         compute_scaled_div_m(
             &h.coarse.data, h.base_grid.nx, h.base_grid.ny,
             h.base_grid.dx, h.base_grid.dy, mat.ms,
             &mut self.coarse_div,
         );
 
-        // ════════════════════════════════════════════════════════════════
-        // STEP 1: L0 solve with enhanced RHS → B_L0 (PPPM-corrected)
-        // ════════════════════════════════════════════════════════════════
-        let corrections = if has_patches {
-            compute_patch_corrections(h, &self.coarse_div, mat.ms)
-        } else {
-            Vec::new()
-        };
+        // ---- Pre-compute parent-patch index maps ----
+        let parent_maps = build_parent_index_maps(h);
 
-        self.l0_solver.solve_with_corrections(
-            &h.coarse, &corrections, b_demag_coarse, mat);
+        // ════════════════════════════════════════════════════════════════
+        // COMPOSITE V-CYCLE ITERATIONS
+        // ════════════════════════════════════════════════════════════════
+        let max_cycles = self.vcfg.max_cycles;
+        let mut b_scratch = VectorField2D::new(self.base_grid);
 
         if composite_diag() {
             let n_l2plus: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
-            eprintln!("[composite DEFECT] ═══════════════════════════════════════════════════");
-            eprintln!("[composite DEFECT] Defect-correction mode: L1={}, L2+={}", n_l1, n_l2plus);
-            eprintln!("[composite DEFECT] L0 solve complete. Computing per-patch defect corrections...");
+            eprintln!("[composite VCYCLE] ═══════════════════════════════════════════════════");
+            eprintln!("[composite VCYCLE] Iterative V-cycle: L1={}, L2+={}, max_cycles={}",
+                n_l1, n_l2plus, max_cycles);
         }
 
-        // ════════════════════════════════════════════════════════════════
-        // STEP 2: Per-patch defect correction
-        // ════════════════════════════════════════════════════════════════
-        //
-        // For each patch:
-        //   defect_rhs[i,j] = fine_div[i,j] − bilinear(coarse_div, x, y)
-        //   Smooth ∇²(δφ) = defect_rhs with δφ=0 on all boundaries
-        //   δB = −μ₀∇(δφ)
-        //   B_patch = bilinear(B_L0) + [δBx, δBy, 0]
-        //
-        // Bz: purely from L0 interpolation (3D z-physics captured by L0 solve).
+        for cycle in 0..max_cycles {
+            self.vcycle_iteration(h, mat, &parent_maps, &mut b_scratch);
 
-        let cnx = h.base_grid.nx;
-        let cny = h.base_grid.ny;
-        let cdx = h.base_grid.dx;
-        let cdy = h.base_grid.dy;
-        let n_smooth = (self.vcfg.n_pre + self.vcfg.n_post).max(10);
-        let omega = self.vcfg.omega;
-
-        // ---- Apply to all L1 patches ----
-        let mut b_l1: Vec<Vec<[f64; 3]>> = Vec::with_capacity(h.patches.len());
-        for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
-            let b = compute_defect_correction_on_patch(
-                patch, pd, &self.coarse_div, cnx, cny, cdx, cdy,
-                b_demag_coarse, omega, n_smooth);
-            b_l1.push(b);
-        }
-
-        // ---- Apply to all L2+ patches ----
-        let mut b_l2: Vec<Vec<Vec<[f64; 3]>>> = Vec::with_capacity(h.patches_l2plus.len());
-        for (lvl_patches, lvl_data) in h.patches_l2plus.iter().zip(self.l2plus_data.iter_mut()) {
-            let mut lvl_b = Vec::with_capacity(lvl_patches.len());
-            for (patch, pd) in lvl_patches.iter().zip(lvl_data.iter_mut()) {
-                let b = compute_defect_correction_on_patch(
-                    patch, pd, &self.coarse_div, cnx, cny, cdx, cdy,
-                    b_demag_coarse, omega, n_smooth);
-                lvl_b.push(b);
+            // Monitor convergence: max residual norm on all patches.
+            if composite_diag() || cycle + 1 == max_cycles {
+                let mut max_res = 0.0f64;
+                for pd in self.l1_data.iter() {
+                    for &v in pd.residual.iter() {
+                        max_res = max_res.max(v.abs());
+                    }
+                }
+                for lvl_data in self.l2plus_data.iter() {
+                    for pd in lvl_data.iter() {
+                        for &v in pd.residual.iter() {
+                            max_res = max_res.max(v.abs());
+                        }
+                    }
+                }
+                if composite_diag() {
+                    eprintln!(
+                        "[composite VCYCLE] cycle {}/{}: max|residual| = {:.4e}",
+                        cycle + 1, max_cycles, max_res);
+                }
             }
-            b_l2.push(lvl_b);
         }
 
         if composite_diag() {
-            // Report defect correction statistics
-            let mut max_dphi = 0.0f64;
+            // Report converged φ magnitudes per level.
+            let mut max_phi_l1 = 0.0f64;
             for pd in self.l1_data.iter() {
                 for &v in pd.phi.iter() {
-                    max_dphi = max_dphi.max(v.abs());
+                    max_phi_l1 = max_phi_l1.max(v.abs());
                 }
             }
-            eprintln!("[composite DEFECT] max|δφ| on L1 patches = {:.4e}", max_dphi);
-            eprintln!("[composite DEFECT] ═══════════════════════════════════════════════════");
+            eprintln!("[composite VCYCLE] converged max|φ| on L1 = {:.4e}", max_phi_l1);
+
+            for (lvl_idx, lvl_data) in self.l2plus_data.iter().enumerate() {
+                let mut max_phi = 0.0f64;
+                for pd in lvl_data.iter() {
+                    for &v in pd.phi.iter() {
+                        max_phi = max_phi.max(v.abs());
+                    }
+                }
+                if !lvl_data.is_empty() {
+                    eprintln!(
+                        "[composite VCYCLE] converged max|φ| on L{} = {:.4e}",
+                        lvl_idx + 2, max_phi);
+                }
+            }
+            eprintln!("[composite VCYCLE] ═══════════════════════════════════════════════════");
         }
+
+        // ════════════════════════════════════════════════════════════════
+        // EXTRACT B FROM CONVERGED φ
+        // ════════════════════════════════════════════════════════════════
+        //
+        // L0 B: from b_scratch (the ΔK-corrected MG solve output).
+        // Patch B: -μ₀∇(φ_patch) at fine resolution using central differences.
+        //   Bx, By from fine φ gradient; Bz interpolated from L0.
+        //   Ghost cells in φ provide boundary data for the stencil.
+
+        b_demag_coarse.data.copy_from_slice(&b_scratch.data);
+
+        // L1 patch B from fine φ gradient.
+        let b_l1: Vec<Vec<[f64; 3]>> = h.patches.iter()
+            .zip(self.l1_data.iter())
+            .map(|(patch, pd)| extract_b_from_patch_phi(patch, &pd.phi, b_demag_coarse))
+            .collect();
+
+        // L2+ patch B from fine φ gradient.
+        let b_l2: Vec<Vec<Vec<[f64; 3]>>> = h.patches_l2plus.iter()
+            .zip(self.l2plus_data.iter())
+            .map(|(lvl_patches, lvl_data)| {
+                lvl_patches.iter().zip(lvl_data.iter())
+                    .map(|(patch, pd)| extract_b_from_patch_phi(patch, &pd.phi, b_demag_coarse))
+                    .collect()
+            })
+            .collect();
 
         (b_l1, b_l2)
     }
@@ -2413,10 +2866,11 @@ mod phase5_tests {
 
         // Run V-cycles and track max patch residual.
         let mut b_scratch = VectorField2D::new(grid);
+        let parent_maps = build_parent_index_maps(&h);
         let mut residuals = Vec::new();
 
         for cycle in 0..5 {
-            solver.vcycle_iteration(&h, &mat, &mut b_scratch);
+            solver.vcycle_iteration(&h, &mat, &parent_maps, &mut b_scratch);
 
             // Recompute residual to measure it.
             let mut max_res = 0.0f64;

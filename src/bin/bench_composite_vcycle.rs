@@ -62,7 +62,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 // ---------------------------------------------------------------------------
 // Core benchmark: run all three solvers at a given L0 grid size.
-// Returns (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp, n_l1, n_l2plus)
+// Returns (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp, n_l1, n_l2plus, n_edge)
 // If skip_fine, t_fine_ms = 0 and edge errors are NaN.
 // ---------------------------------------------------------------------------
 fn run_benchmark(
@@ -71,7 +71,7 @@ fn run_benchmark(
     domain_nm: f64, hole_radius_nm: f64, dz: f64,
     mat: &Material, shape: &MaskShape,
     skip_fine: bool, verbose: bool,
-) -> (f64, f64, f64, f64, f64, usize, usize) {
+) -> (f64, f64, f64, f64, f64, usize, usize, usize) {
     let dx = domain_nm * 1e-9 / base_nx as f64;
     let dy = domain_nm * 1e-9 / base_ny as f64;
     let base_grid = Grid2D::new(base_nx, base_ny, dx, dy, dz);
@@ -156,6 +156,14 @@ fn run_benchmark(
         println!("  Patches: L1={}, L2+={}", n_l1, n_l2);
     }
 
+    // Fixed physical distance for edge classification (meters).
+    // Using a constant physical band (default 2nm either side of the hole boundary)
+    // ensures the edge cell population is consistent across grid sizes.
+    // Previous: 4.0 * patch.grid.dx — this changed with resolution, making
+    // cross-resolution RMSE comparisons unreliable.
+    let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 8.0);
+    let edge_dist = edge_dist_nm * 1e-9;
+
     // Fine FFT reference
     let mut t_fine_ms = 0.0f64;
     let b_fine_opt = if !skip_fine {
@@ -180,10 +188,14 @@ fn run_benchmark(
         None
     };
 
-    // Coarse-FFT
+    // Coarse-FFT — warm up (builds Newell kernel on first call), then time
+    {
+        let mut bw = VectorField2D::new(base_grid);
+        let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, mat, &mut bw);
+    }
     let t1 = Instant::now();
     let mut b_coarse_fft = VectorField2D::new(base_grid);
-    let (b_l1_cfft, _) = coarse_fft_demag::compute_coarse_fft_demag(&h, mat, &mut b_coarse_fft);
+    let (b_l1_cfft, b_l2_cfft) = coarse_fft_demag::compute_coarse_fft_demag(&h, mat, &mut b_coarse_fft);
     let t_cfft_ms = t1.elapsed().as_secs_f64() * 1e3;
     if verbose { println!("  coarse-FFT:  {:.1} ms", t_cfft_ms); }
 
@@ -194,13 +206,14 @@ fn run_benchmark(
     }
     let t2 = Instant::now();
     let mut b_coarse_comp = VectorField2D::new(base_grid);
-    let (b_l1_comp, _) = mg_composite::compute_composite_demag(&h, mat, &mut b_coarse_comp);
+    let (b_l1_comp, b_l2_comp) = mg_composite::compute_composite_demag(&h, mat, &mut b_coarse_comp);
     let t_comp_ms = t2.elapsed().as_secs_f64() * 1e3;
     if verbose { println!("  composite:   {:.1} ms", t_comp_ms); }
 
-    // Compute edge RMSE if we have the fine reference
+    // Compute edge RMSE across ALL levels if we have the fine reference
     let mut edge_rmse_cfft = f64::NAN;
     let mut edge_rmse_comp = f64::NAN;
+    let mut n_edge = 0usize;
     if let Some(ref b_fine) = b_fine_opt {
         let b_max = b_fine.data.iter()
             .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
@@ -208,23 +221,20 @@ fn run_benchmark(
 
         let mut se_cfft = 0.0f64;
         let mut se_comp = 0.0f64;
-        let mut n_edge = 0usize;
 
-        for (pi, patch) in h.patches.iter().enumerate() {
+        // Helper: measure edge error on a single patch
+        let mut measure_patch = |patch: &llg_sim::amr::patch::Patch2D, bc: &[[f64; 3]], bv: &[[f64; 3]]| {
             let pnx = patch.grid.nx;
             let gi0 = patch.interior_i0();
             let gj0 = patch.interior_j0();
             let gi1 = patch.interior_i1();
             let gj1 = patch.interior_j1();
-            let bc = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
-            let bv = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
-
             for j in gj0..gj1 {
                 for i in gi0..gi1 {
                     let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
                     if !shape.contains(x, y) { continue; }
                     let dist = (x - hole_centre.0).hypot(y - hole_centre.1) - hole_radius;
-                    if dist.abs() >= 4.0 * patch.grid.dx { continue; }
+                    if dist.abs() >= edge_dist { continue; }
                     let (xc, yc) = patch.cell_center_xy(i, j);
                     let br = sample_bilinear(b_fine, xc, yc);
                     let idx = j * pnx + i;
@@ -233,14 +243,33 @@ fn run_benchmark(
                     n_edge += 1;
                 }
             }
+        };
+
+        // L1 patches
+        for (pi, patch) in h.patches.iter().enumerate() {
+            if pi < b_l1_cfft.len() && pi < b_l1_comp.len() {
+                measure_patch(patch, &b_l1_cfft[pi], &b_l1_comp[pi]);
+            }
         }
+
+        // L2+ patches
+        for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+            let bc_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+            let bv_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+            for (pi, patch) in lvl_patches.iter().enumerate() {
+                if pi < bc_lvl.len() && pi < bv_lvl.len() {
+                    measure_patch(patch, &bc_lvl[pi], &bv_lvl[pi]);
+                }
+            }
+        }
+
         if n_edge > 0 {
             edge_rmse_cfft = (se_cfft / n_edge as f64).sqrt() / b_max * 100.0;
             edge_rmse_comp = (se_comp / n_edge as f64).sqrt() / b_max * 100.0;
         }
     }
 
-    (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp, n_l1, n_l2)
+    (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp, n_l1, n_l2, n_edge)
 }
 
 fn main() {
@@ -277,6 +306,10 @@ fn main() {
     let vcycle_on = std::env::var("LLG_DEMAG_COMPOSITE_VCYCLE")
         .map(|v| v == "1").unwrap_or(false);
 
+    // Fixed physical distance for edge classification (same as sweep mode).
+    let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 2.0);
+    let edge_dist = edge_dist_nm * 1e-9;
+
     // ════════════════════════════════════════════════════════════════
     // SWEEP MODE: timing + accuracy across grid sizes → CSV + plot
     // ════════════════════════════════════════════════════════════════
@@ -284,10 +317,11 @@ fn main() {
         let sweep_sizes: Vec<usize> = if let Ok(s) = std::env::var("LLG_CV_SWEEP_SIZES") {
             s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
         } else {
-            vec![64, 128, 256, 512]
+            vec![32, 48, 64, 96, 128, 256, 512]
         };
         let sweep_levels: usize = amr_levels;
         let sweep_skip_fine = env_or("LLG_CV_SWEEP_SKIP_FINE", 0usize) != 0;
+        let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 2.0);
 
         let diag_dir = "out/bench_vcycle_diag";
         fs::create_dir_all(diag_dir).ok();
@@ -300,25 +334,26 @@ fn main() {
         println!("  AMR levels:  {} (ratio {}×, total {}×)", sweep_levels, ratio, ratio.pow(sweep_levels as u32));
         println!("  V-cycle:     {}", if vcycle_on { "ON" } else { "OFF" });
         println!("  Fine ref:    {}", if sweep_skip_fine { "SKIPPED" } else { "ON" });
+        println!("  Edge dist:   {:.1} nm (fixed physical distance)", edge_dist_nm);
         println!("  Grid sizes:  {:?}", sweep_sizes);
         println!();
 
         let mut csv_f = BufWriter::new(fs::File::create(&csv_path).unwrap());
         writeln!(csv_f, "base_nx,fine_nx,amr_levels,t_fine_ms,t_cfft_ms,t_comp_ms,\
-            edge_rmse_cfft_pct,edge_rmse_comp_pct,n_l1,n_l2plus,fine_cells,comp_cells_est").unwrap();
+            edge_rmse_cfft_pct,edge_rmse_comp_pct,n_l1,n_l2plus,fine_cells,comp_cells_est,n_edge").unwrap();
 
-        println!("  {:>6} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            "L0", "fine", "t_fine", "t_cfft", "t_comp", "e_cfft%", "e_comp%");
-        println!("  {:->6} {:->7} {:->10} {:->10} {:->10} {:->10} {:->10}",
-            "", "", "", "", "", "", "");
+        println!("  {:>6} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}",
+            "L0", "fine", "t_fine", "t_cfft", "t_comp", "e_cfft%", "e_comp%", "n_edge");
+        println!("  {:->6} {:->7} {:->10} {:->10} {:->10} {:->10} {:->10} {:->7}",
+            "", "", "", "", "", "", "", "");
 
-        struct SweepRow { _base_nx: usize, fine_nx: usize, t_fine: f64, t_cfft: f64, t_comp: f64, e_cfft: f64, e_comp: f64 }
+        struct SweepRow { _base_nx: usize, fine_nx: usize, t_fine: f64, t_cfft: f64, t_comp: f64, e_cfft: f64, e_comp: f64, _n_edge: usize }
         let mut rows: Vec<SweepRow> = Vec::new();
 
         for &nx in &sweep_sizes {
             let tr = ratio.pow(sweep_levels as u32);
             let fnx = nx * tr;
-            let (tf, tc, tv, ec, ev, nl1, nl2) = run_benchmark(
+            let (tf, tc, tv, ec, ev, nl1, nl2, ne) = run_benchmark(
                 nx, nx, sweep_levels, ratio, ghost,
                 domain_nm, hole_radius_nm, dz,
                 &mat, &shape, sweep_skip_fine, false,
@@ -327,15 +362,15 @@ fn main() {
             // Rough estimate: L0 + patch cells (actual varies)
             let comp_cells_est = nx * nx + (nl1 + nl2) * 400;
 
-            writeln!(csv_f, "{},{},{},{:.1},{:.1},{:.1},{:.2},{:.2},{},{},{},{}",
-                nx, fnx, sweep_levels, tf, tc, tv, ec, ev, nl1, nl2, fine_cells, comp_cells_est).unwrap();
+            writeln!(csv_f, "{},{},{},{:.1},{:.1},{:.1},{:.2},{:.2},{},{},{},{},{}",
+                nx, fnx, sweep_levels, tf, tc, tv, ec, ev, nl1, nl2, fine_cells, comp_cells_est, ne).unwrap();
 
             let ec_str = if ec.is_nan() { "N/A".to_string() } else { format!("{:.2}", ec) };
             let ev_str = if ev.is_nan() { "N/A".to_string() } else { format!("{:.2}", ev) };
-            println!("  {:>6} {:>7} {:>9.0}ms {:>9.1}ms {:>9.1}ms {:>9}% {:>9}%",
-                nx, fnx, tf, tc, tv, ec_str, ev_str);
+            println!("  {:>6} {:>7} {:>9.0}ms {:>9.1}ms {:>9.1}ms {:>9}% {:>9}% {:>7}",
+                nx, fnx, tf, tc, tv, ec_str, ev_str, ne);
 
-            rows.push(SweepRow { _base_nx: nx, fine_nx: fnx, t_fine: tf, t_cfft: tc, t_comp: tv, e_cfft: ec, e_comp: ev });
+            rows.push(SweepRow { _base_nx: nx, fine_nx: fnx, t_fine: tf, t_cfft: tc, t_comp: tv, e_cfft: ec, e_comp: ev, _n_edge: ne });
         }
 
         println!();
@@ -626,9 +661,14 @@ fn main() {
 
     // ---- Coarse-FFT solve ----
     println!("  Running coarse-FFT ...");
+    // Warm up (builds Newell kernel on first call)
+    {
+        let mut bw = VectorField2D::new(base_grid);
+        let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut bw);
+    }
     let t1 = Instant::now();
     let mut b_coarse_fft = VectorField2D::new(base_grid);
-    let (b_l1_cfft, _) = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut b_coarse_fft);
+    let (b_l1_cfft, b_l2_cfft) = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut b_coarse_fft);
     let t_cfft = t1.elapsed().as_secs_f64() * 1e3;
     println!("  coarse-FFT:  {:.1} ms", t_cfft);
 
@@ -641,7 +681,7 @@ fn main() {
     }
     let t2 = Instant::now();
     let mut b_coarse_comp = VectorField2D::new(base_grid);
-    let (b_l1_comp, _) = mg_composite::compute_composite_demag(&h, &mat, &mut b_coarse_comp);
+    let (b_l1_comp, b_l2_comp) = mg_composite::compute_composite_demag(&h, &mat, &mut b_coarse_comp);
     let t_comp = t2.elapsed().as_secs_f64() * 1e3;
     println!("  composite:   {:.1} ms", t_comp);
     println!();
@@ -669,7 +709,8 @@ fn main() {
     };
 
     // ---- Patch-level accuracy comparison ----
-    // Helper to compute errors against a reference B field
+    // Helper to compute errors against a reference B field.
+    // Iterates ALL AMR levels (L1, L2, L3, ...) for comprehensive measurement.
     let compute_patch_errors = |b_ref: &VectorField2D, label: &str| {
         let b_max_global = b_ref.data.iter()
             .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
@@ -681,16 +722,31 @@ fn main() {
         println!("  (normalised to max|B| = {:.4e} T)", b_max_global);
         println!();
 
-        let mut total_edge_se_cfft = 0.0f64;
-        let mut total_edge_se_comp = 0.0f64;
-        let mut total_bulk_se_cfft = 0.0f64;
-        let mut total_bulk_se_comp = 0.0f64;
-        // Per-component accumulators for composite
-        let mut total_edge_se_comp_bx = 0.0f64;
-        let mut total_edge_se_comp_by = 0.0f64;
-        let mut total_edge_se_comp_bz = 0.0f64;
-        let mut total_edge_cells = 0usize;
-        let mut total_bulk_cells = 0usize;
+        // Per-level accumulators
+        struct LevelStats {
+            edge_se_cfft: f64, edge_se_comp: f64,
+            bulk_se_cfft: f64, bulk_se_comp: f64,
+            edge_se_comp_bx: f64, edge_se_comp_by: f64, edge_se_comp_bz: f64,
+            edge_cells: usize, bulk_cells: usize,
+            material_cells: usize,
+        }
+        impl LevelStats {
+            fn new() -> Self { Self {
+                edge_se_cfft: 0.0, edge_se_comp: 0.0,
+                bulk_se_cfft: 0.0, bulk_se_comp: 0.0,
+                edge_se_comp_bx: 0.0, edge_se_comp_by: 0.0, edge_se_comp_bz: 0.0,
+                edge_cells: 0, bulk_cells: 0, material_cells: 0,
+            }}
+        }
+
+        // Collect patches, B arrays, and level labels into a unified list.
+        // Each entry: (level_label, &[Patch2D], &[Vec<[f64;3]>] cfft, &[Vec<[f64;3]>] comp)
+        let n_levels = 1 + h.patches_l2plus.len(); // 1 for L1, plus however many L2+
+        let mut level_stats: Vec<LevelStats> = (0..n_levels).map(|_| LevelStats::new()).collect();
+
+        // Process L1 patches (level index 0)
+        println!("  ── Level 1 ({} patches, dx={:.2} nm) ──", h.patches.len(),
+            if !h.patches.is_empty() { h.patches[0].grid.dx * 1e9 } else { 0.0 });
 
         for (pi, patch) in h.patches.iter().enumerate() {
             let pnx = patch.grid.nx;
@@ -701,22 +757,19 @@ fn main() {
 
             let b_cfft = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
             let b_comp = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
-
-            let mut edge_se_cfft = 0.0f64;
-            let mut edge_se_comp = 0.0f64;
-            let mut n_edge = 0usize;
-            let mut n_bulk = 0usize;
+            let stats = &mut level_stats[0];
 
             for j in gj0..gj1 {
                 for i in gi0..gi1 {
                     let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
                     if !shape.contains(x, y) { continue; }
+                    stats.material_cells += 1;
 
                     let dist_to_hole = (x - hole_centre.0).hypot(y - hole_centre.1) - hole_radius;
-                    let is_edge = dist_to_hole.abs() < 4.0 * patch.grid.dx;
+                    let is_edge = dist_to_hole.abs() < edge_dist;
 
-                    let (x_corner, y_corner) = patch.cell_center_xy(i, j);
-                    let b_r = sample_bilinear(b_ref, x_corner, y_corner);
+                    let (xc, yc) = patch.cell_center_xy(i, j);
+                    let b_r = sample_bilinear(b_ref, xc, yc);
                     let idx = j * pnx + i;
 
                     let b_cf = b_cfft[idx];
@@ -726,41 +779,124 @@ fn main() {
                     let err_comp = (b_co[0]-b_r[0]).powi(2) + (b_co[1]-b_r[1]).powi(2) + (b_co[2]-b_r[2]).powi(2);
 
                     if is_edge {
-                        edge_se_cfft += err_cfft;
-                        edge_se_comp += err_comp;
-                        total_edge_se_comp_bx += (b_co[0]-b_r[0]).powi(2);
-                        total_edge_se_comp_by += (b_co[1]-b_r[1]).powi(2);
-                        total_edge_se_comp_bz += (b_co[2]-b_r[2]).powi(2);
-                        n_edge += 1;
+                        stats.edge_se_cfft += err_cfft;
+                        stats.edge_se_comp += err_comp;
+                        stats.edge_se_comp_bx += (b_co[0]-b_r[0]).powi(2);
+                        stats.edge_se_comp_by += (b_co[1]-b_r[1]).powi(2);
+                        stats.edge_se_comp_bz += (b_co[2]-b_r[2]).powi(2);
+                        stats.edge_cells += 1;
                     } else {
-                        total_bulk_se_cfft += err_cfft;
-                        total_bulk_se_comp += err_comp;
-                        n_bulk += 1;
-                    }
-
-                    if is_edge {
-                        total_edge_se_cfft += err_cfft;
-                        total_edge_se_comp += err_comp;
+                        stats.bulk_se_cfft += err_cfft;
+                        stats.bulk_se_comp += err_comp;
+                        stats.bulk_cells += 1;
                     }
                 }
             }
+        }
 
-            total_edge_cells += n_edge;
-            total_bulk_cells += n_bulk;
+        // Process L2+ patches (level indices 1, 2, ...)
+        for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+            let level_num = lvl_idx + 2;
+            println!("  ── Level {} ({} patches, dx={:.2} nm) ──", level_num, lvl_patches.len(),
+                if !lvl_patches.is_empty() { lvl_patches[0].grid.dx * 1e9 } else { 0.0 });
 
-            if n_edge > 0 {
-                let e_cfft = (edge_se_cfft / n_edge as f64).sqrt();
-                let e_comp = (edge_se_comp / n_edge as f64).sqrt();
-                println!("  Patch {:>2}: {} edge cells, {} bulk cells", pi, n_edge, n_bulk);
-                println!("    Edge:  cfft={:.4e} ({:.2}%)  comp={:.4e} ({:.2}%)",
-                    e_cfft, e_cfft / b_max_global * 100.0,
-                    e_comp, e_comp / b_max_global * 100.0);
+            let b_cfft_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+            let b_comp_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+            let stats = &mut level_stats[lvl_idx + 1];
+
+            for (pi, patch) in lvl_patches.iter().enumerate() {
+                let pnx = patch.grid.nx;
+                let gi0 = patch.interior_i0();
+                let gj0 = patch.interior_j0();
+                let gi1 = patch.interior_i1();
+                let gj1 = patch.interior_j1();
+
+                let b_cfft = if pi < b_cfft_lvl.len() { &b_cfft_lvl[pi] } else { continue };
+                let b_comp = if pi < b_comp_lvl.len() { &b_comp_lvl[pi] } else { continue };
+
+                for j in gj0..gj1 {
+                    for i in gi0..gi1 {
+                        let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                        if !shape.contains(x, y) { continue; }
+                        stats.material_cells += 1;
+
+                        let dist_to_hole = (x - hole_centre.0).hypot(y - hole_centre.1) - hole_radius;
+                        let is_edge = dist_to_hole.abs() < edge_dist;
+
+                        let (xc, yc) = patch.cell_center_xy(i, j);
+                        let b_r = sample_bilinear(b_ref, xc, yc);
+                        let idx = j * pnx + i;
+
+                        let b_cf = b_cfft[idx];
+                        let b_co = b_comp[idx];
+
+                        let err_cfft = (b_cf[0]-b_r[0]).powi(2) + (b_cf[1]-b_r[1]).powi(2) + (b_cf[2]-b_r[2]).powi(2);
+                        let err_comp = (b_co[0]-b_r[0]).powi(2) + (b_co[1]-b_r[1]).powi(2) + (b_co[2]-b_r[2]).powi(2);
+
+                        if is_edge {
+                            stats.edge_se_cfft += err_cfft;
+                            stats.edge_se_comp += err_comp;
+                            stats.edge_se_comp_bx += (b_co[0]-b_r[0]).powi(2);
+                            stats.edge_se_comp_by += (b_co[1]-b_r[1]).powi(2);
+                            stats.edge_se_comp_bz += (b_co[2]-b_r[2]).powi(2);
+                            stats.edge_cells += 1;
+                        } else {
+                            stats.bulk_se_cfft += err_cfft;
+                            stats.bulk_se_comp += err_comp;
+                            stats.bulk_cells += 1;
+                        }
+                    }
+                }
             }
         }
 
+        // Print per-level results
+        for (li, stats) in level_stats.iter().enumerate() {
+            let level_num = if li == 0 { 1 } else { li + 1 };
+            if stats.edge_cells > 0 {
+                let e_cfft = (stats.edge_se_cfft / stats.edge_cells as f64).sqrt();
+                let e_comp = (stats.edge_se_comp / stats.edge_cells as f64).sqrt();
+                let n = stats.edge_cells as f64;
+                let bx_r = (stats.edge_se_comp_bx / n).sqrt();
+                let by_r = (stats.edge_se_comp_by / n).sqrt();
+                let bz_r = (stats.edge_se_comp_bz / n).sqrt();
+                println!("  L{}: {} edge, {} bulk, {} material cells",
+                    level_num, stats.edge_cells, stats.bulk_cells, stats.material_cells);
+                println!("    Edge:  cfft={:.2}%  comp={:.2}%  (Bx={:.2}% By={:.2}% Bz={:.2}%)",
+                    e_cfft / b_max_global * 100.0,
+                    e_comp / b_max_global * 100.0,
+                    bx_r / b_max_global * 100.0,
+                    by_r / b_max_global * 100.0,
+                    bz_r / b_max_global * 100.0);
+            }
+            if stats.bulk_cells > 0 {
+                let b_cfft = (stats.bulk_se_cfft / stats.bulk_cells as f64).sqrt();
+                let b_comp = (stats.bulk_se_comp / stats.bulk_cells as f64).sqrt();
+                if stats.edge_cells == 0 {
+                    println!("  L{}: {} bulk, {} material cells (no edge cells)",
+                        level_num, stats.bulk_cells, stats.material_cells);
+                }
+                println!("    Bulk:  cfft={:.2}%  comp={:.2}%",
+                    b_cfft / b_max_global * 100.0,
+                    b_comp / b_max_global * 100.0);
+            }
+        }
+
+        // Aggregate totals across all levels
+        let total_edge_se_cfft: f64 = level_stats.iter().map(|s| s.edge_se_cfft).sum();
+        let total_edge_se_comp: f64 = level_stats.iter().map(|s| s.edge_se_comp).sum();
+        let total_bulk_se_cfft: f64 = level_stats.iter().map(|s| s.bulk_se_cfft).sum();
+        let total_bulk_se_comp: f64 = level_stats.iter().map(|s| s.bulk_se_comp).sum();
+        let total_edge_cells: usize = level_stats.iter().map(|s| s.edge_cells).sum();
+        let total_bulk_cells: usize = level_stats.iter().map(|s| s.bulk_cells).sum();
+        let total_material: usize = level_stats.iter().map(|s| s.material_cells).sum();
+        let total_edge_se_comp_bx: f64 = level_stats.iter().map(|s| s.edge_se_comp_bx).sum();
+        let total_edge_se_comp_by: f64 = level_stats.iter().map(|s| s.edge_se_comp_by).sum();
+        let total_edge_se_comp_bz: f64 = level_stats.iter().map(|s| s.edge_se_comp_bz).sum();
+
         println!();
         println!("  ────────────────────────────────────────────────────");
-        println!("  TOTALS (vs {})", label);
+        println!("  ALL-LEVEL TOTALS (vs {}) — {} material cells", label, total_material);
         println!("  ────────────────────────────────────────────────────");
 
         if total_edge_cells > 0 {
@@ -769,9 +905,9 @@ fn main() {
             let edge_rel_cfft = edge_rmse_cfft / b_max_global * 100.0;
             let edge_rel_comp = edge_rmse_comp / b_max_global * 100.0;
 
-            println!("  EDGE ({} cells near hole boundary):", total_edge_cells);
-            println!("    coarse-FFT (interpolated): {:.4e} T  ({:.2}%)", edge_rmse_cfft, edge_rel_cfft);
-            println!("    composite  (fine ∇φ):      {:.4e} T  ({:.2}%)", edge_rmse_comp, edge_rel_comp);
+            println!("  EDGE ({} cells across all levels):", total_edge_cells);
+            println!("    coarse-FFT: {:.2}%", edge_rel_cfft);
+            println!("    composite:  {:.2}%", edge_rel_comp);
 
             if edge_rmse_comp < edge_rmse_cfft {
                 println!("    → composite is {:.1}% MORE ACCURATE at edges",
@@ -781,27 +917,22 @@ fn main() {
                     (edge_rmse_comp / edge_rmse_cfft - 1.0) * 100.0);
             }
 
-            // Per-component breakdown for composite edge error
             let n = total_edge_cells as f64;
             let bx_rmse = (total_edge_se_comp_bx / n).sqrt();
             let by_rmse = (total_edge_se_comp_by / n).sqrt();
             let bz_rmse = (total_edge_se_comp_bz / n).sqrt();
-            println!();
-            println!("    Composite edge error by component:");
-            println!("      Bx: {:.4e} T ({:.2}%)", bx_rmse, bx_rmse / b_max_global * 100.0);
-            println!("      By: {:.4e} T ({:.2}%)", by_rmse, by_rmse / b_max_global * 100.0);
-            println!("      Bz: {:.4e} T ({:.2}%)", bz_rmse, bz_rmse / b_max_global * 100.0);
+            println!("    Components: Bx={:.2}% By={:.2}% Bz={:.2}%",
+                bx_rmse / b_max_global * 100.0,
+                by_rmse / b_max_global * 100.0,
+                bz_rmse / b_max_global * 100.0);
         }
 
         if total_bulk_cells > 0 {
             let bulk_rmse_cfft = (total_bulk_se_cfft / total_bulk_cells as f64).sqrt();
             let bulk_rmse_comp = (total_bulk_se_comp / total_bulk_cells as f64).sqrt();
-            println!();
-            println!("  BULK ({} cells away from boundary):", total_bulk_cells);
-            println!("    coarse-FFT (interpolated): {:.4e} T  ({:.2}%)",
-                bulk_rmse_cfft, bulk_rmse_cfft / b_max_global * 100.0);
-            println!("    composite  (fine ∇φ):      {:.4e} T  ({:.2}%)",
-                bulk_rmse_comp, bulk_rmse_comp / b_max_global * 100.0);
+            println!("  BULK ({} cells):", total_bulk_cells);
+            println!("    coarse-FFT: {:.2}%", bulk_rmse_cfft / b_max_global * 100.0);
+            println!("    composite:  {:.2}%", bulk_rmse_comp / b_max_global * 100.0);
         }
         println!();
     };
@@ -1048,26 +1179,36 @@ fn main() {
             }).collect();
             chart.draw_series(std::iter::once(PathElement::new(circle, BLACK.stroke_width(3)))).unwrap();
 
-            // L1 patches (yellow)
+            // L1 patches (yellow/orange)
             for p in h.patches.iter() {
                 let cr = &p.coarse_rect;
                 let x0 = cr.i0 as f64 * dx * 1e9 - half;
                 let y0 = cr.j0 as f64 * dy * 1e9 - half;
                 let x1 = (cr.i0 + cr.nx) as f64 * dx * 1e9 - half;
                 let y1 = (cr.j0 + cr.ny) as f64 * dy * 1e9 - half;
-                chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], RGBColor(255, 200, 0).mix(0.3).filled()))).unwrap();
+                chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], RGBColor(255, 200, 0).mix(0.25).filled()))).unwrap();
                 chart.draw_series(std::iter::once(PathElement::new(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], RGBColor(200, 150, 0).stroke_width(2)))).unwrap();
             }
-            // L2+ patches (green)
-            for lvl in h.patches_l2plus.iter() {
+            // L2+ patches with distinct colors per level
+            let level_colors: Vec<(RGBColor, RGBColor)> = vec![
+                (RGBColor(0, 160, 0), RGBColor(0, 100, 0)),       // L2: green
+                (RGBColor(0, 100, 200), RGBColor(0, 60, 150)),     // L3: blue
+                (RGBColor(180, 0, 180), RGBColor(120, 0, 120)),    // L4: purple (if needed)
+            ];
+            for (lvl_idx, lvl) in h.patches_l2plus.iter().enumerate() {
+                let (fill_c, stroke_c) = if lvl_idx < level_colors.len() {
+                    level_colors[lvl_idx]
+                } else {
+                    (RGBColor(128, 128, 128), RGBColor(80, 80, 80))
+                };
                 for p in lvl.iter() {
                     let cr = &p.coarse_rect;
                     let x0 = cr.i0 as f64 * dx * 1e9 - half;
                     let y0 = cr.j0 as f64 * dy * 1e9 - half;
                     let x1 = (cr.i0 + cr.nx) as f64 * dx * 1e9 - half;
                     let y1 = (cr.j0 + cr.ny) as f64 * dy * 1e9 - half;
-                    chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], RGBColor(0, 180, 0).mix(0.25).filled()))).unwrap();
-                    chart.draw_series(std::iter::once(PathElement::new(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], RGBColor(0, 120, 0).stroke_width(1)))).unwrap();
+                    chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], fill_c.mix(0.2).filled()))).unwrap();
+                    chart.draw_series(std::iter::once(PathElement::new(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], stroke_c.stroke_width(1)))).unwrap();
                 }
             }
             root.present().unwrap();
@@ -1135,51 +1276,100 @@ fn main() {
             }
         }
 
-        // Plot 3: Error bar chart
+        // Plot 3: Error bar chart (all levels)
         if let Some(ref b_fine_fft) = b_fine_fft_opt {
             let path = format!("{}/error_comparison.png", diag_dir);
-            let root = BitMapBackend::new(&path, (700, 500)).into_drawing_area();
+            let root = BitMapBackend::new(&path, (900, 550)).into_drawing_area();
             root.fill(&WHITE).unwrap();
             let b_max_g = b_fine_fft.data.iter()
                 .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt()).fold(0.0f64, f64::max);
-            let mut e_se_cfft = 0.0f64; let mut e_se_comp = 0.0f64;
-            let mut b_se_cfft = 0.0f64; let mut b_se_comp = 0.0f64;
-            let mut ne = 0usize; let mut nb = 0usize;
-            for (pi, patch) in h.patches.iter().enumerate() {
+
+            // Collect per-level edge/bulk RMSE
+            struct LvlErr { edge_cfft: f64, edge_comp: f64, bulk_cfft: f64, bulk_comp: f64, ne: usize, nb: usize }
+            let n_levels = 1 + h.patches_l2plus.len();
+            let mut lvl_errs: Vec<LvlErr> = (0..n_levels).map(|_| LvlErr { edge_cfft: 0.0, edge_comp: 0.0, bulk_cfft: 0.0, bulk_comp: 0.0, ne: 0, nb: 0 }).collect();
+
+            // Helper closure for a single patch
+            let measure_patch = |patch: &llg_sim::amr::patch::Patch2D, b_cfft_p: &[[f64; 3]], b_comp_p: &[[f64; 3]], lvl: &mut LvlErr| {
                 let pnx = patch.grid.nx;
                 let (gi0, gj0, gi1, gj1) = (patch.interior_i0(), patch.interior_j0(), patch.interior_i1(), patch.interior_j1());
-                let bc = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
-                let bv = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
                 for j in gj0..gj1 { for i in gi0..gi1 {
                     let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
                     if !shape.contains(x, y) { continue; }
                     let dist = (x - hole_centre.0).hypot(y - hole_centre.1) - hole_radius;
-                    let is_edge = dist.abs() < 4.0 * patch.grid.dx;
+                    let is_edge = dist.abs() < edge_dist;
                     let (xc, yc) = patch.cell_center_xy(i, j);
                     let br = sample_bilinear(b_fine_fft, xc, yc);
                     let idx = j * pnx + i;
-                    let ec = (bc[idx][0]-br[0]).powi(2)+(bc[idx][1]-br[1]).powi(2)+(bc[idx][2]-br[2]).powi(2);
-                    let ev = (bv[idx][0]-br[0]).powi(2)+(bv[idx][1]-br[1]).powi(2)+(bv[idx][2]-br[2]).powi(2);
-                    if is_edge { e_se_cfft += ec; e_se_comp += ev; ne += 1; }
-                    else { b_se_cfft += ec; b_se_comp += ev; nb += 1; }
+                    let ec = (b_cfft_p[idx][0]-br[0]).powi(2)+(b_cfft_p[idx][1]-br[1]).powi(2)+(b_cfft_p[idx][2]-br[2]).powi(2);
+                    let ev = (b_comp_p[idx][0]-br[0]).powi(2)+(b_comp_p[idx][1]-br[1]).powi(2)+(b_comp_p[idx][2]-br[2]).powi(2);
+                    if is_edge { lvl.edge_cfft += ec; lvl.edge_comp += ev; lvl.ne += 1; }
+                    else { lvl.bulk_cfft += ec; lvl.bulk_comp += ev; lvl.nb += 1; }
                 }}
+            };
+
+            // L1
+            for (pi, patch) in h.patches.iter().enumerate() {
+                if pi < b_l1_cfft.len() && pi < b_l1_comp.len() {
+                    measure_patch(patch, &b_l1_cfft[pi], &b_l1_comp[pi], &mut lvl_errs[0]);
+                }
             }
-            let ep_c = if ne > 0 { (e_se_cfft/ne as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
-            let ep_v = if ne > 0 { (e_se_comp/ne as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
-            let bp_c = if nb > 0 { (b_se_cfft/nb as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
-            let bp_v = if nb > 0 { (b_se_comp/nb as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
-            let m = [ep_c, ep_v, bp_c, bp_v].iter().cloned().fold(0.0f64, f64::max) * 1.3;
+            // L2+
+            for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+                let bc_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+                let bv_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+                for (pi, patch) in lvl_patches.iter().enumerate() {
+                    if pi < bc_lvl.len() && pi < bv_lvl.len() {
+                        measure_patch(patch, &bc_lvl[pi], &bv_lvl[pi], &mut lvl_errs[lvl_idx + 1]);
+                    }
+                }
+            }
+
+            // Build per-level bar data
+            let mut bars: Vec<(String, f64, f64, f64, f64)> = Vec::new(); // (label, edge_cfft%, edge_comp%, bulk_cfft%, bulk_comp%)
+            for (li, le) in lvl_errs.iter().enumerate() {
+                let lnum = if li == 0 { 1 } else { li + 1 };
+                let ep_c = if le.ne > 0 { (le.edge_cfft/le.ne as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                let ep_v = if le.ne > 0 { (le.edge_comp/le.ne as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                let bp_c = if le.nb > 0 { (le.bulk_cfft/le.nb as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                let bp_v = if le.nb > 0 { (le.bulk_comp/le.nb as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                if le.ne > 0 || le.nb > 0 {
+                    bars.push((format!("L{}", lnum), ep_c, ep_v, bp_c, bp_v));
+                }
+            }
+
+            let m = bars.iter().flat_map(|b| vec![b.1, b.2, b.3, b.4]).fold(0.0f64, f64::max) * 1.3;
+            let x_max = (bars.len() as f64) * 4.0 + 1.0;
+
             let mut chart = ChartBuilder::on(&root)
-                .caption("Patch-Level RMSE (% of max|B|) vs Newell FFT", ("sans-serif", 18))
+                .caption("Per-Level RMSE (% of max|B|) vs Newell FFT", ("sans-serif", 18))
                 .margin(15).x_label_area_size(45).y_label_area_size(55)
-                .build_cartesian_2d(0.0f64..7.0f64, 0.0..m.max(1.0)).unwrap();
-            chart.configure_mesh().y_desc("RMSE (%)").x_desc("Edge                              Bulk").disable_x_mesh().draw().unwrap();
-            chart.draw_series(std::iter::once(Rectangle::new([(0.5, 0.0), (1.5, ep_c)], GREEN.filled()))).unwrap()
-                .label(format!("coarse-FFT ({:.1}% / {:.1}%)", ep_c, bp_c));
-            chart.draw_series(std::iter::once(Rectangle::new([(1.8, 0.0), (2.8, ep_v)], RED.filled()))).unwrap()
-                .label(format!("composite ({:.1}% / {:.1}%)", ep_v, bp_v));
-            chart.draw_series(std::iter::once(Rectangle::new([(4.0, 0.0), (5.0, bp_c)], GREEN.filled()))).unwrap();
-            chart.draw_series(std::iter::once(Rectangle::new([(5.3, 0.0), (6.3, bp_v)], RED.filled()))).unwrap();
+                .build_cartesian_2d(0.0f64..x_max, 0.0..m.max(1.0)).unwrap();
+            chart.configure_mesh().y_desc("RMSE (%)").disable_x_mesh().draw().unwrap();
+
+            for (bi, (label, ep_c, ep_v, bp_c, bp_v)) in bars.iter().enumerate() {
+                let x0 = bi as f64 * 4.0 + 0.5;
+                // Edge bars
+                chart.draw_series(std::iter::once(Rectangle::new([(x0, 0.0), (x0+0.7, *ep_c)], GREEN.filled()))).unwrap();
+                chart.draw_series(std::iter::once(Rectangle::new([(x0+0.8, 0.0), (x0+1.5, *ep_v)], RED.filled()))).unwrap();
+                // Bulk bars
+                chart.draw_series(std::iter::once(Rectangle::new([(x0+1.8, 0.0), (x0+2.5, *bp_c)], GREEN.mix(0.5).filled()))).unwrap();
+                chart.draw_series(std::iter::once(Rectangle::new([(x0+2.6, 0.0), (x0+3.3, *bp_v)], RED.mix(0.5).filled()))).unwrap();
+                // Label
+                chart.draw_series(std::iter::once(plotters::element::Text::new(
+                    format!("{} edge", label), (x0+0.3, -m*0.03), ("sans-serif", 11),
+                ))).ok();
+            }
+
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], GREEN.filled()))).unwrap()
+                .label("coarse-FFT edge").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], GREEN.filled()));
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], RED.filled()))).unwrap()
+                .label("composite edge").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], RED.filled()));
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], GREEN.mix(0.5).filled()))).unwrap()
+                .label("coarse-FFT bulk").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], GREEN.mix(0.5).filled()));
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], RED.mix(0.5).filled()))).unwrap()
+                .label("composite bulk").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], RED.mix(0.5).filled()));
+
             chart.configure_series_labels().background_style(WHITE.mix(0.8)).border_style(BLACK)
                 .position(SeriesLabelPosition::UpperRight).draw().unwrap();
             root.present().unwrap();
