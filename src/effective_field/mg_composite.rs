@@ -693,7 +693,7 @@ fn build_parent_index_maps(h: &AmrHierarchy2D) -> Vec<Vec<usize>> {
 pub(crate) fn extract_b_from_patch_phi(
     patch: &Patch2D,
     patch_phi: &[f64],
-    b_coarse: &VectorField2D,  // for Bz interpolation
+    b_coarse: &VectorField2D,  // for Bz interpolation and fallback
 ) -> Vec<[f64; 3]> {
     let pnx = patch.grid.nx;
     let pny = patch.grid.ny;
@@ -701,6 +701,13 @@ pub(crate) fn extract_b_from_patch_phi(
     let dy = patch.grid.dy;
     let inv_2dx = 1.0 / (2.0 * dx);
     let inv_2dy = 1.0 / (2.0 * dy);
+    let inv_dx = 1.0 / dx;
+    let inv_dy = 1.0 / dy;
+
+    // Geometry mask: true = material, false = vacuum.
+    // When available, use one-sided differences at material/vacuum boundaries
+    // to avoid contamination from poorly-resolved vacuum φ values.
+    let gm = patch.geom_mask_fine();
 
     let mut b = vec![[0.0f64; 3]; pnx * pny];
 
@@ -708,36 +715,53 @@ pub(crate) fn extract_b_from_patch_phi(
         for i in 0..pnx {
             let idx = j * pnx + i;
 
-            // Bx, By from fine φ gradient (central differences).
-            // At boundaries (i=0 or i=pnx-1), use one-sided differences.
-            let bx = if i > 0 && i + 1 < pnx {
-                // Central difference.
+            // For vacuum cells, use coarse-interpolated B entirely.
+            if let Some(mask) = gm {
+                if !mask[idx] {
+                    let (x, y) = patch.cell_center_xy(i, j);
+                    b[idx] = sample_bilinear(b_coarse, x, y);
+                    continue;
+                }
+            }
+
+            // Material cell: geometry-aware gradient.
+            // Check which neighbours are material (or treat all as material if no mask).
+            let xp_ok = i + 1 < pnx && gm.map_or(true, |m| m[j * pnx + (i + 1)]);
+            let xm_ok = i > 0       && gm.map_or(true, |m| m[j * pnx + (i - 1)]);
+            let yp_ok = j + 1 < pny && gm.map_or(true, |m| m[(j + 1) * pnx + i]);
+            let ym_ok = j > 0       && gm.map_or(true, |m| m[(j - 1) * pnx + i]);
+
+            // Bx: choose stencil based on which x-neighbours are material.
+            let bx = if xp_ok && xm_ok {
+                // Both neighbours material → central difference.
                 -MU0 * (patch_phi[j * pnx + (i + 1)] - patch_phi[j * pnx + (i - 1)]) * inv_2dx
-            } else if i + 1 < pnx {
-                // Forward difference at left boundary.
-                -MU0 * (patch_phi[j * pnx + (i + 1)] - patch_phi[idx]) / dx
-            } else if i > 0 {
-                // Backward difference at right boundary.
-                -MU0 * (patch_phi[idx] - patch_phi[j * pnx + (i - 1)]) / dx
+            } else if xm_ok && !xp_ok {
+                // +x is vacuum → backward difference (away from vacuum).
+                -MU0 * (patch_phi[idx] - patch_phi[j * pnx + (i - 1)]) * inv_dx
+            } else if xp_ok && !xm_ok {
+                // -x is vacuum → forward difference (away from vacuum).
+                -MU0 * (patch_phi[j * pnx + (i + 1)] - patch_phi[idx]) * inv_dx
             } else {
-                0.0
+                // Both neighbours vacuum or at grid edge → use coarse B.
+                let (x, y) = patch.cell_center_xy(i, j);
+                sample_bilinear(b_coarse, x, y)[0]
             };
 
-            let by = if j > 0 && j + 1 < pny {
+            // By: same logic for y-direction.
+            let by = if yp_ok && ym_ok {
                 -MU0 * (patch_phi[(j + 1) * pnx + i] - patch_phi[(j - 1) * pnx + i]) * inv_2dy
-            } else if j + 1 < pny {
-                -MU0 * (patch_phi[(j + 1) * pnx + i] - patch_phi[idx]) / dy
-            } else if j > 0 {
-                -MU0 * (patch_phi[idx] - patch_phi[(j - 1) * pnx + i]) / dy
+            } else if ym_ok && !yp_ok {
+                -MU0 * (patch_phi[idx] - patch_phi[(j - 1) * pnx + i]) * inv_dy
+            } else if yp_ok && !ym_ok {
+                -MU0 * (patch_phi[(j + 1) * pnx + i] - patch_phi[idx]) * inv_dy
             } else {
-                0.0
+                let (x, y) = patch.cell_center_xy(i, j);
+                sample_bilinear(b_coarse, x, y)[1]
             };
 
             // Bz from coarse solution (interpolated).
-            // The 3D L0 solve captures z-surface charges and z-gradient of φ.
             let (x, y) = patch.cell_center_xy(i, j);
-            let b_coarse_val = sample_bilinear(b_coarse, x, y);
-            let bz = b_coarse_val[2];
+            let bz = sample_bilinear(b_coarse, x, y)[2];
 
             b[idx] = [bx, by, bz];
         }
@@ -877,6 +901,7 @@ fn sample_coarse_to_patch(b_coarse: &VectorField2D, patch: &Patch2D) -> Vec<[f64
 /// with the area-average of the patch's fine ∇·(Ms·m) (stored in pd.rhs).
 /// This builds the "composite level" divergence that the next finer level
 /// computes its defect against.
+#[allow(dead_code)]
 fn update_composite_div(
     composite_div: &mut [f64],
     patches: &[Patch2D],
@@ -909,6 +934,7 @@ fn update_composite_div(
 /// the area-average of the patch's fine B (the full corrected B, not just δB).
 /// This builds the "composite level" B field that the next finer level
 /// interpolates from when computing B_patch = interp(composite_B) + δB.
+#[allow(dead_code)]
 fn update_composite_b(
     composite_b_data: &mut [[f64; 3]],
     patches: &[Patch2D],
@@ -977,6 +1003,7 @@ fn update_composite_b(
 /// The defect RHS is HIGH-FREQUENCY (fine detail the parent grid missed).
 /// For high-k modes, 2D and 3D Green's functions agree, so the 2D Laplacian
 /// is correct for the defect even though it's wrong for the full equation.
+#[allow(dead_code)]
 fn compute_defect_correction_on_patch(
     patch: &Patch2D,
     pd: &mut PatchPoissonData,
@@ -1143,10 +1170,16 @@ impl Default for CompositeVCycleConfig {
     fn default() -> Self {
         let max_cycles: usize = std::env::var("LLG_COMPOSITE_MAX_CYCLES")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+        let n_pre: usize = std::env::var("LLG_COMPOSITE_N_PRE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let n_post: usize = std::env::var("LLG_COMPOSITE_N_POST")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let omega: f64 = std::env::var("LLG_COMPOSITE_OMEGA")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0 / 3.0);
         Self {
-            n_pre: 3,
-            n_post: 3,
-            omega: 2.0 / 3.0,
+            n_pre,
+            n_post,
+            omega,
             max_cycles,
         }
     }
@@ -1545,8 +1578,8 @@ impl CompositeGridPoisson {
         if composite_diag() {
             let n_l2plus: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
             eprintln!("[composite VCYCLE] ═══════════════════════════════════════════════════");
-            eprintln!("[composite VCYCLE] Iterative V-cycle: L1={}, L2+={}, max_cycles={}",
-                n_l1, n_l2plus, max_cycles);
+            eprintln!("[composite VCYCLE] Iterative V-cycle: L1={}, L2+={}, max_cycles={}, n_pre={}, n_post={}",
+                n_l1, n_l2plus, max_cycles, self.vcfg.n_pre, self.vcfg.n_post);
         }
 
         for cycle in 0..max_cycles {
