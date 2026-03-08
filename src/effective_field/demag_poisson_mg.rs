@@ -2008,12 +2008,6 @@ impl DemagPoissonMG {
         (self.px, self.py, self.pz)
     }
 
-    /// Offsets from padded-box origin to magnet-layer origin.
-    #[allow(dead_code)]
-    pub(crate) fn magnet_offsets(&self) -> (usize, usize, usize) {
-        (self.offx, self.offy, self.offz)
-    }
-
     /// Read-only access to finest-level φ.
     #[allow(dead_code)]
     pub(crate) fn finest_phi(&self) -> &[f64] {
@@ -2170,6 +2164,320 @@ impl DemagPoissonMG {
         b_out.set_uniform(0.0, 0.0, 0.0);
         self.add_b_from_phi_on_magnet_layer_all(b_out);
     }
+
+    // =====================================================================
+    // Patch miniCycle support (Phase B)
+    //
+    // These methods allow mg_composite.rs to construct lightweight MG
+    // solvers for AMR patches and run internal V-cycles ("miniCycles")
+    // as the smoothing step in the outer composite V-cycle.
+    // =====================================================================
+
+    /// Create a solver configured for use as a patch miniCycle.
+    ///
+    /// Uses DirichletZero BCs (no treecode, no dipole — parent-level
+    /// Dirichlet values are stamped into bc_phi externally).
+    /// No PPPM/ΔK (fine-resolution MG discretisation error is O(dx²),
+    /// small enough at patch resolution).
+    ///
+    /// Smoother, stencil, and coarse-operator settings are inherited
+    /// from env vars so that the patch operator is identical to L0's.
+    pub(crate) fn new_for_patch(
+        interior_nx: usize,
+        interior_ny: usize,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        pad_xy: usize,
+        n_vac_z: usize,
+    ) -> Self {
+        let grid = Grid2D::new(interior_nx, interior_ny, dx, dy, dz);
+        let mut cfg = DemagPoissonMGConfig::from_env();
+        // Override patch-specific settings.
+        cfg.pad_xy = pad_xy;
+        cfg.n_vac_z = n_vac_z;
+        cfg.bc = BoundaryCondition::DirichletZero;
+        cfg.warm_start = true; // reuse φ between outer V-cycle iterations
+        cfg.v_cycles = 1;
+        cfg.tol_abs = None;
+        cfg.tol_rel = None;
+
+        // Force 7-point stencil for patch solvers.
+        // The iso27 stencil has cross-derivative terms that make the
+        // weighted-Jacobi smoother unstable at high cell aspect ratios
+        // (e.g. dx=0.49nm, dz=3nm → ratio 6:1 at L3). The 7-point
+        // stencil is unconditionally stable with weighted Jacobi at
+        // any aspect ratio.
+        //
+        // This means patches use a different stencil than L0 (which
+        // uses iso27). The difference is O(h²) — negligible at fine
+        // resolution. The residual is computed with the correct stencil
+        // via compute_residual_magnet_layer().
+        let op = MGOperatorSettings {
+            stencil: LaplacianStencilKind::SevenPoint,
+            prolong: ProlongationKind::Trilinear,
+            coarse_op: CoarseOpKind::Galerkin,
+            iso27_alpha_bits: 0,
+        };
+        Self::new_with_operator(grid, cfg, op)
+    }
+
+    /// Run `n_vcycles` internal V-cycles on the current state.
+    ///
+    /// The caller is responsible for:
+    ///   1. Loading rhs into `self.rhs_3d_mut()` (via `build_rhs_from_m`
+    ///      or `build_rhs_from_m_raw`)
+    ///   2. Loading parent-derived Dirichlet BCs into `self.bc_phi_mut()`
+    ///   3. Loading warm-start φ into `self.phi_3d_mut()` (if desired)
+    ///
+    /// This method then enforces Dirichlet and runs the requested number
+    /// of standard geometric-MG V-cycles.
+    pub(crate) fn mini_solve(&mut self, n_vcycles: usize) {
+        // Zero coarser MG levels to prevent stale data when the solver is
+        // shared across patches via PatchMGCache. In the MG correction scheme,
+        // coarser levels represent the correction δφ and must start from zero.
+        // (The L0 solver doesn't need this because it always solves the same
+        // problem, so coarser-level warm-start is valid. Shared patch solvers
+        // switch between different patches with different BCs, making the
+        // coarser-level phi from a previous patch a wrong initial guess that
+        // causes divergence.)
+        for l in 1..self.levels.len() {
+            self.levels[l].phi.fill(0.0);
+        }
+        self.levels[0].enforce_dirichlet();
+        for _ in 0..n_vcycles {
+            self.v_cycle(0);
+        }
+    }
+
+    /// Compute residual r = rhs - L(φ) on the finest level using the
+    /// CORRECT stencil (iso27/7pt/iso9, matching the solve operator),
+    /// then extract the magnet-layer (k = offz) slice as a flat 2D array.
+    ///
+    /// Returns a Vec<f64> of length `grid.nx * grid.ny`.
+    ///
+    /// This must be used instead of a hand-rolled 7-point residual
+    /// because the solver may use iso27 or iso9 stencils. Computing
+    /// the residual with a different operator gives a large spurious
+    /// residual even when the solve has converged.
+    pub(crate) fn compute_residual_magnet_layer(&mut self) -> Vec<f64> {
+        Self::compute_residual(&mut self.levels[0]);
+
+        let nx_m = self.grid.nx;
+        let ny_m = self.grid.ny;
+        let px = self.px;
+        let py = self.py;
+        let offx = self.offx;
+        let offy = self.offy;
+        let offz = self.offz;
+        let res = &self.levels[0].res;
+
+        let mut res_2d = vec![0.0f64; nx_m * ny_m];
+        for mj in 0..ny_m {
+            for mi in 0..nx_m {
+                res_2d[mj * nx_m + mi] = res[idx3(offx + mi, offy + mj, offz, px, py)];
+            }
+        }
+        res_2d
+    }
+
+    /// Build 3D RHS from a raw magnetisation data slice.
+    ///
+    /// `m_data` must contain `nx_m * ny_m` entries in row-major order
+    /// (interior cells only, no ghost cells). Each entry is `[mx, my, mz]`
+    /// (unit magnetisation, NOT scaled by Ms — scaling is applied here).
+    ///
+    /// The RHS includes:
+    ///   - ∇·(Ms·m) at the magnet layer (k = offz) using face-averaged
+    ///     divergence with correct material/vacuum interface handling
+    ///   - z-surface charges in the vacuum cells at k = offz ± 1
+    ///   - Zero everywhere else
+    ///
+    /// This is identical to `build_rhs_from_m` but takes a raw slice
+    /// instead of a `VectorField2D`, enabling use from mg_composite.rs
+    /// without constructing a temporary VectorField2D.
+    pub(crate) fn build_rhs_from_m_raw(
+        &mut self,
+        m_data: &[[f64; 3]],
+        ms: f64,
+    ) {
+        let nx_m = self.grid.nx;
+        let ny_m = self.grid.ny;
+        debug_assert_eq!(
+            m_data.len(),
+            nx_m * ny_m,
+            "build_rhs_from_m_raw: expected {} entries, got {}",
+            nx_m * ny_m,
+            m_data.len()
+        );
+
+        let finest = &mut self.levels[0];
+        finest.rhs.fill(0.0);
+
+        let nx = finest.nx;
+        let ny = finest.ny;
+        let nz = finest.nz;
+        let dx = finest.dx;
+        let dy = finest.dy;
+        let dz = finest.dz;
+
+        let offx = self.offx;
+        let offy = self.offy;
+        let offz = self.offz;
+        let px = self.px;
+        let py = self.py;
+        let pz = self.pz;
+
+        // --- Helpers (identical to build_rhs_from_m) ---
+
+        #[inline]
+        fn m_at(
+            pi: isize, pj: isize, pk: isize,
+            px: usize, py: usize, pz: usize,
+            offx: usize, offy: usize, offz: usize,
+            nx_m: usize, ny_m: usize,
+            mdata: &[[f64; 3]], ms: f64,
+        ) -> (bool, [f64; 3]) {
+            if pi < 0 || pj < 0 || pk < 0 {
+                return (false, [0.0; 3]);
+            }
+            let (piu, pju, pku) = (pi as usize, pj as usize, pk as usize);
+            if piu >= px || pju >= py || pku >= pz {
+                return (false, [0.0; 3]);
+            }
+            if pku != offz {
+                return (false, [0.0; 3]);
+            }
+            if piu < offx || piu >= offx + nx_m || pju < offy || pju >= offy + ny_m {
+                return (false, [0.0; 3]);
+            }
+            let mi = piu - offx;
+            let mj = pju - offy;
+            let id = mj * nx_m + mi;
+            let v = mdata[id];
+            let n2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            if n2 < 1e-30 {
+                return (false, [0.0; 3]);
+            }
+            (true, [ms * v[0], ms * v[1], ms * v[2]])
+        }
+
+        #[inline]
+        fn face_val(in_a: bool, a: f64, in_b: bool, b: f64) -> f64 {
+            match (in_a, in_b) {
+                (true, true) => 0.5 * (a + b),
+                (true, false) => a,
+                (false, true) => b,
+                (false, false) => 0.0,
+            }
+        }
+
+        let rhs = &mut finest.rhs;
+
+        rhs.par_chunks_mut(nx)
+            .enumerate()
+            .for_each(|(row_idx, rhs_row)| {
+                let k = row_idx / ny;
+                let j = row_idx % ny;
+
+                if k == 0 || k + 1 == nz || j == 0 || j + 1 == ny {
+                    return;
+                }
+
+                let pj = j as isize;
+                let pk = k as isize;
+
+                for i in 1..(nx - 1) {
+                    let pi = i as isize;
+
+                    let (c_in, m_c) = m_at(
+                        pi, pj, pk, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+                    let (xp_in, m_xp) = m_at(
+                        pi + 1, pj, pk, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+                    let (xm_in, m_xm) = m_at(
+                        pi - 1, pj, pk, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+                    let (yp_in, m_yp) = m_at(
+                        pi, pj + 1, pk, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+                    let (ym_in, m_ym) = m_at(
+                        pi, pj - 1, pk, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+                    let (zp_in, m_zp) = m_at(
+                        pi, pj, pk + 1, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+                    let (zm_in, m_zm) = m_at(
+                        pi, pj, pk - 1, px, py, pz, offx, offy, offz,
+                        nx_m, ny_m, m_data, ms,
+                    );
+
+                    let mx_p = face_val(c_in, m_c[0], xp_in, m_xp[0]);
+                    let mx_m = face_val(xm_in, m_xm[0], c_in, m_c[0]);
+
+                    let my_p = face_val(c_in, m_c[1], yp_in, m_yp[1]);
+                    let my_m = face_val(ym_in, m_ym[1], c_in, m_c[1]);
+
+                    let mz_p = face_val(c_in, m_c[2], zp_in, m_zp[2]);
+                    let mz_m = face_val(zm_in, m_zm[2], c_in, m_c[2]);
+
+                    rhs_row[i] = (mx_p - mx_m) / dx
+                        + (my_p - my_m) / dy
+                        + (mz_p - mz_m) / dz;
+                }
+            });
+    }
+
+    // ── 3D field accessors for patch miniCycle ──
+
+    /// Read-only access to the finest-level 3D φ field.
+    pub(crate) fn phi_3d(&self) -> &[f64] {
+        &self.levels[0].phi
+    }
+
+    /// Mutable access to the finest-level 3D φ field.
+    pub(crate) fn phi_3d_mut(&mut self) -> &mut [f64] {
+        &mut self.levels[0].phi
+    }
+
+    /// Read-only access to the finest-level 3D RHS field.
+    pub(crate) fn rhs_3d(&self) -> &[f64] {
+        &self.levels[0].rhs
+    }
+
+    /// Mutable access to the finest-level 3D RHS field.
+    #[allow(dead_code)]
+    pub(crate) fn rhs_3d_mut(&mut self) -> &mut [f64] {
+        &mut self.levels[0].rhs
+    }
+
+    /// Mutable access to the finest-level 3D boundary-condition φ field.
+    pub(crate) fn bc_phi_mut(&mut self) -> &mut [f64] {
+        &mut self.levels[0].bc_phi
+    }
+
+    /// Offsets from padded-box origin to the interior magnet region.
+    pub(crate) fn offsets(&self) -> (usize, usize, usize) {
+        (self.offx, self.offy, self.offz)
+    }
+
+    /// Cell spacings on the finest MG level.
+    pub(crate) fn cell_spacings(&self) -> (f64, f64, f64) {
+        (self.levels[0].dx, self.levels[0].dy, self.levels[0].dz)
+    }
+
+    /// Interior (magnet region) dimensions.
+    pub(crate) fn interior_dims(&self) -> (usize, usize) {
+        (self.grid.nx, self.grid.ny)
+    }
+
 }
 
 // ---------------------------

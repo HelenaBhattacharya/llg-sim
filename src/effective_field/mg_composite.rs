@@ -24,11 +24,13 @@ use crate::params::{MU0, Material};
 use crate::vector_field::VectorField2D;
 
 use super::demag_poisson_mg::{
-    DemagPoissonMGConfig, DemagPoissonMGHybrid, HybridConfig,
+    DemagPoissonMG, DemagPoissonMGConfig,
+    DemagPoissonMGHybrid, HybridConfig,
 };
 use super::mg_kernels;
 
 use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Patch-level Poisson data (Phase 1 of composite V-cycle)
@@ -534,6 +536,737 @@ fn fill_phi_ghosts_from_parent_patch(
     }
 }
 
+// Phase B: 3D Patch MiniCycle Infrastructure
+//
+// These types enable per-patch 3D MG V-cycles ("miniCycles") as the
+// smoothing step in the outer composite V-cycle. Each patch gets a small
+// 3D padded box with the SAME operator (stencil, coarsening) as L0,
+// ensuring operator consistency and enabling convergent iteration.
+// =========================================================================
+
+/// Default lateral padding for patch 3D boxes.
+///
+/// Smaller than L0's pad_xy=6 because the far-field is captured by L0;
+/// patches only need a few ghost cells for the parent-Dirichlet BCs.
+const PATCH_PAD_XY: usize = 2;
+
+// ---------------------------------------------------------------------------
+// PatchPoisson3D: per-patch 3D scalar-field storage
+// ---------------------------------------------------------------------------
+
+/// Per-patch 3D scalar-field storage for the composite V-cycle with miniCycle.
+///
+/// Each AMR patch is embedded in a small 3D padded box with the same
+/// z-structure as L0 (n_vac_z vacuum layers above and below the magnet
+/// layer). The φ field lives on this 3D box and persists between outer
+/// V-cycle iterations for warm start.
+pub(crate) struct PatchPoisson3D {
+    /// 3D scalar potential on the padded grid (px * py * pz).
+    /// Persists between outer V-cycle iterations (warm start).
+    pub phi: Vec<f64>,
+
+    /// Padded box dimensions.
+    pub px: usize,
+    pub py: usize,
+    pub pz: usize,
+
+    /// Offsets from padded-box origin to interior magnet region.
+    pub offx: usize,
+    pub offy: usize,
+    pub offz: usize,
+
+    /// Interior (magnet-region) dimensions at this patch's resolution.
+    pub int_nx: usize,
+    pub int_ny: usize,
+
+    /// Cell spacings (dx, dy at patch resolution; dz global).
+    pub dx: f64,
+    pub dy: f64,
+    pub dz: f64,
+
+    /// Cache key for looking up the shared solver in PatchMGCache.
+    /// (int_nx, int_ny, dx_bits, dy_bits)
+    pub solver_key: (usize, usize, u64, u64),
+}
+
+impl PatchPoisson3D {
+    /// Create 3D storage for a patch, using the given padded-box geometry.
+    ///
+    /// The padded-box dimensions are obtained from a DemagPoissonMG solver
+    /// configured for this patch's interior size and resolution.
+    pub fn new(
+        patch: &Patch2D,
+        solver: &DemagPoissonMG,
+    ) -> Self {
+        let (px, py, pz) = solver.padded_dims();
+        let (offx, offy, offz) = solver.offsets();
+        let int_nx = patch.interior_nx;
+        let int_ny = patch.interior_ny;
+        let dx = patch.grid.dx;
+        let dy = patch.grid.dy;
+        let dz = patch.grid.dz;
+        let n = px * py * pz;
+        Self {
+            phi: vec![0.0; n],
+            px, py, pz,
+            offx, offy, offz,
+            int_nx, int_ny,
+            dx, dy, dz,
+            solver_key: (int_nx, int_ny, dx.to_bits(), dy.to_bits()),
+        }
+    }
+
+    /// Total cell count in the 3D padded box.
+    #[allow(dead_code)]
+    pub fn total_cells(&self) -> usize {
+        self.px * self.py * self.pz
+    }
+
+    /// Extract magnet-layer φ as a flat 2D array (int_nx × int_ny).
+    /// Used for restriction to parent (extract 2D slice, then area-average).
+    #[allow(dead_code)]
+    pub fn extract_magnet_layer_phi(&self) -> Vec<f64> {
+        let mut phi2d = vec![0.0f64; self.int_nx * self.int_ny];
+        for mj in 0..self.int_ny {
+            for mi in 0..self.int_nx {
+                let pi = self.offx + mi;
+                let pj = self.offy + mj;
+                phi2d[mj * self.int_nx + mi] =
+                    self.phi[mg_kernels::idx3(pi, pj, self.offz, self.px, self.py)];
+            }
+        }
+        phi2d
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PatchMGCache: shared solver instances keyed by patch size + resolution
+// ---------------------------------------------------------------------------
+
+/// Cache of DemagPoissonMG instances configured for patch miniCycles.
+///
+/// Patches of the same interior size and cell spacing share a single
+/// solver instance (stencils, MG hierarchy, scratch arrays). The field
+/// data (φ, rhs) is loaded from PatchPoisson3D before each miniCycle
+/// and copied back afterward.
+pub(crate) struct PatchMGCache {
+    solvers: HashMap<(usize, usize, u64, u64), DemagPoissonMG>,
+    n_vac_z: usize,
+    pad_xy: usize,
+    dz: f64,
+}
+
+impl PatchMGCache {
+    /// Create a new cache.
+    ///
+    /// `n_vac_z`: vacuum padding in z (same as L0, typically 16).
+    /// `dz`: z cell spacing (global, same at all AMR levels).
+    pub fn new(n_vac_z: usize, dz: f64) -> Self {
+        Self {
+            solvers: HashMap::new(),
+            n_vac_z,
+            pad_xy: PATCH_PAD_XY,
+            dz,
+        }
+    }
+
+    /// Get or create a solver for the given patch interior size and resolution.
+    ///
+    /// Returns a mutable reference to the shared solver. The caller loads
+    /// φ/rhs/bc_phi into the solver, runs the miniCycle, then copies φ back.
+    pub fn get_or_create(
+        &mut self,
+        int_nx: usize,
+        int_ny: usize,
+        dx: f64,
+        dy: f64,
+    ) -> &mut DemagPoissonMG {
+        let key = (int_nx, int_ny, dx.to_bits(), dy.to_bits());
+        self.solvers.entry(key).or_insert_with(|| {
+            let solver = DemagPoissonMG::new_for_patch(
+                int_nx, int_ny, dx, dy, self.dz, self.pad_xy, self.n_vac_z,
+            );
+            let (px, py, pz) = solver.padded_dims();
+            eprintln!(
+                "[composite Phase B] Created PatchMGSolver for {}×{} interior \
+                 (dx={:.3e}, dy={:.3e}) → padded {}×{}×{} ({} cells)",
+                int_nx, int_ny, dx, dy, px, py, pz, px * py * pz,
+            );
+            solver
+        })
+    }
+
+    /// Create PatchPoisson3D storage for a patch, using a solver from the cache.
+    pub fn create_patch_data(
+        &mut self,
+        patch: &Patch2D,
+    ) -> PatchPoisson3D {
+        let int_nx = patch.interior_nx;
+        let int_ny = patch.interior_ny;
+        let dx = patch.grid.dx;
+        let dy = patch.grid.dy;
+        let solver = self.get_or_create(int_nx, int_ny, dx, dy);
+        PatchPoisson3D::new(patch, solver)
+    }
+
+    /// Number of unique solver instances (for diagnostics).
+    #[allow(dead_code)]
+    pub fn solver_count(&self) -> usize {
+        self.solvers.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3D ghost-fill: lateral BC from parent's 3D φ
+// ---------------------------------------------------------------------------
+
+/// Bilinearly interpolate a value from a 3D padded-box φ field at a given
+/// physical (x, y) position and z-index k.
+///
+/// `parent_phi`: full 3D array (parent_px * parent_py * parent_pz).
+/// `parent_dx/dy`: cell spacings of the parent grid.
+/// `parent_offx/offy`: offset from padded-box origin to parent interior.
+///
+/// The mapping assumes the parent's interior cell (mi, mj) is at physical
+/// position x = (mi + 0.5) * parent_dx, consistent with corner-origin
+/// coordinates used throughout the codebase.
+fn sample_bilinear_3d_at_k(
+    parent_phi: &[f64],
+    parent_px: usize,
+    parent_py: usize,
+    parent_offx: usize,
+    parent_offy: usize,
+    parent_dx: f64,
+    parent_dy: f64,
+    k: usize,
+    x: f64,
+    y: f64,
+) -> f64 {
+    // Map physical coords to fractional padded-box indices.
+    // Interior cell mi at physical x = (mi+0.5)*dx.
+    // Padded-box index of interior cell mi = offx + mi.
+    // So: padded index = x/dx - 0.5 + offx.
+    let fx = x / parent_dx - 0.5 + parent_offx as f64;
+    let fy = y / parent_dy - 0.5 + parent_offy as f64;
+
+    let i0f = fx.floor();
+    let j0f = fy.floor();
+    let tx = fx - i0f;
+    let ty = fy - j0f;
+
+    let clamp = |v: isize, n: usize| -> usize {
+        if v <= 0 {
+            0
+        } else if v >= n as isize - 1 {
+            n - 1
+        } else {
+            v as usize
+        }
+    };
+
+    let i0 = clamp(i0f as isize, parent_px);
+    let j0 = clamp(j0f as isize, parent_py);
+    let i1 = clamp(i0f as isize + 1, parent_px);
+    let j1 = clamp(j0f as isize + 1, parent_py);
+
+    let v00 = parent_phi[mg_kernels::idx3(i0, j0, k, parent_px, parent_py)];
+    let v10 = parent_phi[mg_kernels::idx3(i1, j0, k, parent_px, parent_py)];
+    let v01 = parent_phi[mg_kernels::idx3(i0, j1, k, parent_px, parent_py)];
+    let v11 = parent_phi[mg_kernels::idx3(i1, j1, k, parent_px, parent_py)];
+
+    let v0 = v00 * (1.0 - tx) + v10 * tx;
+    let v1 = v01 * (1.0 - tx) + v11 * tx;
+    v0 * (1.0 - ty) + v1 * ty
+}
+
+/// Fill the bc_phi array for a patch's 3D solver from a parent's 3D φ field.
+///
+/// Lateral faces (x and y boundaries of the padded box) are filled by
+/// bilinear interpolation from the parent φ at each z-level.
+/// Z-faces (k=0, k=pz-1) are left at zero (DirichletZero).
+///
+/// This is called before each miniCycle to set the boundary conditions
+/// that couple the patch to the parent level.
+///
+/// # Arguments
+/// * `patch` - The AMR patch (for physical coordinate mapping).
+/// * `pd3d` - The patch's 3D data (for padded-box geometry).
+/// * `solver_bc_phi` - The solver's bc_phi array to fill (px*py*pz).
+/// * `parent_phi` - Parent's full 3D φ array.
+/// * `parent_px/py` - Parent's padded-box dimensions.
+/// * `parent_offx/offy` - Parent's interior offsets.
+/// * `parent_dx/dy` - Parent's cell spacings.
+pub(crate) fn fill_patch_bc_from_parent_3d(
+    patch: &Patch2D,
+    pd3d: &PatchPoisson3D,
+    solver_bc_phi: &mut [f64],
+    parent_phi: &[f64],
+    parent_px: usize,
+    parent_py: usize,
+    parent_offx: usize,
+    parent_offy: usize,
+    parent_dx: f64,
+    parent_dy: f64,
+) {
+    let px = pd3d.px;
+    let py = pd3d.py;
+    let pz = pd3d.pz;
+    let offx = pd3d.offx;
+    let offy = pd3d.offy;
+
+    // The physical position of padded-box cell (i, j) in the patch:
+    // Interior cell mi = i - offx (where mi ranges 0..int_nx).
+    // Fine-grid global index of interior cell mi:
+    //   gi = patch.coarse_rect.i0 * patch.ratio + mi
+    // Physical x = (gi + 0.5) * patch.grid.dx
+    //
+    // For ghost cells (i < offx or i >= offx + int_nx), mi is outside
+    // the interior but the formula still gives a valid physical position.
+    let gi0 = (patch.coarse_rect.i0 * patch.ratio) as f64;
+    let gj0 = (patch.coarse_rect.j0 * patch.ratio) as f64;
+    let patch_dx = pd3d.dx;
+    let patch_dy = pd3d.dy;
+
+    // Fill all boundary cells of the padded box.
+    // Interior cells are NOT touched (they hold φ from the V-cycle).
+    // Z-face cells (k=0, k=pz-1) stay at 0.0 (DirichletZero).
+    solver_bc_phi.fill(0.0);
+
+    for k in 1..(pz - 1) {
+        for j in 0..py {
+            for i in 0..px {
+                // We only need to fill the boundary shell.
+                let is_boundary = i == 0 || i + 1 == px || j == 0 || j + 1 == py;
+                if !is_boundary {
+                    continue;
+                }
+
+                // Physical position of this cell.
+                let mi = i as f64 - offx as f64; // may be negative
+                let mj = j as f64 - offy as f64;
+                let x = (gi0 + mi + 0.5) * patch_dx;
+                let y = (gj0 + mj + 0.5) * patch_dy;
+
+                let val = sample_bilinear_3d_at_k(
+                    parent_phi,
+                    parent_px,
+                    parent_py,
+                    parent_offx,
+                    parent_offy,
+                    parent_dx,
+                    parent_dy,
+                    k,
+                    x,
+                    y,
+                );
+
+                solver_bc_phi[mg_kernels::idx3(i, j, k, px, py)] = val;
+            }
+        }
+    }
+    // k=0 and k=pz-1 slices remain 0.0 (DirichletZero on z-faces).
+}
+
+// ---------------------------------------------------------------------------
+// run_mini_cycle: orchestrate a miniCycle for a single patch
+// ---------------------------------------------------------------------------
+
+/// Run one miniCycle on a patch: load data into shared solver, run V-cycle(s),
+/// copy result back.
+///
+/// This is the Phase B replacement for `smooth_jacobi_2d`. Instead of a few
+/// 2D Jacobi iterations, it runs a full 3D MG V-cycle on the patch's padded
+/// box, ensuring operator consistency with L0.
+///
+/// # Arguments
+/// * `pd3d` - Persistent 3D patch data (φ read from here, updated φ written back).
+/// * `cache` - Shared solver cache.
+/// * `patch` - The AMR patch (for M data and coordinate mapping).
+/// * `ms` - Saturation magnetisation.
+/// * `n_vcycles` - Number of internal V-cycles per miniCycle (typically 1-2).
+/// * `parent_phi` - Parent's full 3D φ array (for ghost-fill BCs).
+/// * `parent_px/py/offx/offy/dx/dy` - Parent's padded-box geometry.
+#[allow(dead_code)]
+pub(crate) fn run_mini_cycle(
+    pd3d: &mut PatchPoisson3D,
+    cache: &mut PatchMGCache,
+    patch: &Patch2D,
+    ms: f64,
+    n_vcycles: usize,
+    parent_phi: &[f64],
+    parent_px: usize,
+    parent_py: usize,
+    parent_offx: usize,
+    parent_offy: usize,
+    parent_dx: f64,
+    parent_dy: f64,
+) {
+    let (int_nx, int_ny, dx_bits, dy_bits) = pd3d.solver_key;
+    let solver = cache.get_or_create(int_nx, int_ny,
+        f64::from_bits(dx_bits), f64::from_bits(dy_bits));
+
+    // --- 1. Build 3D RHS from patch magnetisation ---
+    // Extract interior M data (strip AMR ghost cells).
+    let ghost = patch.ghost;
+    let m_data = &patch.m.data;
+    let patch_nx = patch.grid.nx;
+    let mut m_interior = vec![[0.0f64; 3]; int_nx * int_ny];
+    for mj in 0..int_ny {
+        for mi in 0..int_nx {
+            let pi = ghost + mi;
+            let pj = ghost + mj;
+            m_interior[mj * int_nx + mi] = m_data[pj * patch_nx + pi];
+        }
+    }
+    solver.build_rhs_from_m_raw(&m_interior, ms);
+
+    // --- 2. Load warm-start φ from persistent storage ---
+    solver.phi_3d_mut().copy_from_slice(&pd3d.phi);
+
+    // --- 3. Fill lateral BCs from parent ---
+    fill_patch_bc_from_parent_3d(
+        patch, pd3d,
+        solver.bc_phi_mut(),
+        parent_phi,
+        parent_px, parent_py,
+        parent_offx, parent_offy,
+        parent_dx, parent_dy,
+    );
+
+    // --- 4. Run miniCycle (enforce_dirichlet + V-cycles) ---
+    solver.mini_solve(n_vcycles);
+
+    // --- 5. Copy converged φ back to persistent storage ---
+    pd3d.phi.copy_from_slice(solver.phi_3d());
+}
+
+// ---------------------------------------------------------------------------
+// 3D residual extraction (magnet layer only, for restriction to parent)
+// ---------------------------------------------------------------------------
+
+/// Compute the residual r = rhs - L(φ) on the magnet layer of a patch's 3D box,
+/// returning a 2D array (int_nx × int_ny) suitable for restriction to the parent.
+///
+/// Uses the solver's 3D stencil (applied internally by re-computing the
+/// stencil at magnet-layer cells). For efficiency, we compute residual only
+/// at k=offz and return the 2D slice.
+///
+/// NOTE: For the initial implementation, we use a simple approach:
+/// run the solver's compute_residual, then extract the magnet-layer slice.
+/// A more efficient version would compute only the k=offz plane.
+#[allow(dead_code)]
+pub(crate) fn extract_magnet_layer_residual_3d(
+    pd3d: &PatchPoisson3D,
+    cache: &mut PatchMGCache,
+    patch: &Patch2D,
+    ms: f64,
+    parent_phi: &[f64],
+    parent_px: usize,
+    parent_py: usize,
+    parent_offx: usize,
+    parent_offy: usize,
+    parent_dx: f64,
+    parent_dy: f64,
+) -> Vec<f64> {
+    let (int_nx, int_ny, dx_bits, dy_bits) = pd3d.solver_key;
+    let solver = cache.get_or_create(int_nx, int_ny,
+        f64::from_bits(dx_bits), f64::from_bits(dy_bits));
+
+    // Load current state into solver.
+    let ghost = patch.ghost;
+    let m_data = &patch.m.data;
+    let patch_nx = patch.grid.nx;
+    let mut m_interior = vec![[0.0f64; 3]; int_nx * int_ny];
+    for mj in 0..int_ny {
+        for mi in 0..int_nx {
+            m_interior[mj * int_nx + mi] = m_data[(ghost + mj) * patch_nx + (ghost + mi)];
+        }
+    }
+    solver.build_rhs_from_m_raw(&m_interior, ms);
+    solver.phi_3d_mut().copy_from_slice(&pd3d.phi);
+    fill_patch_bc_from_parent_3d(
+        patch, pd3d, solver.bc_phi_mut(),
+        parent_phi, parent_px, parent_py,
+        parent_offx, parent_offy, parent_dx, parent_dy,
+    );
+    solver.mini_solve(0); // enforce_dirichlet only (0 V-cycles)
+
+    // Compute residual using the CORRECT stencil (matching the solve operator).
+    solver.compute_residual_magnet_layer()
+}
+
+// ---------------------------------------------------------------------------
+// 3D B extraction from converged patch φ
+// ---------------------------------------------------------------------------
+
+/// Extract B = -μ₀∇φ from the 3D φ field at the magnet layer (k=offz).
+///
+/// This is the Phase B replacement for the 2D `extract_b_from_patch_phi`.
+/// The key improvement: Bz is now computed from ∂φ/∂z at fine resolution
+/// (capturing z-surface charge physics locally) rather than being
+/// interpolated from L0.
+///
+/// Returns B vectors for the patch interior cells (int_nx × int_ny).
+#[allow(dead_code)]
+pub(crate) fn extract_b_from_patch_phi_3d(
+    pd3d: &PatchPoisson3D,
+) -> Vec<[f64; 3]> {
+    let px = pd3d.px;
+    let py = pd3d.py;
+    let offx = pd3d.offx;
+    let offy = pd3d.offy;
+    let offz = pd3d.offz;
+    let int_nx = pd3d.int_nx;
+    let int_ny = pd3d.int_ny;
+    let dx = pd3d.dx;
+    let dy = pd3d.dy;
+    let dz = pd3d.dz;
+    let phi = &pd3d.phi;
+
+    let mut b = vec![[0.0f64; 3]; int_nx * int_ny];
+
+    for mj in 0..int_ny {
+        for mi in 0..int_nx {
+            let pi = offx + mi;
+            let pj = offy + mj;
+            let k = offz;
+
+            // Central differences for ∂φ/∂x, ∂φ/∂y, ∂φ/∂z.
+            let dphi_dx = (phi[mg_kernels::idx3(pi + 1, pj, k, px, py)]
+                - phi[mg_kernels::idx3(pi - 1, pj, k, px, py)])
+                / (2.0 * dx);
+
+            let dphi_dy = (phi[mg_kernels::idx3(pi, pj + 1, k, px, py)]
+                - phi[mg_kernels::idx3(pi, pj - 1, k, px, py)])
+                / (2.0 * dy);
+
+            let dphi_dz = (phi[mg_kernels::idx3(pi, pj, k + 1, px, py)]
+                - phi[mg_kernels::idx3(pi, pj, k - 1, px, py)])
+                / (2.0 * dz);
+
+            b[mj * int_nx + mi] = [
+                -MU0 * dphi_dx,
+                -MU0 * dphi_dy,
+                -MU0 * dphi_dz,
+            ];
+        }
+    }
+
+    b
+}
+
+// ---------------------------------------------------------------------------
+// Phase B Step 4: V-cycle integration helpers
+// ---------------------------------------------------------------------------
+
+/// Run miniCycle on a patch AND compute the magnet-layer residual.
+///
+/// Used in the downstroke where we need both smoothing and the residual
+/// for restriction. After the miniCycle, the solver's RHS is still loaded,
+/// so we compute r = rhs - L(φ) at k=offz before returning.
+///
+/// `residual_2d` is sized (patch.grid.nx × patch.grid.ny) — the full 2D
+/// patch grid with ghost padding. Interior cells get the computed residual;
+/// ghost cells are set to zero.
+#[allow(dead_code)]
+pub(crate) fn smooth_and_residual_3d(
+    pd3d: &mut PatchPoisson3D,
+    residual_2d: &mut [f64],
+    patch: &Patch2D,
+    cache: &mut PatchMGCache,
+    ms: f64,
+    n_vcycles: usize,
+    parent_phi: &[f64],
+    parent_px: usize, parent_py: usize,
+    parent_offx: usize, parent_offy: usize,
+    parent_dx: f64, parent_dy: f64,
+) {
+    let (int_nx, int_ny, dx_bits, dy_bits) = pd3d.solver_key;
+    let dx = f64::from_bits(dx_bits);
+    let dy = f64::from_bits(dy_bits);
+    let solver = cache.get_or_create(int_nx, int_ny, dx, dy);
+
+    // 1. Build 3D RHS from patch magnetisation.
+    let ghost = patch.ghost;
+    let m_data = &patch.m.data;
+    let patch_nx = patch.grid.nx;
+    let mut m_interior = vec![[0.0f64; 3]; int_nx * int_ny];
+    for mj in 0..int_ny {
+        for mi in 0..int_nx {
+            m_interior[mj * int_nx + mi] = m_data[(ghost + mj) * patch_nx + (ghost + mi)];
+        }
+    }
+    solver.build_rhs_from_m_raw(&m_interior, ms);
+
+    // 2. Load warm-start φ from persistent storage.
+    solver.phi_3d_mut().copy_from_slice(&pd3d.phi);
+
+    // 3. Fill lateral BCs from parent.
+    fill_patch_bc_from_parent_3d(
+        patch, pd3d, solver.bc_phi_mut(),
+        parent_phi, parent_px, parent_py,
+        parent_offx, parent_offy, parent_dx, parent_dy,
+    );
+
+    // 4. Run miniCycle (enforce_dirichlet + V-cycles).
+    solver.mini_solve(n_vcycles);
+
+    // 5. Compute magnet-layer residual r = rhs - L(φ) at k=offz using
+    //    the SAME stencil as the solve (iso27/7pt/iso9). Using a different
+    //    stencil gives a large spurious residual even when converged.
+    let res_interior = solver.compute_residual_magnet_layer();
+
+    residual_2d.fill(0.0);
+    let r2d_nx = patch.grid.nx;
+    for mj in 0..int_ny {
+        for mi in 0..int_nx {
+            let ri = ghost + mi;
+            let rj = ghost + mj;
+            residual_2d[rj * r2d_nx + ri] = res_interior[mj * int_nx + mi];
+        }
+    }
+
+    // 6. Copy converged φ back to persistent storage.
+    pd3d.phi.copy_from_slice(solver.phi_3d());
+}
+
+/// Prolongate the L0 φ correction into a L1 patch's 3D φ at k=offz.
+///
+/// Computes delta = interp(coarse_phi_new - coarse_phi_old) at each
+/// interior cell position and ADDS it to pd3d.phi on the magnet layer.
+#[allow(dead_code)]
+fn prolongate_correction_to_3d(
+    coarse_phi_new: &[f64],
+    coarse_phi_old: &[f64],
+    coarse_nx: usize, coarse_ny: usize,
+    coarse_dx: f64, coarse_dy: f64,
+    patch: &Patch2D,
+    pd3d: &mut PatchPoisson3D,
+) {
+    let delta_coarse: Vec<f64> = coarse_phi_new.iter()
+        .zip(coarse_phi_old.iter())
+        .map(|(n, o)| n - o)
+        .collect();
+
+    let ghost = patch.ghost;
+    let offz = pd3d.offz;
+    let (px, py) = (pd3d.px, pd3d.py);
+    let offx = pd3d.offx;
+    let offy = pd3d.offy;
+
+    for mj in 0..pd3d.int_ny {
+        for mi in 0..pd3d.int_nx {
+            let (x, y) = patch.cell_center_xy(ghost + mi, ghost + mj);
+            let delta_interp = sample_bilinear_scalar(
+                &delta_coarse, coarse_nx, coarse_ny, coarse_dx, coarse_dy, x, y);
+            pd3d.phi[mg_kernels::idx3(offx + mi, offy + mj, offz, px, py)] += delta_interp;
+        }
+    }
+}
+
+/// Prolongate correction from a parent patch's φ change into a child
+/// patch's 3D φ at k=offz.
+///
+/// Uses interior-only magnet-layer slices of the parent's 3D phi (before
+/// and after the parent's upstroke) to compute the correction delta.
+#[allow(dead_code)]
+fn prolongate_correction_to_3d_from_parent(
+    parent_patch: &Patch2D,
+    parent_phi_new_interior: &[f64],  // parent int_nx × int_ny
+    parent_phi_old_interior: &[f64],  // same, snapshot from before
+    child_patch: &Patch2D,
+    child_pd3d: &mut PatchPoisson3D,
+) {
+    let p_int_nx = parent_patch.interior_nx;
+    let _p_int_ny = parent_patch.interior_ny;
+    let pdx = parent_patch.grid.dx;
+    let pdy = parent_patch.grid.dy;
+
+    // Origin of the parent's interior grid in physical coordinates.
+    let gi0_p = (parent_patch.coarse_rect.i0 * parent_patch.ratio) as f64;
+    let gj0_p = (parent_patch.coarse_rect.j0 * parent_patch.ratio) as f64;
+    let origin_x = gi0_p * pdx;
+    let origin_y = gj0_p * pdy;
+
+    let delta: Vec<f64> = parent_phi_new_interior.iter()
+        .zip(parent_phi_old_interior.iter())
+        .map(|(n, o)| n - o)
+        .collect();
+
+    let c_ghost = child_patch.ghost;
+    let offz = child_pd3d.offz;
+    let (cpx, _cpy) = (child_pd3d.px, child_pd3d.py);
+    let c_offx = child_pd3d.offx;
+    let c_offy = child_pd3d.offy;
+
+    for mj in 0..child_pd3d.int_ny {
+        for mi in 0..child_pd3d.int_nx {
+            let (x, y) = child_patch.cell_center_xy(c_ghost + mi, c_ghost + mj);
+            let local_x = x - origin_x;
+            let local_y = y - origin_y;
+            let delta_interp = sample_bilinear_scalar(
+                &delta, p_int_nx, parent_patch.interior_ny, pdx, pdy,
+                local_x, local_y);
+            child_pd3d.phi[mg_kernels::idx3(c_offx + mi, c_offy + mj, offz, cpx, child_pd3d.py)]
+                += delta_interp;
+        }
+    }
+}
+
+/// Extract the interior magnet-layer φ from a PatchPoisson3D as a flat
+/// 2D array (int_nx × int_ny). Used for prolongation delta computation.
+#[allow(dead_code)]
+fn extract_interior_magnet_layer(pd3d: &PatchPoisson3D) -> Vec<f64> {
+    let mut out = vec![0.0f64; pd3d.int_nx * pd3d.int_ny];
+    let offz = pd3d.offz;
+    let (px, py) = (pd3d.px, pd3d.py);
+    for mj in 0..pd3d.int_ny {
+        for mi in 0..pd3d.int_nx {
+            out[mj * pd3d.int_nx + mi] =
+                pd3d.phi[mg_kernels::idx3(pd3d.offx + mi, pd3d.offy + mj, offz, px, py)];
+        }
+    }
+    out
+}
+
+/// Copy the converged 3D magnet-layer φ into the 2D PatchPoissonData.phi
+/// for backward compatibility with the existing B extraction code.
+///
+/// Only interior cells are copied; ghost cells are left unchanged.
+/// The caller should run 2D ghost-fill afterward if B extraction needs
+/// valid ghost values.
+#[allow(dead_code)]
+fn sync_3d_phi_to_2d(
+    pd3d: &PatchPoisson3D,
+    pd: &mut PatchPoissonData,
+    _patch: &Patch2D,
+) {
+    // Copy the ENTIRE k=offz slice from the 3D padded box into the 2D phi.
+    // This includes ghost cells, which have correct values from the 3D
+    // solve (set by fill_patch_bc_from_parent_3d and smoothed by MG).
+    //
+    // We must NOT subsequently overwrite ghosts with 2D ghost-fill from
+    // coarse_phi, because that would create a discontinuity at the patch
+    // boundary (the 3D solve used different BCs than the 2D ghost-fill).
+    //
+    // Layout guarantee: pad_xy (3D) == ghost (2D) == 2, so px == pd.nx
+    // and py == pd.ny. The cell at 3D index (i, j, offz) maps directly
+    // to 2D index (i, j).
+    let nx_2d = pd.nx;
+    let ny_2d = pd.ny;
+    let (px, py) = (pd3d.px, pd3d.py);
+    let offz = pd3d.offz;
+
+    debug_assert_eq!(px, nx_2d, "3D px ({}) must equal 2D nx ({})", px, nx_2d);
+    debug_assert_eq!(py, ny_2d, "3D py ({}) must equal 2D ny ({})", py, ny_2d);
+
+    for j in 0..ny_2d {
+        for i in 0..nx_2d {
+            pd.phi[j * nx_2d + i] = pd3d.phi[mg_kernels::idx3(i, j, offz, px, py)];
+        }
+    }
+}
+
 /// Restrict child patch residual into the enclosing parent patch's residual.
 ///
 /// For each parent fine cell covered by the child, REPLACES the parent's
@@ -605,6 +1338,7 @@ fn restrict_residual_to_parent_patch(
 /// Computes delta = parent_phi_new - parent_phi_old on the parent patch grid,
 /// bilinearly interpolates delta to each child interior cell, and ADDS to
 /// child_phi. Ghost cells are not modified (they get updated by ghost-fill).
+#[allow(dead_code)]
 fn prolongate_phi_correction_from_parent_patch(
     parent_patch: &Patch2D,
     parent_phi_new: &[f64],
@@ -1159,7 +1893,8 @@ pub(crate) struct CompositeVCycleConfig {
     pub n_pre: usize,
     /// Post-smoothing iterations on patches.
     pub n_post: usize,
-    /// Jacobi relaxation weight.
+    /// Jacobi relaxation weight (legacy, used by 2D path).
+    #[allow(dead_code)]
     pub omega: f64,
     /// Maximum number of outer V-cycle iterations.
     #[allow(dead_code)]
@@ -1197,6 +1932,11 @@ pub(crate) struct CompositeGridPoisson {
     coarse_div: Vec<f64>,
     /// V-cycle configuration.
     vcfg: CompositeVCycleConfig,
+    /// Phase B: 3D patch data for miniCycle-based V-cycle.
+    l1_data_3d: Vec<PatchPoisson3D>,
+    l2plus_data_3d: Vec<Vec<PatchPoisson3D>>,
+    /// Phase B: shared MG solver instances keyed by patch size.
+    patch_mg_cache: Option<PatchMGCache>,
 }
 
 impl CompositeGridPoisson {
@@ -1226,6 +1966,9 @@ impl CompositeGridPoisson {
             coarse_phi: vec![0.0; n],
             coarse_div: vec![0.0; n],
             vcfg: CompositeVCycleConfig::default(),
+            l1_data_3d: Vec::new(),
+            l2plus_data_3d: Vec::new(),
+            patch_mg_cache: None,
         }
     }
 
@@ -1241,218 +1984,293 @@ impl CompositeGridPoisson {
     // Phase 5: Composite V-cycle
     // ------------------------------------------------------------------
 
-    /// Run one composite V-cycle iteration (García-Cervera / AMReX pattern).
+    /// Run one composite V-cycle iteration using 3D miniCycles (Phase B).
     ///
-    /// Downstroke (finest → coarsest):
-    ///   For each level from L_finest down to L1:
-    ///     Ghost-fill φ from PARENT level → pre-smooth → compute residual
-    ///     Restrict residual into parent level patches
-    ///   Restrict L1 residuals to L0.
+    /// Downstroke: smooth_and_residual_3d on each level (finest → coarsest).
+    /// L0 solve: existing 3D MG+PPPM (unchanged).
+    /// Upstroke: prolongate + run_mini_cycle on each level (coarsest → finest).
     ///
-    /// L0 solve: existing 3D MG+PPPM with restricted fine residuals.
-    ///
-    /// Upstroke (coarsest → finest):
-    ///   L1: prolongate from L0 → ghost-fill from L0 → post-smooth.
-    ///   For each level from L2 up to L_finest:
-    ///     Prolongate from PARENT patch → ghost-fill from parent → post-smooth.
-    ///
-    /// `parent_maps` is the pre-computed parent-index map from `build_parent_index_maps`.
-    /// `b_scratch` is a temporary VectorField2D used by solve_with_corrections.
+    /// The 2D `l1_data`/`l2plus_data` `.residual` fields are populated for
+    /// restriction compatibility. After this method returns, the caller
+    /// should call `sync_3d_phi_to_2d` to update 2D phi for B extraction.
     fn vcycle_iteration(
         &mut self,
         h: &AmrHierarchy2D,
         mat: &Material,
         parent_maps: &[Vec<usize>],
-        b_scratch: &mut VectorField2D,
+        _b_scratch: &mut VectorField2D,
+        pppm_delta: &[f64],
+        cycle: usize,
     ) {
         let cnx = h.base_grid.nx;
         let cny = h.base_grid.ny;
         let cdx = h.base_grid.dx;
         let cdy = h.base_grid.dy;
-        let step_ratio = h.ratio; // ratio between adjacent AMR levels
+        let _step_ratio = h.ratio;
+        let ms = mat.ms;
+
+        // Take cache temporarily to avoid borrow conflicts with self.
+        let (_, _, n_vac_z) = self.l0_solver.mg.offsets();
+        let dz = self.base_grid.dz;
+        let mut cache = self.patch_mg_cache.take()
+            .unwrap_or_else(|| PatchMGCache::new(n_vac_z, dz));
+
+        let (l0_px, l0_py, _) = self.l0_solver.mg.padded_dims();
+        let (l0_offx, l0_offy, l0_offz) = self.l0_solver.mg.offsets();
+        let (nx_m, ny_m) = self.l0_solver.mg.interior_dims();
+
+        // Create ghost-fill phi: L0's raw 3D phi + PPPM correction at k=offz.
+        // The correction is on a COPY — L0's actual state stays raw MG.
+        let make_corrected_l0_phi = |raw_3d: &[f64]| -> Vec<f64> {
+            let mut phi = raw_3d.to_vec();
+            if !pppm_delta.is_empty() {
+                for mj in 0..ny_m {
+                    for mi in 0..nx_m {
+                        phi[mg_kernels::idx3(
+                            l0_offx + mi, l0_offy + mj, l0_offz, l0_px, l0_py,
+                        )] += pppm_delta[mj * nx_m + mi];
+                    }
+                }
+            }
+            phi
+        };
+
+        let l0_phi_3d = make_corrected_l0_phi(self.l0_solver.mg.phi_3d());
 
         // ═══════ DOWNSTROKE: finest → coarsest ═══════
         //
-        // Two-pass approach to avoid the ordering issue where restriction
-        // from a child level would be overwritten by the parent's
-        // compute_residual_2d.
-        //
-        // Pass 1: All levels ghost-fill + smooth + compute residual.
-        //         Processed finest-first so ghost values are current.
-        // Pass 2: Cascade restrictions from finest to coarsest.
-        //         Each level's residual at covered cells is REPLACED with
-        //         the restricted fine residual. This cascades L3→L2→L1.
+        // Pass 1: smooth + residual on all levels (finest first).
+        // Pass 2: cascade restrictions (finest first).
 
-        // ── Pass 1: Ghost-fill + smooth + residual on ALL levels ──
+        // ── Pass 1: smooth_and_residual_3d on ALL levels ──
 
         // L2+ from finest to coarsest
         for lvl_idx in (0..h.patches_l2plus.len()).rev() {
             let lvl_patches = &h.patches_l2plus[lvl_idx];
             if lvl_patches.is_empty() { continue; }
 
-            // Clone parent φ arrays for ghost-fill (avoids borrow conflicts).
-            let parent_phis: Vec<Vec<f64>> = if lvl_idx == 0 {
-                self.l1_data.iter().map(|pd| pd.phi.clone()).collect()
+            // Clone parent 3D phis for ghost-fill (avoids borrow conflicts).
+            let parent_phis_3d: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data_3d.iter().map(|pd| pd.phi.clone()).collect()
             } else {
-                self.l2plus_data[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+                self.l2plus_data_3d[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
             };
-            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
-                &h.patches
+            // Parent padded-box geometry.
+            let parent_geoms: Vec<(usize, usize, usize, usize, f64, f64)> = if lvl_idx == 0 {
+                self.l1_data_3d.iter().map(|pd| (pd.px, pd.py, pd.offx, pd.offy, pd.dx, pd.dy)).collect()
             } else {
-                &h.patches_l2plus[lvl_idx - 1]
+                self.l2plus_data_3d[lvl_idx - 1].iter().map(|pd| (pd.px, pd.py, pd.offx, pd.offy, pd.dx, pd.dy)).collect()
             };
 
-            for (pi, (patch, pd)) in lvl_patches.iter()
-                .zip(self.l2plus_data[lvl_idx].iter_mut()).enumerate()
-            {
+            for (pi, patch) in lvl_patches.iter().enumerate() {
                 let parent_idx = parent_maps[lvl_idx][pi];
-                fill_phi_ghosts_from_parent_patch(
-                    patch, &mut pd.phi,
-                    &parent_patches[parent_idx], &parent_phis[parent_idx]);
+                let (ppx, ppy, poffx, poffy, pdx, pdy) = parent_geoms[parent_idx];
 
-                smooth_jacobi_2d(
-                    &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
-                    self.vcfg.omega, self.vcfg.n_pre);
+                let pd3d = &mut self.l2plus_data_3d[lvl_idx][pi];
+                let pd = &mut self.l2plus_data[lvl_idx][pi];
 
-                compute_residual_2d(pd);
+                smooth_and_residual_3d(
+                    pd3d, &mut pd.residual, patch, &mut cache, ms,
+                    self.vcfg.n_pre,
+                    &parent_phis_3d[parent_idx], ppx, ppy, poffx, poffy, pdx, pdy,
+                );
             }
         }
 
         // L1 patches
-        for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
-            fill_phi_ghosts_from_coarse(
-                patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
+        for (i, patch) in h.patches.iter().enumerate() {
+            let pd3d = &mut self.l1_data_3d[i];
+            let pd = &mut self.l1_data[i];
 
-            smooth_jacobi_2d(
-                &mut pd.phi, &pd.rhs, &mut pd.residual,
-                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
-                self.vcfg.omega, self.vcfg.n_pre);
-
-            compute_residual_2d(pd);
+            smooth_and_residual_3d(
+                pd3d, &mut pd.residual, patch, &mut cache, ms,
+                self.vcfg.n_pre,
+                &l0_phi_3d, l0_px, l0_py, l0_offx, l0_offy, cdx, cdy,
+            );
         }
 
-        // ── Pass 2: Cascade restrictions from finest to coarsest ──
-        //
-        // At each level, restrict its residual into the parent level's
-        // residual (REPLACING covered cells). Process from finest first
-        // so that when L2's residual is restricted into L1, the L2 residual
-        // already includes L3's contributions at covered cells.
+        // After the downstroke, before printing:
+        if composite_diag() {
+            // L1 residual
+            let mut max_res_l1 = 0.0f64;
+            for pd in self.l1_data.iter() {
+                for &v in pd.residual.iter() { max_res_l1 = max_res_l1.max(v.abs()); }
+            }
+            eprintln!("[composite VCYCLE]   L1 max|residual| = {:.4e}", max_res_l1);
+            // Per L2+ level residual
+            for (lvl_idx, lvl_data) in self.l2plus_data.iter().enumerate() {
+                let mut max_res = 0.0f64;
+                for pd in lvl_data.iter() {
+                    for &v in pd.residual.iter() { max_res = max_res.max(v.abs()); }
+                }
+                eprintln!("[composite VCYCLE]   L{} max|residual| = {:.4e}", lvl_idx+2, max_res);
+            }
 
-        for lvl_idx in (0..h.patches_l2plus.len()).rev() {
-            let lvl_patches = &h.patches_l2plus[lvl_idx];
-            if lvl_patches.is_empty() { continue; }
-
-            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
-                &h.patches
-            } else {
-                &h.patches_l2plus[lvl_idx - 1]
-            };
-
-            // Collect restriction operations, then apply.
-            let restrict_ops: Vec<(usize, usize, f64)> = {
-                let lvl_data = &self.l2plus_data[lvl_idx];
-                let mut ops = Vec::new();
-                for (pi, (patch, pd)) in lvl_patches.iter()
-                    .zip(lvl_data.iter()).enumerate()
-                {
-                    let parent_idx = parent_maps[lvl_idx][pi];
-                    let parent_patch = &parent_patches[parent_idx];
-                    let pnx = parent_patch.grid.nx;
-                    let pny = parent_patch.grid.ny;
-                    let mut tmp_res = vec![f64::NAN; pnx * pny];
-                    restrict_residual_to_parent_patch(
-                        patch, &pd.residual, pd.nx,
-                        parent_patch, &mut tmp_res, pnx,
-                        step_ratio);
-                    for idx in 0..pnx * pny {
-                        if !tmp_res[idx].is_nan() {
-                            ops.push((parent_idx, idx, tmp_res[idx]));
+            // ── Per-level max|φ| on magnet layer (scale check) ──
+            let mut max_phi_l1 = 0.0f64;
+            for pd3d in self.l1_data_3d.iter() {
+                for mj in 0..pd3d.int_ny {
+                    for mi in 0..pd3d.int_nx {
+                        let v = pd3d.phi[mg_kernels::idx3(
+                            pd3d.offx + mi, pd3d.offy + mj, pd3d.offz,
+                            pd3d.px, pd3d.py)].abs();
+                        max_phi_l1 = max_phi_l1.max(v);
+                    }
+                }
+            }
+            eprintln!("[composite VCYCLE]   L1 max|φ_magnet| = {:.4e}", max_phi_l1);
+            for (lvl_idx, lvl_data_3d) in self.l2plus_data_3d.iter().enumerate() {
+                let mut max_phi = 0.0f64;
+                for pd3d in lvl_data_3d.iter() {
+                    for mj in 0..pd3d.int_ny {
+                        for mi in 0..pd3d.int_nx {
+                            let v = pd3d.phi[mg_kernels::idx3(
+                                pd3d.offx + mi, pd3d.offy + mj, pd3d.offz,
+                                pd3d.px, pd3d.py)].abs();
+                            max_phi = max_phi.max(v);
                         }
                     }
                 }
-                ops
-            };
+                eprintln!("[composite VCYCLE]   L{} max|φ_magnet| = {:.4e}", lvl_idx+2, max_phi);
+            }
 
-            // Apply into parent's residual.
-            if lvl_idx == 0 {
-                for (parent_idx, cell_idx, val) in restrict_ops {
-                    self.l1_data[parent_idx].residual[cell_idx] = val;
+            // ── First cycle only: ghost-fill scale diagnostics ──
+            if cycle == 0 {
+                // L0 φ scale (the source for L1 ghost values)
+                let max_l0_phi: f64 = self.coarse_phi.iter()
+                    .map(|v| v.abs()).fold(0.0, f64::max);
+                eprintln!("[ghost-diag] max|φ_L0_magnet_layer| = {:.4e}", max_l0_phi);
+
+                // L0 3D phi scale at magnet layer (with PPPM correction)
+                let mut max_l0_3d = 0.0f64;
+                for mj in 0..ny_m {
+                    for mi in 0..nx_m {
+                        max_l0_3d = max_l0_3d.max(
+                            l0_phi_3d[mg_kernels::idx3(
+                                l0_offx + mi, l0_offy + mj, l0_offz, l0_px, l0_py
+                            )].abs());
+                    }
                 }
-            } else {
-                for (parent_idx, cell_idx, val) in restrict_ops {
-                    self.l2plus_data[lvl_idx - 1][parent_idx].residual[cell_idx] = val;
+                eprintln!("[ghost-diag] max|φ_L0_3d_corrected_magnet| = {:.4e}", max_l0_3d);
+
+                // Ghost-fill values at first L1 patch boundary (from its 3D φ after smooth)
+                // The boundary cells of pd3d.phi were stamped from L0 by enforce_dirichlet.
+                if !self.l1_data_3d.is_empty() {
+                    let pd3d = &self.l1_data_3d[0];
+                    let (px, py, _pz) = (pd3d.px, pd3d.py, pd3d.pz);
+                    let offz = pd3d.offz;
+                    // Sample boundary cells at k=offz to see what ghost values were set
+                    let mut max_bc_zlayer = 0.0f64;
+                    for j in 0..py {
+                        for i in 0..px {
+                            let is_b = i == 0 || i+1 == px || j == 0 || j+1 == py;
+                            if is_b {
+                                let v = pd3d.phi[mg_kernels::idx3(i, j, offz, px, py)].abs();
+                                max_bc_zlayer = max_bc_zlayer.max(v);
+                            }
+                        }
+                    }
+                    // Interior phi of patch 0 after downstroke smooth
+                    let mut max_patch_phi = 0.0f64;
+                    for mj in 0..pd3d.int_ny {
+                        for mi in 0..pd3d.int_nx {
+                            max_patch_phi = max_patch_phi.max(pd3d.phi[mg_kernels::idx3(
+                                pd3d.offx + mi, pd3d.offy + mj, offz, px, py)].abs());
+                        }
+                    }
+                    eprintln!("[ghost-diag] L1 patch 0: max|φ_boundary_k=offz| = {:.4e}, max|φ_interior_k=offz| = {:.4e}  (ratio = {:.2})",
+                        max_bc_zlayer, max_patch_phi,
+                        if max_patch_phi > 1e-30 { max_bc_zlayer / max_patch_phi } else { 0.0 });
+                }
+
+                // Ghost-fill values for first L2 patch (from parent L1)
+                if !self.l2plus_data_3d.is_empty() && !self.l2plus_data_3d[0].is_empty() {
+                    let pd3d_l2 = &self.l2plus_data_3d[0][0];
+                    let parent_idx = parent_maps[0][0];
+                    let parent_pd3d = &self.l1_data_3d[parent_idx];
+                    let mut max_parent_phi = 0.0f64;
+                    for mj in 0..parent_pd3d.int_ny {
+                        for mi in 0..parent_pd3d.int_nx {
+                            max_parent_phi = max_parent_phi.max(parent_pd3d.phi[mg_kernels::idx3(
+                                parent_pd3d.offx + mi, parent_pd3d.offy + mj, parent_pd3d.offz,
+                                parent_pd3d.px, parent_pd3d.py)].abs());
+                        }
+                    }
+                    let mut max_l2_phi = 0.0f64;
+                    for mj in 0..pd3d_l2.int_ny {
+                        for mi in 0..pd3d_l2.int_nx {
+                            max_l2_phi = max_l2_phi.max(pd3d_l2.phi[mg_kernels::idx3(
+                                pd3d_l2.offx + mi, pd3d_l2.offy + mj, pd3d_l2.offz,
+                                pd3d_l2.px, pd3d_l2.py)].abs());
+                        }
+                    }
+                    eprintln!("[ghost-diag] L2 patch 0: parent(L1#{}) max|φ| = {:.4e}, L2 max|φ| = {:.4e}",
+                        parent_idx, max_parent_phi, max_l2_phi);
+                }
+
+                // RHS scale at each level (the source term that drives φ)
+                let mut max_rhs_l1 = 0.0f64;
+                for pd in self.l1_data.iter() {
+                    for &v in pd.rhs.iter() { max_rhs_l1 = max_rhs_l1.max(v.abs()); }
+                }
+                eprintln!("[ghost-diag] max|rhs_L1| = {:.4e}", max_rhs_l1);
+                for (lvl_idx, lvl_data) in self.l2plus_data.iter().enumerate() {
+                    let mut max_rhs = 0.0f64;
+                    for pd in lvl_data.iter() {
+                        for &v in pd.rhs.iter() { max_rhs = max_rhs.max(v.abs()); }
+                    }
+                    eprintln!("[ghost-diag] max|rhs_L{}| = {:.4e}", lvl_idx+2, max_rhs);
                 }
             }
         }
 
-        // Restrict L1 residuals to L0 corrections.
-        // delta = restricted_fine_residual - coarse_div
-        // so that solve_with_corrections produces:
-        //   3d_rhs = coarse_3d_div + delta = z_surface + restricted_fine_residual
-        let mut all_corrections: Vec<(usize, f64)> = Vec::new();
-
-        for (patch, pd) in h.patches.iter().zip(self.l1_data.iter()) {
-            let restricted = restrict_residual_to_coarse(
-                patch, &pd.residual, cnx);
-            for (cell_idx, avg_res) in restricted {
-                let delta = avg_res - self.coarse_div[cell_idx];
-                if delta.abs() > 1e-30 {
-                    all_corrections.push((cell_idx, delta));
-                }
-            }
-        }
-
-        // ═══════ L0 SOLVE ═══════
+        // ═══════ L0 IS FIXED (from bootstrap) ═══════
+        //
+        // The L0 solve was done once in compute_vcycle before the iteration
+        // loop (with enhanced RHS + PPPM). The L0 RHS doesn't change between
+        // iterations (static magnetisation), so L0 phi is a fixed point.
+        //
+        // We skip:
+        //  - Cascade restriction of fine residuals (nothing to inject into L0)
+        //  - L0 re-solve (would produce identical result)
+        //
+        // phi_old_l0 == self.coarse_phi (unchanged), so the L1 prolongation
+        // below computes delta = 0. But L1 still gets mini_cycled with
+        // correct ghost-fill, and L2+ benefits from L1's updated state.
 
         let phi_old_l0 = self.coarse_phi.clone();
 
-        self.l0_solver.solve_with_corrections(
-            &h.coarse, &all_corrections, b_scratch, mat);
-
-        // Extract updated L0 φ.
-        let new_phi = self.l0_solver.mg.extract_magnet_layer_phi();
-        self.coarse_phi.copy_from_slice(&new_phi);
-
-        // Apply PPPM-φ correction so that ∇(coarse_phi) approximates
-        // the Newell B field, giving patches correct ghost BCs.
-        if let Some(dk) = self.l0_solver.delta_kernel() {
-            dk.apply_phi_correction(&h.coarse, &mut self.coarse_phi, mat.ms);
-        }
-
         // ═══════ UPSTROKE: coarsest → finest ═══════
 
-        // L1 patches: prolongate correction from L0, ghost-fill, post-smooth.
-        // Save L1 phi_old for L2 prolongation.
-        let l1_phi_old: Vec<Vec<f64>> = self.l1_data.iter()
-            .map(|pd| pd.phi.clone()).collect();
+        // Snapshot L0's 3D phi with PPPM correction at k=offz for ghost-fill.
+        let l0_phi_3d_new = make_corrected_l0_phi(self.l0_solver.mg.phi_3d());
 
-        for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
-            prolongate_phi_correction(
-                &self.coarse_phi, &phi_old_l0, cnx, cny, cdx, cdy,
-                patch, &mut pd.phi);
+        // Save L1 interior magnet-layer phi before prolongation (for L2 delta).
+        let l1_phi_old_interior: Vec<Vec<f64>> = self.l1_data_3d.iter()
+            .map(|pd| extract_interior_magnet_layer(pd)).collect();
 
-            fill_phi_ghosts_from_coarse(
-                patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
+        // L1 patches: prolongate correction from L0, then post-smooth.
+        for (i, patch) in h.patches.iter().enumerate() {
+            let pd3d = &mut self.l1_data_3d[i];
 
-            smooth_jacobi_2d(
-                &mut pd.phi, &pd.rhs, &mut pd.residual,
-                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
-                self.vcfg.omega, self.vcfg.n_post);
+            prolongate_correction_to_3d(
+                &self.coarse_phi, &phi_old_l0, cnx, cny, cdx, cdy, patch, pd3d);
+
+            run_mini_cycle(
+                pd3d, &mut cache, patch, ms, self.vcfg.n_post,
+                &l0_phi_3d_new, l0_px, l0_py, l0_offx, l0_offy, cdx, cdy,
+            );
         }
 
-        // L2+ levels: prolongate from parent, ghost-fill, post-smooth.
-        // Process from coarsest (L2) to finest (L_max).
-        // prev_phi_old tracks each level's φ before prolongation so the
-        // next finer level can compute the correction delta.
-        let mut prev_phi_old: Vec<Vec<f64>> = l1_phi_old; // starts with L1 old
+        // L2+ levels: prolongate from parent, then post-smooth.
+        // Process from coarsest (L2) to finest.
+        let mut prev_phi_old_interior: Vec<Vec<f64>> = l1_phi_old_interior;
 
         for lvl_idx in 0..h.patches_l2plus.len() {
             let lvl_patches = &h.patches_l2plus[lvl_idx];
             if lvl_patches.is_empty() {
-                // Carry forward: set prev_phi_old to current level's phi
-                prev_phi_old = self.l2plus_data[lvl_idx].iter()
-                    .map(|pd| pd.phi.clone()).collect();
+                prev_phi_old_interior = self.l2plus_data_3d[lvl_idx].iter()
+                    .map(|pd| extract_interior_magnet_layer(pd)).collect();
                 continue;
             }
 
@@ -1462,41 +2280,52 @@ impl CompositeGridPoisson {
                 &h.patches_l2plus[lvl_idx - 1]
             };
 
-            // Clone parent φ to avoid borrow conflict: we need immutable
-            // parent data while mutating child data in l2plus_data.
-            let parent_phis_new: Vec<Vec<f64>> = if lvl_idx == 0 {
-                self.l1_data.iter().map(|pd| pd.phi.clone()).collect()
+            // Current parent interior phi (after parent's upstroke).
+            let parent_phis_new_interior: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data_3d.iter().map(|pd| extract_interior_magnet_layer(pd)).collect()
             } else {
-                self.l2plus_data[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+                self.l2plus_data_3d[lvl_idx - 1].iter().map(|pd| extract_interior_magnet_layer(pd)).collect()
+            };
+            // Parent 3D phi for ghost-fill in run_mini_cycle.
+            let parent_phis_3d: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data_3d.iter().map(|pd| pd.phi.clone()).collect()
+            } else {
+                self.l2plus_data_3d[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+            };
+            let parent_geoms: Vec<(usize, usize, usize, usize, f64, f64)> = if lvl_idx == 0 {
+                self.l1_data_3d.iter().map(|pd| (pd.px, pd.py, pd.offx, pd.offy, pd.dx, pd.dy)).collect()
+            } else {
+                self.l2plus_data_3d[lvl_idx - 1].iter().map(|pd| (pd.px, pd.py, pd.offx, pd.offy, pd.dx, pd.dy)).collect()
             };
 
-            // Save this level's phi_old for the next level.
-            let this_phi_old: Vec<Vec<f64>> = self.l2plus_data[lvl_idx].iter()
-                .map(|pd| pd.phi.clone()).collect();
+            // Save this level's interior phi before prolongation.
+            let this_phi_old_interior: Vec<Vec<f64>> = self.l2plus_data_3d[lvl_idx].iter()
+                .map(|pd| extract_interior_magnet_layer(pd)).collect();
 
-            for (pi, (patch, pd)) in lvl_patches.iter()
-                .zip(self.l2plus_data[lvl_idx].iter_mut()).enumerate()
-            {
+            for (pi, patch) in lvl_patches.iter().enumerate() {
                 let parent_idx = parent_maps[lvl_idx][pi];
+                let (ppx, ppy, poffx, poffy, pdx, pdy) = parent_geoms[parent_idx];
 
-                prolongate_phi_correction_from_parent_patch(
+                let pd3d = &mut self.l2plus_data_3d[lvl_idx][pi];
+
+                prolongate_correction_to_3d_from_parent(
                     &parent_patches[parent_idx],
-                    &parent_phis_new[parent_idx],
-                    &prev_phi_old[parent_idx],
-                    patch, &mut pd.phi);
+                    &parent_phis_new_interior[parent_idx],
+                    &prev_phi_old_interior[parent_idx],
+                    patch, pd3d,
+                );
 
-                fill_phi_ghosts_from_parent_patch(
-                    patch, &mut pd.phi,
-                    &parent_patches[parent_idx], &parent_phis_new[parent_idx]);
-
-                smooth_jacobi_2d(
-                    &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
-                    self.vcfg.omega, self.vcfg.n_post);
+                run_mini_cycle(
+                    pd3d, &mut cache, patch, ms, self.vcfg.n_post,
+                    &parent_phis_3d[parent_idx], ppx, ppy, poffx, poffy, pdx, pdy,
+                );
             }
 
-            prev_phi_old = this_phi_old;
+            prev_phi_old_interior = this_phi_old_interior;
         }
+
+        // Put cache back.
+        self.patch_mg_cache = Some(cache);
     }
 
     /// Composite V-cycle solve (true iterative V-cycle).
@@ -1548,6 +2377,34 @@ impl CompositeGridPoisson {
             self.l2plus_data = l2;
         }
 
+        // ---- Phase B: allocate 3D patch data if needed ----
+        let need_3d_realloc = self.l1_data_3d.len() != n_l1
+            || self.l2plus_data_3d.len() != h.patches_l2plus.len()
+            || self.l2plus_data_3d.iter().zip(h.patches_l2plus.iter())
+                .any(|(d, p)| d.len() != p.len());
+
+        if need_3d_realloc && has_patches {
+            let (_, _, n_vac_z) = self.l0_solver.mg.offsets();
+            let dz = self.base_grid.dz;
+            let mut cache = self.patch_mg_cache.take()
+                .unwrap_or_else(|| PatchMGCache::new(n_vac_z, dz));
+
+            self.l1_data_3d = h.patches.iter()
+                .map(|p| cache.create_patch_data(p))
+                .collect();
+            self.l2plus_data_3d = h.patches_l2plus.iter()
+                .map(|lvl| lvl.iter().map(|p| cache.create_patch_data(p)).collect())
+                .collect();
+
+            self.patch_mg_cache = Some(cache);
+        }
+
+        if self.patch_mg_cache.is_none() {
+            let (_, _, n_vac_z) = self.l0_solver.mg.offsets();
+            let dz = self.base_grid.dz;
+            self.patch_mg_cache = Some(PatchMGCache::new(n_vac_z, dz));
+        }
+
         let n_coarse = h.base_grid.nx * h.base_grid.ny;
         if self.coarse_phi.len() != n_coarse {
             self.coarse_phi = vec![0.0; n_coarse];
@@ -1570,10 +2427,53 @@ impl CompositeGridPoisson {
         let parent_maps = build_parent_index_maps(h);
 
         // ════════════════════════════════════════════════════════════════
-        // COMPOSITE V-CYCLE ITERATIONS
+        // BOOTSTRAP: Initial L0 solve with enhanced RHS + PPPM
         // ════════════════════════════════════════════════════════════════
+        //
+        // The L0 solve is done ONCE with the enhanced-RHS approach:
+        //   rhs_L0[covered] = area_avg(rhs_fine)
+        //   rhs_L0[uncovered] = coarse ∇·M
+        // This gives L0 the best possible phi for patch ghost-fill.
+        // Subsequent V-cycle iterations only smooth patches — L0 is fixed.
         let max_cycles = self.vcfg.max_cycles;
         let mut b_scratch = VectorField2D::new(self.base_grid);
+
+        // Compute enhanced-RHS corrections (same as the `compute` path).
+        let enhanced_corrections = if has_patches {
+            compute_patch_corrections(h, &self.coarse_div, mat.ms)
+        } else {
+            Vec::new()
+        };
+
+        // Bootstrap L0 solve: full MG+PPPM with enhanced RHS.
+        // This calls build_rhs_from_m, adds corrections, solves, extracts B.
+        self.l0_solver.solve_with_corrections(
+            &h.coarse, &enhanced_corrections, &mut b_scratch, mat);
+        let new_phi = self.l0_solver.mg.extract_magnet_layer_phi();
+        self.coarse_phi.copy_from_slice(&new_phi);
+
+        // PPPM ΔK phi correction: computed NOW (not lazily after first
+        // iteration). The delta kernel is loaded from disk cache by
+        // solve_with_corrections → ensure_delta_kernel. This fixes Bug 3:
+        // patches get PPPM-accurate ghost values from iteration 1.
+        let n_coarse_cells = h.base_grid.nx * h.base_grid.ny;
+        let mut pppm_delta: Vec<f64> = vec![0.0f64; n_coarse_cells];
+        if let Some(dk) = self.l0_solver.delta_kernel() {
+            dk.apply_phi_correction(&h.coarse, &mut pppm_delta, mat.ms);
+            if composite_diag() {
+                let max_d: f64 = pppm_delta.iter().map(|v| v.abs()).fold(0.0, f64::max);
+                eprintln!("[composite VCYCLE] PPPM delta loaded: max|delta| = {:.4e}", max_d);
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // COMPOSITE V-CYCLE ITERATIONS (patch smoothing)
+        // ════════════════════════════════════════════════════════════════
+        //
+        // L0 phi is fixed from the bootstrap. Each iteration smooths
+        // patches with ghost-fill from L0 (for L1) or parent patches
+        // (for L2+). Patches warm-start from the previous iteration.
+        // Convergence comes from accumulated miniCycle iterations.
 
         if composite_diag() {
             let n_l2plus: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
@@ -1583,7 +2483,7 @@ impl CompositeGridPoisson {
         }
 
         for cycle in 0..max_cycles {
-            self.vcycle_iteration(h, mat, &parent_maps, &mut b_scratch);
+            self.vcycle_iteration(h, mat, &parent_maps, &mut b_scratch, &pppm_delta, cycle);
 
             // Monitor convergence: max residual norm on all patches.
             if composite_diag() || cycle + 1 == max_cycles {
@@ -1604,6 +2504,27 @@ impl CompositeGridPoisson {
                     eprintln!(
                         "[composite VCYCLE] cycle {}/{}: max|residual| = {:.4e}",
                         cycle + 1, max_cycles, max_res);
+                }
+            }
+        }
+
+        // ---- Phase B: sync 3D magnet-layer phi → 2D pd.phi ----
+
+        for (i, patch) in h.patches.iter().enumerate() {
+            if i < self.l1_data_3d.len() && i < self.l1_data.len() {
+                sync_3d_phi_to_2d(&self.l1_data_3d[i], &mut self.l1_data[i], patch);
+            }
+        }
+        for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+            if lvl_idx >= self.l2plus_data_3d.len() { break; }
+            for (pi, patch) in lvl_patches.iter().enumerate() {
+                if pi < self.l2plus_data_3d[lvl_idx].len()
+                    && pi < self.l2plus_data[lvl_idx].len()
+                {
+                    sync_3d_phi_to_2d(
+                        &self.l2plus_data_3d[lvl_idx][pi],
+                        &mut self.l2plus_data[lvl_idx][pi],
+                        patch);
                 }
             }
         }
@@ -1820,6 +2741,144 @@ impl CompositeGridPoisson {
             ).collect();
 
         (b_l1, b_l2)
+    }
+
+    // ------------------------------------------------------------------
+    // Diagnostic accessors (for benchmark φ comparison)
+    // ------------------------------------------------------------------
+
+    /// Get a reference to the L1 3D patch data (for benchmark diagnostics).
+    #[allow(dead_code)]
+    pub(crate) fn l1_data_3d_ref(&self) -> &[PatchPoisson3D] {
+        &self.l1_data_3d
+    }
+
+    /// Get a reference to the L2+ 3D patch data (for benchmark diagnostics).
+    #[allow(dead_code)]
+    pub(crate) fn l2plus_data_3d_ref(&self) -> &[Vec<PatchPoisson3D>] {
+        &self.l2plus_data_3d
+    }
+
+    /// Get the L0 magnet-layer φ (for benchmark diagnostics).
+    #[allow(dead_code)]
+    pub(crate) fn coarse_phi_ref(&self) -> &[f64] {
+        &self.coarse_phi
+    }
+
+    /// Print a comprehensive diagnostic summary comparing patch φ against
+    /// a fine-reference φ field.
+    ///
+    /// `fine_phi` is the magnet-layer φ from a uniform fine MG solve, stored
+    /// as a flat array of size `fine_nx * fine_ny`.
+    /// `fine_nx/ny/dx/dy` describe the fine reference grid.
+    #[allow(dead_code)]
+    pub(crate) fn print_phi_comparison(
+        &self,
+        h: &AmrHierarchy2D,
+        fine_phi: &[f64],
+        fine_nx: usize, fine_ny: usize,
+        fine_dx: f64, fine_dy: f64,
+    ) {
+        eprintln!("\n[φ-comparison] ══════════════════════════════════════════");
+        eprintln!("[φ-comparison] Patch φ vs uniform fine MG reference φ");
+        eprintln!("[φ-comparison] Fine ref grid: {}×{}, dx={:.4e}", fine_nx, fine_ny, fine_dx);
+
+        let max_phi_ref: f64 = fine_phi.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        eprintln!("[φ-comparison] max|φ_fine_ref| = {:.4e}", max_phi_ref);
+
+        // L1 patches
+        for (pi, patch) in h.patches.iter().enumerate() {
+            if pi >= self.l1_data_3d.len() { break; }
+            let pd3d = &self.l1_data_3d[pi];
+            let ghost = patch.ghost;
+            let mut max_diff = 0.0f64;
+            let mut max_phi_patch = 0.0f64;
+            let mut max_phi_ref_local = 0.0f64;
+            let mut sum_se = 0.0f64;
+            let mut n_cells = 0usize;
+
+            for mj in 0..pd3d.int_ny {
+                for mi in 0..pd3d.int_nx {
+                    let (x, y) = patch.cell_center_xy(ghost + mi, ghost + mj);
+                    // Map to fine reference grid index
+                    let fi = (x / fine_dx - 0.5).round() as isize;
+                    let fj = (y / fine_dy - 0.5).round() as isize;
+                    if fi < 0 || fj < 0 || fi >= fine_nx as isize || fj >= fine_ny as isize {
+                        continue;
+                    }
+                    let fi = fi as usize;
+                    let fj = fj as usize;
+
+                    let phi_ref = fine_phi[fj * fine_nx + fi];
+                    let phi_comp = pd3d.phi[mg_kernels::idx3(
+                        pd3d.offx + mi, pd3d.offy + mj, pd3d.offz,
+                        pd3d.px, pd3d.py)];
+
+                    let diff = (phi_ref - phi_comp).abs();
+                    max_diff = max_diff.max(diff);
+                    max_phi_patch = max_phi_patch.max(phi_comp.abs());
+                    max_phi_ref_local = max_phi_ref_local.max(phi_ref.abs());
+                    sum_se += diff * diff;
+                    n_cells += 1;
+                }
+            }
+            let rmse = if n_cells > 0 { (sum_se / n_cells as f64).sqrt() } else { 0.0 };
+            let rel_pct = if max_phi_ref_local > 0.0 { max_diff / max_phi_ref_local * 100.0 } else { 0.0 };
+            if pi < 3 || pi + 1 == h.patches.len() {
+                eprintln!("[φ-comparison] L1 patch {}: max|φ_ref|={:.4e} max|φ_comp|={:.4e} \
+                    max|Δφ|={:.4e} ({:.1}%) rmse={:.4e} ({} cells)",
+                    pi, max_phi_ref_local, max_phi_patch, max_diff, rel_pct, rmse, n_cells);
+            }
+        }
+
+        // L2+ patches (summarise per level)
+        for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+            if lvl_idx >= self.l2plus_data_3d.len() { break; }
+            let mut total_se = 0.0f64;
+            let mut total_n = 0usize;
+            let mut level_max_diff = 0.0f64;
+            let mut level_max_ref = 0.0f64;
+            let mut level_max_comp = 0.0f64;
+
+            for (pi, patch) in lvl_patches.iter().enumerate() {
+                if pi >= self.l2plus_data_3d[lvl_idx].len() { break; }
+                let pd3d = &self.l2plus_data_3d[lvl_idx][pi];
+                let ghost = patch.ghost;
+
+                for mj in 0..pd3d.int_ny {
+                    for mi in 0..pd3d.int_nx {
+                        let (x, y) = patch.cell_center_xy(ghost + mi, ghost + mj);
+                        let fi = (x / fine_dx - 0.5).round() as isize;
+                        let fj = (y / fine_dy - 0.5).round() as isize;
+                        if fi < 0 || fj < 0 || fi >= fine_nx as isize || fj >= fine_ny as isize {
+                            continue;
+                        }
+                        let fi = fi as usize;
+                        let fj = fj as usize;
+
+                        let phi_ref = fine_phi[fj * fine_nx + fi];
+                        let phi_comp = pd3d.phi[mg_kernels::idx3(
+                            pd3d.offx + mi, pd3d.offy + mj, pd3d.offz,
+                            pd3d.px, pd3d.py)];
+
+                        let diff = (phi_ref - phi_comp).abs();
+                        level_max_diff = level_max_diff.max(diff);
+                        level_max_ref = level_max_ref.max(phi_ref.abs());
+                        level_max_comp = level_max_comp.max(phi_comp.abs());
+                        total_se += diff * diff;
+                        total_n += 1;
+                    }
+                }
+            }
+            let rmse = if total_n > 0 { (total_se / total_n as f64).sqrt() } else { 0.0 };
+            let rel_pct = if level_max_ref > 0.0 { level_max_diff / level_max_ref * 100.0 } else { 0.0 };
+            eprintln!("[φ-comparison] L{} ({} patches): max|φ_ref|={:.4e} max|φ_comp|={:.4e} \
+                max|Δφ|={:.4e} ({:.1}%) rmse={:.4e} ({} cells)",
+                lvl_idx + 2, lvl_patches.len(), level_max_ref, level_max_comp,
+                level_max_diff, rel_pct, rmse, total_n);
+        }
+
+        eprintln!("[φ-comparison] ══════════════════════════════════════════\n");
     }
 }
 
@@ -2889,6 +3948,21 @@ mod phase5_tests {
         solver.l2plus_data = l2;
         compute_all_patch_rhs(&h, &mut solver.l1_data, &mut solver.l2plus_data, mat.ms);
 
+        // Allocate 3D patch data (Phase B).
+        {
+            let (_, _, n_vac_z) = solver.l0_solver.mg.offsets();
+            let dz = grid.dz;
+            let mut cache = solver.patch_mg_cache.take()
+                .unwrap_or_else(|| PatchMGCache::new(n_vac_z, dz));
+            solver.l1_data_3d = h.patches.iter()
+                .map(|p| cache.create_patch_data(p))
+                .collect();
+            solver.l2plus_data_3d = h.patches_l2plus.iter()
+                .map(|lvl| lvl.iter().map(|p| cache.create_patch_data(p)).collect())
+                .collect();
+            solver.patch_mg_cache = Some(cache);
+        }
+
         // Compute coarse div.
         let n_coarse = grid.nx * grid.ny;
         solver.coarse_phi = vec![0.0; n_coarse];
@@ -2903,14 +3977,15 @@ mod phase5_tests {
         let mut residuals = Vec::new();
 
         for cycle in 0..5 {
-            solver.vcycle_iteration(&h, &mat, &parent_maps, &mut b_scratch);
+            solver.vcycle_iteration(&h, &mat, &parent_maps, &mut b_scratch, &[], cycle);
 
-            // Recompute residual to measure it.
+            // Read the residual that was set by smooth_and_residual_3d
+            // during the downstroke (already the 3D magnet-layer residual).
             let mut max_res = 0.0f64;
-            for pd in solver.l1_data.iter_mut() {
-                compute_residual_2d(pd);
-                for j in pd.ghost..(pd.ny - pd.ghost) {
-                    for i in pd.ghost..(pd.nx - pd.ghost) {
+            for pd in solver.l1_data.iter() {
+                let ghost = pd.ghost;
+                for j in ghost..(pd.ny - ghost) {
+                    for i in ghost..(pd.nx - ghost) {
                         max_res = max_res.max(pd.residual[j * pd.nx + i].abs());
                     }
                 }
@@ -3153,5 +4228,208 @@ mod phase6_tests {
 
         eprintln!("[phase6] zero-patch: B_max={:.3e}, b_l1 empty, b_l2 empty", b_max);
         eprintln!("[phase6] PASSED: zero-patch still works with Phase 6 gradient extraction");
+    }
+}
+
+// =========================================================================
+// Phase B tests: Sessions 1–4
+// =========================================================================
+
+#[cfg(test)]
+mod phase_b_tests {
+    use super::*;
+    use crate::grid::Grid2D;
+
+    // ── Session 1 ──
+
+    #[test]
+    fn test_patch_solver_matches_l0_geometry() {
+        let dx = 3.906e-9;
+        let dy = 3.906e-9;
+        let dz = 3.0e-9;
+        let n_vac_z = 16;
+        let mut cache = PatchMGCache::new(n_vac_z, dz);
+        let solver = cache.get_or_create(32, 32, dx, dy);
+        let (px, py, pz) = solver.padded_dims();
+        let (_offx, _offy, offz) = solver.offsets();
+        assert!(px >= 32 + 2 * PATCH_PAD_XY);
+        assert!(py >= 32 + 2 * PATCH_PAD_XY);
+        assert_eq!(offz, n_vac_z);
+        assert!(pz >= 1 + 2 * n_vac_z);
+        solver.phi_3d_mut().fill(0.0);
+        solver.bc_phi_mut().fill(0.0);
+        solver.mini_solve(0);
+        let max_phi: f64 = solver.phi_3d().iter().map(|v| v.abs()).fold(0.0, f64::max);
+        assert!(max_phi < 1e-30);
+        eprintln!("[phase_b] PASSED: patch solver geometry");
+    }
+
+    #[test]
+    fn test_mini_cycle_produces_nonzero_phi() {
+        let mut cache = PatchMGCache::new(16, 3.0e-9);
+        let solver = cache.get_or_create(16, 16, 3.906e-9, 3.906e-9);
+        let m: Vec<[f64; 3]> = vec![[1.0, 0.0, 0.0]; 256];
+        solver.build_rhs_from_m_raw(&m, 8e5);
+        solver.phi_3d_mut().fill(0.0);
+        solver.bc_phi_mut().fill(0.0);
+        solver.mini_solve(2);
+        let (px, py, _) = solver.padded_dims();
+        let (offx, offy, offz) = solver.offsets();
+        let phi = solver.phi_3d();
+        let mut mx = 0.0f64;
+        for mj in 0..16 { for mi in 0..16 {
+            mx = mx.max(phi[mg_kernels::idx3(offx+mi, offy+mj, offz, px, py)].abs());
+        }}
+        assert!(mx > 1e-20 && mx.is_finite());
+        eprintln!("[phase_b] PASSED: miniCycle nonzero phi (max={:.3e})", mx);
+    }
+
+    #[test]
+    fn test_patch_poisson_3d_creation() {
+        use crate::amr::patch::Patch2D;
+        use crate::amr::rect::Rect2i;
+        let base = Grid2D::new(128, 128, 7.812e-9, 7.812e-9, 3e-9);
+        let patch = Patch2D::new(&base, Rect2i::new(4, 4, 8, 8), 2, 2);
+        let mut cache = PatchMGCache::new(16, 3e-9);
+        let pd3d = cache.create_patch_data(&patch);
+        assert_eq!(pd3d.int_nx, 16);
+        assert_eq!(pd3d.int_ny, 16);
+        assert_eq!(pd3d.phi.len(), pd3d.px * pd3d.py * pd3d.pz);
+        eprintln!("[phase_b] PASSED: PatchPoisson3D creation");
+    }
+
+    // ── Session 2 ──
+
+    #[test]
+    fn test_3d_rhs_raw_matches_standard() {
+        use crate::vector_field::VectorField2D;
+        let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let mut m = VectorField2D::new(grid);
+        let cx = 8.0; let cy = 8.0;
+        for j in 0..16 { for i in 0..16 {
+            let x = i as f64 + 0.5 - cx;
+            let y = j as f64 + 0.5 - cy;
+            let r = (x*x + y*y).sqrt().max(0.5);
+            let (mx, my, mz) = (-y/r, x/r, 0.3);
+            let n = (mx*mx+my*my+mz*mz).sqrt();
+            m.data[j*16+i] = [mx/n, my/n, mz/n];
+        }}
+        let cfg = DemagPoissonMGConfig::from_env();
+        let mut a = DemagPoissonMG::new(grid, cfg);
+        a.build_rhs_from_m(&m, 8e5);
+        let ra = a.rhs_3d().to_vec();
+        let mut b = DemagPoissonMG::new(grid, cfg);
+        b.build_rhs_from_m_raw(&m.data, 8e5);
+        let rb = b.rhs_3d().to_vec();
+        let md: f64 = ra.iter().zip(rb.iter()).map(|(a,b)|(a-b).abs()).fold(0.0, f64::max);
+        assert!(md < 1e-20, "RHS mismatch: {:.3e}", md);
+        eprintln!("[phase_b s2] PASSED: build_rhs_from_m_raw bit-identical");
+    }
+
+    #[test]
+    fn test_patch_rhs_matches_l0_at_same_resolution() {
+        let (nx, ny) = (16, 16);
+        let (dx, dy, dz, ms) = (2.5e-9, 2.5e-9, 3e-9, 8e5);
+        let norm = (0.6f64*0.6+0.8*0.8+0.3*0.3).sqrt();
+        let m_vec: Vec<[f64;3]> = vec![[0.6/norm, 0.8/norm, 0.3/norm]; nx*ny];
+        let grid = Grid2D::new(nx, ny, dx, dy, dz);
+        let cfg = DemagPoissonMGConfig::from_env();
+        let mut sl0 = DemagPoissonMG::new(grid, cfg);
+        sl0.build_rhs_from_m_raw(&m_vec, ms);
+        let rl0 = sl0.rhs_3d().to_vec();
+        let (l0px, l0py, _) = sl0.padded_dims();
+        let (l0ox, l0oy, l0oz) = sl0.offsets();
+        let mut cache = PatchMGCache::new(16, dz);
+        let sp = cache.get_or_create(nx, ny, dx, dy);
+        sp.build_rhs_from_m_raw(&m_vec, ms);
+        let rp = sp.rhs_3d().to_vec();
+        let (ppx, ppy, _) = sp.padded_dims();
+        let (pox, poy, poz) = sp.offsets();
+        for dk in [-1isize, 0, 1] {
+            let mut md = 0.0f64;
+            let kl = (l0oz as isize + dk) as usize;
+            let kp = (poz as isize + dk) as usize;
+            for mj in 0..ny { for mi in 0..nx {
+                let vl = rl0[mg_kernels::idx3(l0ox+mi, l0oy+mj, kl, l0px, l0py)];
+                let vp = rp[mg_kernels::idx3(pox+mi, poy+mj, kp, ppx, ppy)];
+                md = md.max((vl-vp).abs());
+            }}
+            assert!(md < 1e-10, "RHS mismatch dk={}: {:.3e}", dk, md);
+        }
+        eprintln!("[phase_b s2] PASSED: patch RHS matches L0");
+    }
+
+    #[test]
+    fn test_ghost_fill_3d_from_known_parent() {
+        use crate::amr::patch::Patch2D;
+        use crate::amr::rect::Rect2i;
+        let (pnx, pny) = (32, 32);
+        let (pdx, pdy, dz) = (5e-9, 5e-9, 3e-9);
+        let base = Grid2D::new(pnx, pny, pdx, pdy, dz);
+        let mut pcache = PatchMGCache::new(16, dz);
+        let ps = pcache.get_or_create(pnx, pny, pdx, pdy);
+        let (ppx, ppy, ppz) = ps.padded_dims();
+        let (pox, poy, _) = ps.offsets();
+        let n = ppx*ppy*ppz;
+        let mut pphi = vec![0.0f64; n];
+        for k in 0..ppz { for pj in 0..ppy { for pi in 0..ppx {
+            let mi = pi as f64 - pox as f64;
+            let mj = pj as f64 - poy as f64;
+            pphi[mg_kernels::idx3(pi, pj, k, ppx, ppy)] = (mi+0.5)*pdx + 2.0*(mj+0.5)*pdy;
+        }}}
+        let cp = Patch2D::new(&base, Rect2i::new(8, 8, 8, 8), 2, 2);
+        let mut ccache = PatchMGCache::new(16, dz);
+        let pd3d = ccache.create_patch_data(&cp);
+        let mut bc = vec![0.0f64; pd3d.px*pd3d.py*pd3d.pz];
+        fill_patch_bc_from_parent_3d(&cp, &pd3d, &mut bc, &pphi, ppx, ppy, pox, poy, pdx, pdy);
+        let k = pd3d.offz;
+        let gi0 = (cp.coarse_rect.i0 * cp.ratio) as f64;
+        let gj0 = (cp.coarse_rect.j0 * cp.ratio) as f64;
+        let cdx = cp.grid.dx;
+        let cdy = cp.grid.dy;
+        let mut me = 0.0f64;
+        for j in 0..pd3d.py { for i in 0..pd3d.px {
+            let is_b = i==0||i+1==pd3d.px||j==0||j+1==pd3d.py;
+            if !is_b { continue; }
+            let mi = i as f64 - pd3d.offx as f64;
+            let mj = j as f64 - pd3d.offy as f64;
+            let exp = (gi0+mi+0.5)*cdx + 2.0*(gj0+mj+0.5)*cdy;
+            me = me.max((bc[mg_kernels::idx3(i, j, k, pd3d.px, pd3d.py)] - exp).abs());
+        }}
+        assert!(me < 1e-18, "ghost fill err: {:.3e}", me);
+        eprintln!("[phase_b s2] PASSED: ghost fill linear (err={:.3e})", me);
+    }
+
+    #[test]
+    fn test_run_mini_cycle_end_to_end() {
+        use crate::amr::patch::Patch2D;
+        use crate::amr::rect::Rect2i;
+        use crate::vector_field::VectorField2D;
+        let (nx, ny) = (32, 32);
+        let (dx, dy, dz, ms) = (5e-9, 5e-9, 3e-9, 8e5);
+        let grid = Grid2D::new(nx, ny, dx, dy, dz);
+        let mut m = VectorField2D::new(grid);
+        for v in m.data.iter_mut() { *v = [1.0, 0.0, 0.0]; }
+        let cfg = DemagPoissonMGConfig::from_env();
+        let mut l0 = DemagPoissonMG::new(grid, cfg);
+        l0.build_rhs_from_m(&m, ms);
+        l0.phi_3d_mut().fill(0.0);
+        l0.bc_phi_mut().fill(0.0);
+        l0.mini_solve(16);
+        let l0phi = l0.phi_3d().to_vec();
+        let (l0px, l0py, _) = l0.padded_dims();
+        let (l0ox, l0oy, _) = l0.offsets();
+        let mut cp = Patch2D::new(&grid, Rect2i::new(8, 8, 8, 8), 2, 2);
+        let g = cp.ghost; let pnx = cp.grid.nx;
+        for mj in 0..cp.interior_ny { for mi in 0..cp.interior_nx {
+            cp.m.data[(g+mj)*pnx+(g+mi)] = [1.0, 0.0, 0.0];
+        }}
+        let mut cache = PatchMGCache::new(16, dz);
+        let mut pd3d = cache.create_patch_data(&cp);
+        run_mini_cycle(&mut pd3d, &mut cache, &cp, ms, 2, &l0phi, l0px, l0py, l0ox, l0oy, dx, dy);
+        let b = extract_b_from_patch_phi_3d(&pd3d);
+        let bmax: f64 = b.iter().flat_map(|v| v.iter()).map(|x| x.abs()).fold(0.0, f64::max);
+        assert!(bmax > 1e-6 && bmax.is_finite(), "B={:.3e}", bmax);
+        eprintln!("[phase_b s2] PASSED: end-to-end (B={:.3e})", bmax);
     }
 }

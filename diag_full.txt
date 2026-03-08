@@ -1,0 +1,298 @@
+   Compiling llg-sim v0.1.0 (/Users/helena/RustProjects/llg-sim)
+warning: methods `rhs_3d` and `cell_spacings` are never used
+    --> src/effective_field/demag_poisson_mg.rs:2451:19
+     |
+1322 | impl DemagPoissonMG {
+     | ------------------- methods in this implementation
+...
+2451 |     pub(crate) fn rhs_3d(&self) -> &[f64] {
+     |                   ^^^^^^
+...
+2472 |     pub(crate) fn cell_spacings(&self) -> (f64, f64, f64) {
+     |                   ^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `fill_phi_ghosts_from_parent_patch` is never used
+   --> src/effective_field/mg_composite.rs:492:4
+    |
+492 | fn fill_phi_ghosts_from_parent_patch(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `restrict_residual_to_parent_patch` is never used
+    --> src/effective_field/mg_composite.rs:1279:4
+     |
+1279 | fn restrict_residual_to_parent_patch(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `llg-sim` (lib) generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 17.47s
+     Running `target/release/bench_composite_vcycle`
+╔════════════════════════════════════════════════════════════════╗
+║  Composite V-Cycle Benchmark — Single Antidot Hole            ║
+╚════════════════════════════════════════════════════════════════╝
+
+  Domain:      500 nm × 500 nm, dz = 3.0 nm
+  Hole:        r = 100 nm at centre
+  Base grid:   128 × 128, dx = 3.91 nm
+  Fine grid:   1024 × 1024 (8× refinement, 3 AMR levels)
+  V-cycle:     ON (fine ∇φ on patches)
+
+  Regrid: 6872 cells flagged
+  Patches:     L1=12, L2+=68
+
+  Computing fine FFT reference (1024 × 1024) ...
+  Fine FFT:    12.88 s
+  max|B|:      4.6523e-1 T
+  Running coarse-FFT ...
+  coarse-FFT:  6.2 ms
+  Running composite (V-cycle) ...
+[composite] V-cycle: auto-enabling PPPM hybrid (radius=14)
+[composite] V-CYCLE mode enabled (LLG_DEMAG_COMPOSITE_VCYCLE=1) — fine-resolution B within patches
+[composite Phase B] Created PatchMGSolver for 32×64 interior (dx=1.953e-9, dy=1.953e-9) → padded 36×68×36 (88128 cells)
+[composite Phase B] Created PatchMGSolver for 18×128 interior (dx=1.953e-9, dy=1.953e-9) → padded 22×132×36 (104544 cells)
+[composite Phase B] Created PatchMGSolver for 192×18 interior (dx=1.953e-9, dy=1.953e-9) → padded 196×22×36 (155232 cells)
+[composite Phase B] Created PatchMGSolver for 38×124 interior (dx=1.953e-9, dy=1.953e-9) → padded 42×128×36 (193536 cells)
+[composite Phase B] Created PatchMGSolver for 70×50 interior (dx=1.953e-9, dy=1.953e-9) → padded 74×54×36 (143856 cells)
+[composite Phase B] Created PatchMGSolver for 36×256 interior (dx=9.766e-10, dy=9.766e-10) → padded 40×260×36 (374400 cells)
+[composite Phase B] Created PatchMGSolver for 384×36 interior (dx=9.766e-10, dy=9.766e-10) → padded 388×40×36 (558720 cells)
+[composite Phase B] Created PatchMGSolver for 76×248 interior (dx=9.766e-10, dy=9.766e-10) → padded 80×252×36 (725760 cells)
+[composite Phase B] Created PatchMGSolver for 140×88 interior (dx=9.766e-10, dy=9.766e-10) → padded 144×92×36 (476928 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 72×64 interior (dx=4.883e-10, dy=4.883e-10) → padded 76×68×36 (186048 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 24×400 interior (dx=4.883e-10, dy=4.883e-10) → padded 28×404×36 (407232 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 96×72 interior (dx=4.883e-10, dy=4.883e-10) → padded 100×76×36 (273600 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 592×24 interior (dx=4.883e-10, dy=4.883e-10) → padded 596×28×36 (600768 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 64×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 68×52×36 (127296 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 48×144 interior (dx=4.883e-10, dy=4.883e-10) → padded 52×148×36 (277056 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 56×56 interior (dx=4.883e-10, dy=4.883e-10) → padded 60×60×36 (129600 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 56×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 60×52×36 (112320 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 72×24 interior (dx=4.883e-10, dy=4.883e-10) → padded 76×28×36 (76608 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 64×40 interior (dx=4.883e-10, dy=4.883e-10) → padded 68×44×36 (107712 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 48×56 interior (dx=4.883e-10, dy=4.883e-10) → padded 52×60×36 (112320 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 48×40 interior (dx=4.883e-10, dy=4.883e-10) → padded 52×44×36 (82368 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 40×56 interior (dx=4.883e-10, dy=4.883e-10) → padded 44×60×36 (95040 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 32×56 interior (dx=4.883e-10, dy=4.883e-10) → padded 36×60×36 (77760 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 72×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 76×52×36 (142272 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 224×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 228×52×36 (426816 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 232×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 236×52×36 (441792 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 224×24 interior (dx=4.883e-10, dy=4.883e-10) → padded 228×28×36 (229824 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 40×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 44×52×36 (82368 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 120×48 interior (dx=4.883e-10, dy=4.883e-10) → padded 124×52×36 (232128 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 48×64 interior (dx=4.883e-10, dy=4.883e-10) → padded 52×68×36 (127296 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 112×24 interior (dx=4.883e-10, dy=4.883e-10) → padded 116×28×36 (116928 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 40×24 interior (dx=4.883e-10, dy=4.883e-10) → padded 44×28×36 (44352 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 56×64 interior (dx=4.883e-10, dy=4.883e-10) → padded 60×68×36 (146880 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 48×128 interior (dx=4.883e-10, dy=4.883e-10) → padded 52×132×36 (247104 cells)
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite Phase B] Created PatchMGSolver for 32×496 interior (dx=4.883e-10, dy=4.883e-10) → padded 36×500×36 (648000 cells)
+[demag_mg] hybrid ΔK ENABLED (radius_xy=14, delta_v_cycles=60, sigma_cells=1.500, cache_to_disk=true)
+[demag_mg] hybrid cache hit -> loaded ΔK stencil from "out/demag_cache/demag_mg_hybrid_dk_nx128_ny128_dx3.906e-9_dy3.906e-9_dz3.000e-9_pad6_nvacz16_opiso27_tri_gal_bcbh_th6.000e-1_leaf64_dep20_smwj_pre2_post2_om3fe5555555555555_som3ff0000000000000_sig3ff8000000000000_r14_dv60.bin"
+[composite VCYCLE] PPPM delta loaded: max|delta| = 3.0851e-4
+[composite VCYCLE] ═══════════════════════════════════════════════════
+[composite VCYCLE] Iterative V-cycle: L1=12, L2+=68, max_cycles=5, n_pre=3, n_post=3
+[composite VCYCLE]   L1 max|residual| = 3.1662e13
+[composite VCYCLE]   L2 max|residual| = 5.0484e13
+[composite VCYCLE]   L3 max|residual| = 1.6823e14
+[composite VCYCLE]   L1 max|φ_magnet| = 1.7301e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.5450e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 9.5988e-4
+[ghost-diag] max|φ_L0_magnet_layer| = 1.5687e-3
+[ghost-diag] max|φ_L0_3d_corrected_magnet| = 1.8669e-3
+[ghost-diag] L1 patch 0: max|φ_boundary_k=offz| = 1.7810e-3, max|φ_interior_k=offz| = 1.4116e-3  (ratio = 1.26)
+[ghost-diag] L2 patch 0: parent(L1#1) max|φ| = 1.4852e-3, L2 max|φ| = 2.9975e-4
+[ghost-diag] max|rhs_L1| = 4.0960e14
+[ghost-diag] max|rhs_L2| = 8.1920e14
+[ghost-diag] max|rhs_L3| = 1.6384e15
+[composite VCYCLE] cycle 1/5: max|residual| = 1.6823e14
+[composite VCYCLE]   L1 max|residual| = 4.9257e11
+[composite VCYCLE]   L2 max|residual| = 1.0215e13
+[composite VCYCLE]   L3 max|residual| = 2.3973e14
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8134e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9335e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0094e-3
+[composite VCYCLE] cycle 2/5: max|residual| = 2.3973e14
+[composite VCYCLE]   L1 max|residual| = 1.2920e10
+[composite VCYCLE]   L2 max|residual| = 2.0410e12
+[composite VCYCLE]   L3 max|residual| = 1.3476e14
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8162e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9823e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0865e-3
+[composite VCYCLE] cycle 3/5: max|residual| = 1.3476e14
+[composite VCYCLE]   L1 max|residual| = 6.4490e8
+[composite VCYCLE]   L2 max|residual| = 6.1742e11
+[composite VCYCLE]   L3 max|residual| = 8.4836e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8165e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0505e-3
+[composite VCYCLE] cycle 4/5: max|residual| = 8.4836e13
+[composite VCYCLE]   L1 max|residual| = 7.3890e7
+[composite VCYCLE]   L2 max|residual| = 2.0968e11
+[composite VCYCLE]   L3 max|residual| = 5.7421e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8166e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0267e-3
+[composite VCYCLE] cycle 5/5: max|residual| = 5.7421e13
+[composite VCYCLE] converged max|φ| on L1 = 2.1769e-3
+[composite VCYCLE] converged max|φ| on L2 = 2.3107e-3
+[composite VCYCLE] converged max|φ| on L3 = 2.1737e-3
+[composite VCYCLE] ═══════════════════════════════════════════════════
+[composite VCYCLE] PPPM delta loaded: max|delta| = 3.0851e-4
+[composite VCYCLE] ═══════════════════════════════════════════════════
+[composite VCYCLE] Iterative V-cycle: L1=12, L2+=68, max_cycles=5, n_pre=3, n_post=3
+[composite VCYCLE]   L1 max|residual| = 1.1831e7
+[composite VCYCLE]   L2 max|residual| = 7.6868e10
+[composite VCYCLE]   L3 max|residual| = 4.0435e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8166e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0121e-3
+[ghost-diag] max|φ_L0_magnet_layer| = 1.5687e-3
+[ghost-diag] max|φ_L0_3d_corrected_magnet| = 1.8669e-3
+[ghost-diag] L1 patch 0: max|φ_boundary_k=offz| = 1.7810e-3, max|φ_interior_k=offz| = 1.6770e-3  (ratio = 1.06)
+[ghost-diag] L2 patch 0: parent(L1#1) max|φ| = 1.6902e-3, L2 max|φ| = 1.9836e-3
+[ghost-diag] max|rhs_L1| = 4.0960e14
+[ghost-diag] max|rhs_L2| = 8.1920e14
+[ghost-diag] max|rhs_L3| = 1.6384e15
+[composite VCYCLE] cycle 1/5: max|residual| = 4.0435e13
+[composite VCYCLE]   L1 max|residual| = 2.0229e6
+[composite VCYCLE]   L2 max|residual| = 2.9573e10
+[composite VCYCLE]   L3 max|residual| = 2.9073e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8166e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0046e-3
+[composite VCYCLE] cycle 2/5: max|residual| = 2.9073e13
+[composite VCYCLE]   L1 max|residual| = 3.4998e5
+[composite VCYCLE]   L2 max|residual| = 1.1719e10
+[composite VCYCLE]   L3 max|residual| = 2.1204e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8166e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 2.0010e-3
+[composite VCYCLE] cycle 3/5: max|residual| = 2.1204e13
+[composite VCYCLE]   L1 max|residual| = 6.0714e4
+[composite VCYCLE]   L2 max|residual| = 4.7141e9
+[composite VCYCLE]   L3 max|residual| = 1.5640e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8166e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 1.9991e-3
+[composite VCYCLE] cycle 4/5: max|residual| = 1.5640e13
+[composite VCYCLE]   L1 max|residual| = 1.0540e4
+[composite VCYCLE]   L2 max|residual| = 1.9145e9
+[composite VCYCLE]   L3 max|residual| = 1.1641e13
+[composite VCYCLE]   L1 max|φ_magnet| = 1.8166e-3
+[composite VCYCLE]   L2 max|φ_magnet| = 1.9836e-3
+[composite VCYCLE]   L3 max|φ_magnet| = 1.9979e-3
+[composite VCYCLE] cycle 5/5: max|residual| = 1.1641e13
+[composite VCYCLE] converged max|φ| on L1 = 2.1769e-3
+[composite VCYCLE] converged max|φ| on L2 = 2.3107e-3
+[composite VCYCLE] converged max|φ| on L3 = 2.1678e-3
+[composite VCYCLE] ═══════════════════════════════════════════════════
+  composite:   20595.6 ms
+
+  Computing fine MG reference (1024 × 1024) ...
+[demag_mg] WARNING: extreme cell aspect ratio 6.1 (dx=4.88e-10, dy=4.88e-10, dz=3.00e-9). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[demag_mg] hybrid cache hit -> loaded ΔK stencil from "out/demag_cache/demag_mg_hybrid_dk_nx1024_ny1024_dx4.883e-10_dy4.883e-10_dz3.000e-9_pad6_nvacz16_opiso27_tri_gal_bcbh_th6.000e-1_leaf64_dep20_smwj_pre2_post2_om3fe5555555555555_som3ff0000000000000_sig3ff8000000000000_r14_dv60.bin"
+  Fine MG:     29.77 s
+  max|B|_MG:   5.3038e-1 T
+
+╔════════════════════════════════════════════════════════════════╗
+║  Patch-Level B Accuracy (vs uniform fine FFT (Newell)           )  ║
+╚════════════════════════════════════════════════════════════════╝
+  (normalised to max|B| = 4.6523e-1 T)
+
+  ── Level 1 (12 patches, dx=1.95 nm) ──
+  ── Level 2 (8 patches, dx=0.98 nm) ──
+  ── Level 3 (60 patches, dx=0.49 nm) ──
+  L1: 352 edge, 29894 bulk, 30246 material cells
+    Edge:  cfft=21.35%  comp=18.27%  (Bx=16.07% By=8.69% Bz=0.00%)
+    Bulk:  cfft=2.39%  comp=7.34%
+  L2: 1384 edge, 86812 bulk, 88196 material cells
+    Edge:  cfft=20.72%  comp=16.18%  (Bx=15.00% By=6.06% Bz=0.00%)
+    Bulk:  cfft=2.80%  comp=6.82%
+  L3: 8974 edge, 262157 bulk, 271131 material cells
+    Edge:  cfft=24.73%  comp=18.15%  (Bx=12.28% By=13.37% Bz=0.00%)
+    Bulk:  cfft=3.53%  comp=9.70%
+
+  ────────────────────────────────────────────────────
+  ALL-LEVEL TOTALS (vs uniform fine FFT (Newell)) — 389573 material cells
+  ────────────────────────────────────────────────────
+  EDGE (10710 cells across all levels):
+    coarse-FFT: 24.15%
+    composite:  17.92%
+    → composite is 25.8% MORE ACCURATE at edges
+    Components: Bx=12.81% By=12.53% Bz=0.00%
+  BULK (378863 cells):
+    coarse-FFT: 3.30%
+    composite:  8.95%
+
+╔════════════════════════════════════════════════════════════════╗
+║  Patch-Level B Accuracy (vs uniform fine MG (same formulation)  )  ║
+╚════════════════════════════════════════════════════════════════╝
+  (normalised to max|B| = 5.3038e-1 T)
+
+  ── Level 1 (12 patches, dx=1.95 nm) ──
+  ── Level 2 (8 patches, dx=0.98 nm) ──
+  ── Level 3 (60 patches, dx=0.49 nm) ──
+  L1: 352 edge, 29894 bulk, 30246 material cells
+    Edge:  cfft=20.97%  comp=17.92%  (Bx=15.72% By=7.82% Bz=3.57%)
+    Bulk:  cfft=3.16%  comp=6.82%
+  L2: 1384 edge, 86812 bulk, 88196 material cells
+    Edge:  cfft=20.36%  comp=14.24%  (Bx=12.86% By=4.93% Bz=3.59%)
+    Bulk:  cfft=3.69%  comp=6.51%
+  L3: 8974 edge, 262157 bulk, 271131 material cells
+    Edge:  cfft=25.36%  comp=17.22%  (Bx=12.35% By=11.42% Bz=3.69%)
+    Bulk:  cfft=4.53%  comp=9.05%
+
+  ────────────────────────────────────────────────────
+  ALL-LEVEL TOTALS (vs uniform fine MG (same formulation)) — 389573 material cells
+  ────────────────────────────────────────────────────
+  EDGE (10710 cells across all levels):
+    coarse-FFT: 24.64%
+    composite:  16.89%
+    → composite is 31.5% MORE ACCURATE at edges
+    Components: Bx=12.54% By=10.69% Bz=3.67%
+  BULK (378863 cells):
+    coarse-FFT: 4.26%
+    composite:  8.37%
+
+  TIMING
+  ────────────────────────────────────────────────────
+    coarse-FFT:  6.2 ms
+    composite:   20595.6 ms
+    fine FFT:    90450.1 ms (reference)
+
+  V-cycle mode: ON
+  Wrote out/bench_vcycle_diag/patch_map.csv
+  Wrote out/bench_vcycle_diag/error_map_l1.csv
+  Wrote out/bench_vcycle_diag/l0_slice_y_center.csv
+  Wrote out/bench_vcycle_diag/patch_radial_slice.csv
+  Wrote out/bench_vcycle_diag/summary.txt
+
+  Diagnostics written to out/bench_vcycle_diag/
+  (Use `-- --plots` for PNGs, `-- --sweep` for crossover study)
+
+  Total wall time: 90.5 s
+
