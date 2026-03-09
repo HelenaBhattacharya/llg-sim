@@ -51,7 +51,7 @@ use llg_sim::amr::indicator::IndicatorKind;
 use llg_sim::amr::interp::sample_bilinear;
 use llg_sim::amr::regrid::maybe_regrid_nested_levels;
 use llg_sim::amr::{AmrHierarchy2D, ClusterPolicy, Connectivity, Rect2i, RegridPolicy};
-use llg_sim::geometry_mask::MaskShape;
+use llg_sim::geometry_mask::{MaskShape, edge_smooth_n, fill_fraction_boundary_count, apply_fill_fractions};
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -83,8 +83,9 @@ fn run_benchmark(
     let hole_radius = hole_radius_nm * 1e-9;
     let hole_centre = (0.0, 0.0);
 
-    // Build coarse M
-    let geom_mask = shape.to_mask(&base_grid);
+    // Build coarse M with EdgeSmooth volume-fraction weighting
+    let n_smooth = edge_smooth_n();
+    let (geom_mask, fill_frac) = shape.to_mask_and_fill(&base_grid, n_smooth);
     let mut m_coarse = VectorField2D::new(base_grid);
     for j in 0..base_ny {
         for i in 0..base_nx {
@@ -92,6 +93,7 @@ fn run_benchmark(
             m_coarse.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
         }
     }
+    apply_fill_fractions(&mut m_coarse.data, &fill_frac);
 
     // Build AMR hierarchy
     let mut h = AmrHierarchy2D::new(base_grid, m_coarse, ratio, ghost);
@@ -122,15 +124,18 @@ fn run_benchmark(
     let _ = maybe_regrid_nested_levels(&mut h, &current, regrid_policy, cluster_policy);
     h.fill_patch_ghosts();
 
-    // Reinitialise patch M at fine resolution
+    // Reinitialise patch M at fine resolution with EdgeSmooth
     for p in &mut h.patches {
         p.rebuild_active_from_shape(&base_grid, shape);
         let pnx = p.grid.nx;
         let pny = p.grid.ny;
+        let pdx = p.grid.dx;
+        let pdy = p.grid.dy;
         for j in 0..pny {
             for i in 0..pnx {
                 let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
-                p.m.data[j * pnx + i] = if shape.contains(x, y) { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+                let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
             }
         }
     }
@@ -139,10 +144,13 @@ fn run_benchmark(
             p.rebuild_active_from_shape(&base_grid, shape);
             let pnx = p.grid.nx;
             let pny = p.grid.ny;
+            let pdx = p.grid.dx;
+            let pdy = p.grid.dy;
             for j in 0..pny {
                 for i in 0..pnx {
                     let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
-                    p.m.data[j * pnx + i] = if shape.contains(x, y) { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+                    let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                    p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
                 }
             }
         }
@@ -171,11 +179,14 @@ fn run_benchmark(
         let mut m_fine = VectorField2D::new(fine_grid);
         let fine_half_lx = fine_nx as f64 * fine_grid.dx * 0.5;
         let fine_half_ly = fine_ny as f64 * fine_grid.dy * 0.5;
+        let fine_dx = fine_grid.dx;
+        let fine_dy = fine_grid.dy;
         for j in 0..fine_ny {
             for i in 0..fine_nx {
-                let x = (i as f64 + 0.5) * fine_grid.dx - fine_half_lx;
-                let y = (j as f64 + 0.5) * fine_grid.dy - fine_half_ly;
-                m_fine.data[j * fine_nx + i] = if shape.contains(x, y) { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+                let x = (i as f64 + 0.5) * fine_dx - fine_half_lx;
+                let y = (j as f64 + 0.5) * fine_dy - fine_half_ly;
+                let ff = shape.fill_fraction(x, y, fine_dx, fine_dy, n_smooth);
+                m_fine.data[j * fine_nx + i] = [ff, 0.0, 0.0];
             }
         }
         let t1 = Instant::now();
@@ -524,6 +535,11 @@ fn main() {
     let fine_ny = base_ny * total_ratio;
     let fine_grid = Grid2D::new(fine_nx, fine_ny, dx / total_ratio as f64, dy / total_ratio as f64, dz);
 
+    // ---- Build AMR hierarchy with EdgeSmooth ----
+    let n_smooth = edge_smooth_n();
+    let (geom_mask, fill_frac) = shape.to_mask_and_fill(&base_grid, n_smooth);
+    let n_boundary = fill_fraction_boundary_count(&fill_frac);
+
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  Composite V-Cycle Benchmark — Single Antidot Hole            ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
@@ -534,10 +550,9 @@ fn main() {
     println!("  Fine grid:   {} × {} ({}× refinement, {} AMR levels)",
         fine_nx, fine_ny, total_ratio, amr_levels);
     println!("  V-cycle:     {}", if vcycle_on { "ON (fine ∇φ on patches)" } else { "OFF (interpolated coarse B)" });
+    println!("  EdgeSmooth:  n={} ({} boundary cells with partial fill)", n_smooth, n_boundary);
     println!();
 
-    // ---- Build AMR hierarchy ----
-    let geom_mask = shape.to_mask(&base_grid);
     let mut m_coarse = VectorField2D::new(base_grid);
     for j in 0..base_ny {
         for i in 0..base_nx {
@@ -545,6 +560,7 @@ fn main() {
             m_coarse.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
         }
     }
+    apply_fill_fractions(&mut m_coarse.data, &fill_frac);
 
     let mut h = AmrHierarchy2D::new(base_grid, m_coarse, ratio, ghost);
     h.set_geom_shape(shape.clone());
@@ -579,19 +595,18 @@ fn main() {
 
     h.fill_patch_ghosts();
 
-    // Reinitialise patch M at fine resolution using the shape
+    // Reinitialise patch M at fine resolution using the shape with EdgeSmooth
     for p in &mut h.patches {
         p.rebuild_active_from_shape(&base_grid, &shape);
         let pnx = p.grid.nx;
         let pny = p.grid.ny;
+        let pdx = p.grid.dx;
+        let pdy = p.grid.dy;
         for j in 0..pny {
             for i in 0..pnx {
                 let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
-                p.m.data[j * pnx + i] = if shape.contains(x, y) {
-                    [1.0, 0.0, 0.0]
-                } else {
-                    [0.0, 0.0, 0.0]
-                };
+                let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
             }
         }
     }
@@ -600,14 +615,13 @@ fn main() {
             p.rebuild_active_from_shape(&base_grid, &shape);
             let pnx = p.grid.nx;
             let pny = p.grid.ny;
+            let pdx = p.grid.dx;
+            let pdy = p.grid.dy;
             for j in 0..pny {
                 for i in 0..pnx {
                     let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
-                    p.m.data[j * pnx + i] = if shape.contains(x, y) {
-                        [1.0, 0.0, 0.0]
-                    } else {
-                        [0.0, 0.0, 0.0]
-                    };
+                    let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                    p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
                 }
             }
         }
@@ -625,15 +639,14 @@ fn main() {
         let mut m_fine = VectorField2D::new(fine_grid);
         let fine_half_lx = fine_nx as f64 * fine_grid.dx * 0.5;
         let fine_half_ly = fine_ny as f64 * fine_grid.dy * 0.5;
+        let fine_dx = fine_grid.dx;
+        let fine_dy = fine_grid.dy;
         for j in 0..fine_ny {
             for i in 0..fine_nx {
-                let x = (i as f64 + 0.5) * fine_grid.dx - fine_half_lx;
-                let y = (j as f64 + 0.5) * fine_grid.dy - fine_half_ly;
-                m_fine.data[j * fine_nx + i] = if shape.contains(x, y) {
-                    [1.0, 0.0, 0.0]
-                } else {
-                    [0.0, 0.0, 0.0]
-                };
+                let x = (i as f64 + 0.5) * fine_dx - fine_half_lx;
+                let y = (j as f64 + 0.5) * fine_dy - fine_half_ly;
+                let ff = shape.fill_fraction(x, y, fine_dx, fine_dy, n_smooth);
+                m_fine.data[j * fine_nx + i] = [ff, 0.0, 0.0];
             }
         }
         Some(m_fine)
@@ -1128,6 +1141,134 @@ fn main() {
         println!("  Wrote {}", path);
     }
 
+    // ---- 4b. THESIS FIGURE: Radial Bx profile (always generated) ----
+    // This is the single most informative figure for the thesis: it shows
+    // Bx vs distance-from-hole for FFT (reference), coarse-FFT (smeared),
+    // and composite (partially resolved). The sharp Bx peak at the hole
+    // boundary tells the whole story of staircase vs smooth boundaries.
+    if !h.patches.is_empty() && !b_l1_comp.is_empty() {
+        let target_pi = if h.patches.len() > 5 { 5 } else { 0 };
+        let patch = &h.patches[target_pi];
+        let pnx = patch.grid.nx;
+        let gi0 = patch.interior_i0();
+        let gi1 = patch.interior_i1();
+        let gj0 = patch.interior_j0();
+        let gj1 = patch.interior_j1();
+        let jmid = (gj0 + gj1) / 2;
+
+        let b_cfft_p = &b_l1_cfft[target_pi];
+        let b_comp_p = &b_l1_comp[target_pi];
+
+        // Collect data points
+        let mut pts_fft: Vec<(f64, f64)> = Vec::new();
+        let mut pts_cfft: Vec<(f64, f64)> = Vec::new();
+        let mut pts_comp: Vec<(f64, f64)> = Vec::new();
+
+        for i in gi0..gi1 {
+            let (x, y) = patch.cell_center_xy_centered(i, jmid, &base_grid);
+            let r_nm = (x - hole_centre.0).hypot(y - hole_centre.1) * 1e9;
+            let idx = jmid * pnx + i;
+
+            if let Some(ref bf) = b_fine_fft_opt {
+                let (xc, yc) = patch.cell_center_xy(i, jmid);
+                let br = sample_bilinear(bf, xc, yc);
+                pts_fft.push((r_nm, br[0]));
+            }
+            pts_cfft.push((r_nm, b_cfft_p[idx][0]));
+            pts_comp.push((r_nm, b_comp_p[idx][0]));
+        }
+
+        if !pts_fft.is_empty() || !pts_cfft.is_empty() {
+            let all_pts = pts_fft.iter().chain(pts_cfft.iter()).chain(pts_comp.iter());
+            let r_min = all_pts.clone().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let r_max = all_pts.clone().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let b_all_min = all_pts.clone().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let b_all_max = all_pts.clone().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+            let b_range = (b_all_max - b_all_min).max(0.01);
+            let y_lo = b_all_min - b_range * 0.1;
+            let y_hi = b_all_max + b_range * 0.1;
+
+            let path = format!("{}/radial_bx_thesis.png", diag_dir);
+            let root = BitMapBackend::new(&path, (900, 500)).into_drawing_area();
+            root.fill(&WHITE).unwrap();
+
+            let smooth_label = if n_smooth > 0 {
+                format!("Radial Bx Profile — L0={}, EdgeSmooth={}", base_nx, n_smooth)
+            } else {
+                format!("Radial Bx Profile — L0={}, Staircase", base_nx)
+            };
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(&smooth_label, ("sans-serif", 20).into_font())
+                .margin(12)
+                .x_label_area_size(40)
+                .y_label_area_size(60)
+                .build_cartesian_2d(r_min..r_max, y_lo..y_hi)
+                .unwrap();
+
+            chart.configure_mesh()
+                .x_desc("Distance from centre (nm)")
+                .y_desc("Bx (T)")
+                .label_style(("sans-serif", 14))
+                .draw()
+                .unwrap();
+
+            // Vertical line at hole boundary
+            chart.draw_series(std::iter::once(PathElement::new(
+                vec![(hole_radius_nm, y_lo), (hole_radius_nm, y_hi)],
+                BLACK.mix(0.4).stroke_width(1),
+            ))).unwrap();
+
+            // "material" / "vacuum" labels
+            let mid_y = (y_lo + y_hi) * 0.5;
+            chart.draw_series(std::iter::once(plotters::element::Text::new(
+                "material", (hole_radius_nm + 2.0, mid_y), ("sans-serif", 12).into_font().color(&BLACK.mix(0.5)),
+            ))).ok();
+            chart.draw_series(std::iter::once(plotters::element::Text::new(
+                "vacuum", (hole_radius_nm - 8.0, mid_y), ("sans-serif", 12).into_font().color(&BLACK.mix(0.5)),
+            ))).ok();
+
+            // FFT reference (blue, thick)
+            if !pts_fft.is_empty() {
+                chart.draw_series(LineSeries::new(pts_fft, BLUE.stroke_width(3)))
+                    .unwrap()
+                    .label("Fine FFT (reference)")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE.stroke_width(3)));
+            }
+
+            // Coarse-FFT (green, dashed via dots)
+            chart.draw_series(LineSeries::new(pts_cfft.clone(), GREEN.stroke_width(2)))
+                .unwrap()
+                .label("Coarse-FFT")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN.stroke_width(2)));
+            // Add dots for visual distinction
+            chart.draw_series(pts_cfft.iter().step_by(3).map(|&(rx, bx)|
+                Circle::new((rx, bx), 3, GREEN.filled())
+            )).unwrap();
+
+            // Composite (red)
+            chart.draw_series(LineSeries::new(pts_comp.clone(), RED.stroke_width(2)))
+                .unwrap()
+                .label("Composite MG")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED.stroke_width(2)));
+            // Add dots
+            chart.draw_series(pts_comp.iter().step_by(3).map(|&(rx, bx)|
+                Circle::new((rx, bx), 3, RED.filled())
+            )).unwrap();
+
+            chart.configure_series_labels()
+                .background_style(WHITE.mix(0.9))
+                .border_style(BLACK)
+                .label_font(("sans-serif", 13))
+                .position(SeriesLabelPosition::UpperLeft)
+                .draw()
+                .unwrap();
+
+            root.present().unwrap();
+            println!("  Wrote {} (thesis figure)", path);
+        }
+    }
+
     // ---- 5. Summary file ----
     {
         let path = format!("{}/summary.txt", diag_dir);
@@ -1139,6 +1280,7 @@ fn main() {
         writeln!(f, "Base grid: {} x {}, dx = {:.2} nm", base_nx, base_ny, dx * 1e9).unwrap();
         writeln!(f, "Fine grid: {} x {} ({} AMR levels)", fine_nx, fine_ny, amr_levels).unwrap();
         writeln!(f, "V-cycle: {}", if vcycle_on { "ON" } else { "OFF" }).unwrap();
+        writeln!(f, "EdgeSmooth: n={} ({} boundary cells)", n_smooth, n_boundary).unwrap();
         writeln!(f, "Patches: L1={}, L2+={}", n_l1, n_l2).unwrap();
         writeln!(f, "coarse-FFT: {:.1} ms", t_cfft).unwrap();
         writeln!(f, "composite: {:.1} ms", t_comp).unwrap();

@@ -1108,11 +1108,21 @@ fn compute_defect_correction_on_patch(
             let (x, y) = patch.cell_center_xy(i, j);
             let b_coarse = sample_bilinear(b_l0, x, y);
 
-            // Combine: B_patch = B_parent_interp + δB
-            // Bz purely from parent (3D z-physics captured by the 3D padded-box solve).
+            // Geometry-aware defect damping: weight δB by local |M|.
+            //
+            // The Jacobi smoother on the defect equation doesn't know about
+            // material/vacuum boundaries — it propagates δφ into vacuum cells
+            // where ∇(δφ) produces spurious oscillations.  Weighting by |M|:
+            //   - Vacuum (|M|=0): pure interpolated parent B (discard noisy δB)
+            //   - Boundary (0<|M|<1, via EdgeSmooth): graduated blend
+            //   - Interior (|M|=1): full δB correction (unchanged)
+            let m_at = patch.m.data[idx];
+            let m_mag = (m_at[0]*m_at[0] + m_at[1]*m_at[1] + m_at[2]*m_at[2])
+                .sqrt().min(1.0);
+
             b_out[idx] = [
-                b_coarse[0] + dbx,
-                b_coarse[1] + dby,
+                b_coarse[0] + m_mag * dbx,
+                b_coarse[1] + m_mag * dby,
                 b_coarse[2],
             ];
         }

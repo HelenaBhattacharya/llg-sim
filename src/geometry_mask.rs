@@ -19,6 +19,28 @@ use crate::grid::Grid2D;
 /// Boolean geometry mask for a 2D grid (length = nx*ny).
 pub type Mask2D = Vec<bool>;
 
+/// Per-cell volume (area) fill fraction ∈ [0.0, 1.0] for a 2D grid.
+///
+/// A value of 1.0 means the cell is fully inside the material;
+/// 0.0 means fully outside (vacuum).  Intermediate values arise for
+/// cells that straddle the material/vacuum boundary.
+///
+/// MuMax3 calls this "EdgeSmooth": `EdgeSmooth = n` means n² sub-samples
+/// per cell (they use n³ in 3D; we use n² for thin-film 2D).
+pub type FillFraction2D = Vec<f64>;
+
+/// Read the sub-sampling level from `LLG_EDGE_SMOOTH` (default: 8).
+///
+/// `n = 0` disables smoothing (pure staircase, equivalent to boolean mask).
+/// `n = 8` gives 64 sub-samples per cell — matches MuMax3 default.
+/// Higher values are diminishing returns; 8 is sufficient for most purposes.
+pub fn edge_smooth_n() -> usize {
+    std::env::var("LLG_EDGE_SMOOTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+
 // ---------------------------------------------------------------------------
 // MaskShape: analytical shape descriptor (re-evaluable at any resolution)
 // ---------------------------------------------------------------------------
@@ -159,6 +181,110 @@ impl MaskShape {
     /// ¬A
     pub fn invert(self) -> MaskShape {
         MaskShape::Invert(Box::new(self))
+    }
+
+    // ---- EdgeSmooth: fill-fraction computation (MuMax3 style) ----
+
+    /// Compute the fill fraction of a single cell by sub-sampling.
+    ///
+    /// The cell is centred at `(cx, cy)` with size `(dx, dy)`.
+    /// `n` sub-samples per dimension → n² evaluation points, uniformly
+    /// distributed across the cell area.
+    ///
+    /// Returns a value in `[0.0, 1.0]`.
+    ///
+    /// If `n == 0`, returns 1.0 if the cell centre is inside, 0.0 otherwise
+    /// (staircase approximation).
+    pub fn fill_fraction(&self, cx: f64, cy: f64, dx: f64, dy: f64, n: usize) -> f64 {
+        if n == 0 {
+            return if self.contains(cx, cy) { 1.0 } else { 0.0 };
+        }
+
+        let mut count = 0u32;
+        let total = (n * n) as u32;
+
+        // Sub-sample positions: evenly spaced within the cell,
+        // offset by half a sub-cell width from the cell edge.
+        // For n=8: sub-positions at 1/16, 3/16, 5/16, ..., 15/16 of dx.
+        let inv_n = 1.0 / n as f64;
+        let x0 = cx - dx * 0.5;
+        let y0 = cy - dy * 0.5;
+
+        for sj in 0..n {
+            let sy = y0 + (sj as f64 + 0.5) * inv_n * dy;
+            for si in 0..n {
+                let sx = x0 + (si as f64 + 0.5) * inv_n * dx;
+                if self.contains(sx, sy) {
+                    count += 1;
+                }
+            }
+        }
+
+        count as f64 / total as f64
+    }
+
+    /// Build a fill-fraction array for the entire grid.
+    ///
+    /// This is the 2D equivalent of MuMax3's `EdgeSmooth = n`.
+    /// Each cell gets a value in `[0.0, 1.0]` representing the fraction
+    /// of the cell that lies inside the material.
+    ///
+    /// **Optimisation:** cells whose 4 corners are ALL inside or ALL outside
+    /// skip sub-sampling entirely (they get 1.0 or 0.0 directly).
+    /// Only cells that straddle the boundary are sub-sampled at full `n²`
+    /// resolution.  For a typical antidot with ~5% boundary cells, this
+    /// makes the computation essentially free.
+    pub fn to_fill_fractions(&self, grid: &Grid2D, n: usize) -> FillFraction2D {
+        let nx = grid.nx;
+        let ny = grid.ny;
+        let dx = grid.dx;
+        let dy = grid.dy;
+        let mut ff = vec![0.0f64; nx * ny];
+
+        let half_nx = nx as f64 * 0.5;
+        let half_ny = ny as f64 * 0.5;
+
+        for j in 0..ny {
+            for i in 0..nx {
+                let cx = (i as f64 + 0.5 - half_nx) * dx;
+                let cy = (j as f64 + 0.5 - half_ny) * dy;
+
+                if n == 0 {
+                    // Pure staircase
+                    ff[j * nx + i] = if self.contains(cx, cy) { 1.0 } else { 0.0 };
+                    continue;
+                }
+
+                // Quick check: test the 4 cell corners.
+                // If all are the same (all in or all out), skip sub-sampling.
+                let c00 = self.contains(cx - dx * 0.5, cy - dy * 0.5);
+                let c10 = self.contains(cx + dx * 0.5, cy - dy * 0.5);
+                let c01 = self.contains(cx - dx * 0.5, cy + dy * 0.5);
+                let c11 = self.contains(cx + dx * 0.5, cy + dy * 0.5);
+
+                if c00 == c10 && c10 == c01 && c01 == c11 {
+                    // All corners agree → cell is fully inside or fully outside.
+                    ff[j * nx + i] = if c00 { 1.0 } else { 0.0 };
+                } else {
+                    // Boundary cell — do full sub-sampling.
+                    ff[j * nx + i] = self.fill_fraction(cx, cy, dx, dy, n);
+                }
+            }
+        }
+
+        ff
+    }
+
+    /// Build both a boolean mask AND fill fractions in one pass.
+    ///
+    /// The boolean mask uses `fill > 0.0` as the threshold (any material
+    /// in the cell counts as "material" for exchange / masking purposes).
+    /// This matches MuMax3 behaviour where EdgeSmooth affects Ms but
+    /// exchange neighbours still use the boolean mask.
+    pub fn to_mask_and_fill(&self, grid: &Grid2D, n: usize) -> (Mask2D, FillFraction2D) {
+        let ff = self.to_fill_fractions(grid, n);
+        let mask = ff.iter().map(|&f| f > 0.0).collect();
+        (mask, ff)
     }
 }
 
@@ -408,6 +534,37 @@ pub fn hex_hole_centres_inset(lx: f64, ly: f64, pitch: f64, inset: f64) -> Vec<(
 }
 
 // ---------------------------------------------------------------------------
+// Fill-fraction utilities
+// ---------------------------------------------------------------------------
+
+/// Count boundary cells (cells with 0 < fill_fraction < 1).
+pub fn fill_fraction_boundary_count(ff: &[f64]) -> usize {
+    ff.iter().filter(|&&f| f > 0.0 && f < 1.0).count()
+}
+
+/// Apply fill fractions to a magnetisation array in-place.
+///
+/// For each cell: `m[k] *= fill_fraction[k]`.
+/// Interior cells (f=1) are unchanged.  Vacuum cells (f=0) become zero.
+/// Boundary cells get M_eff = f * M_sat * m̂, smoothing the surface charges.
+///
+/// This is the core of the EdgeSmooth correction: the demag solver then
+/// sees a smooth ∇·M at material boundaries instead of a sharp step.
+pub fn apply_fill_fractions(m: &mut [[f64; 3]], ff: &[f64]) {
+    assert_eq!(m.len(), ff.len(), "m and fill_fraction length mismatch");
+    for (v, &f) in m.iter_mut().zip(ff.iter()) {
+        v[0] *= f;
+        v[1] *= f;
+        v[2] *= f;
+    }
+}
+
+/// Build fill fractions using the global default from `LLG_EDGE_SMOOTH`.
+pub fn fill_fractions_default(shape: &MaskShape, grid: &Grid2D) -> FillFraction2D {
+    shape.to_fill_fractions(grid, edge_smooth_n())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -523,5 +680,109 @@ mod tests {
             assert!(x.abs() <= 1e-6, "hole at x={:.0e} outside domain", x);
             assert!(y.abs() <= 1e-6, "hole at y={:.0e} outside domain", y);
         }
+    }
+
+    // ---- Fill-fraction / EdgeSmooth tests ----
+
+    #[test]
+    fn fill_fraction_interior_cell_is_one() {
+        let shape = MaskShape::Disk { center: (0.0, 0.0), radius: 100e-9 };
+        // Cell well inside the disk
+        let f = shape.fill_fraction(0.0, 0.0, 2e-9, 2e-9, 8);
+        assert!((f - 1.0).abs() < 1e-10, "interior cell should have f=1, got {f}");
+    }
+
+    #[test]
+    fn fill_fraction_exterior_cell_is_zero() {
+        let shape = MaskShape::Disk { center: (0.0, 0.0), radius: 10e-9 };
+        // Cell well outside the disk
+        let f = shape.fill_fraction(50e-9, 50e-9, 2e-9, 2e-9, 8);
+        assert!(f.abs() < 1e-10, "exterior cell should have f=0, got {f}");
+    }
+
+    #[test]
+    fn fill_fraction_boundary_cell_is_partial() {
+        let shape = MaskShape::Disk { center: (0.0, 0.0), radius: 10e-9 };
+        // Cell straddling the boundary (cell centre at r=10nm, edge of disk)
+        let f = shape.fill_fraction(10e-9, 0.0, 2e-9, 2e-9, 8);
+        assert!(f > 0.0, "boundary cell should have f>0, got {f}");
+        assert!(f < 1.0, "boundary cell should have f<1, got {f}");
+    }
+
+    #[test]
+    fn fill_fraction_n0_is_staircase() {
+        let grid = Grid2D::new(32, 32, 1e-9, 1e-9, 1e-9);
+        let shape = MaskShape::Disk { center: (0.0, 0.0), radius: 10e-9 };
+
+        let ff_staircase = shape.to_fill_fractions(&grid, 0);
+        let mask_bool = shape.to_mask(&grid);
+
+        // n=0 should give exactly 0.0 or 1.0, matching the boolean mask
+        for (k, (&f, &b)) in ff_staircase.iter().zip(mask_bool.iter()).enumerate() {
+            let expected = if b { 1.0 } else { 0.0 };
+            assert!((f - expected).abs() < 1e-10,
+                "cell {k}: fill_fraction={f} but mask={b}");
+        }
+    }
+
+    #[test]
+    fn fill_fraction_has_boundary_cells() {
+        let grid = Grid2D::new(64, 64, 1e-9, 1e-9, 1e-9);
+        let shape = MaskShape::Disk { center: (0.0, 0.0), radius: 20e-9 };
+
+        let ff = shape.to_fill_fractions(&grid, 8);
+        let n_boundary = fill_fraction_boundary_count(&ff);
+
+        // A circle of radius 20nm at 1nm cells should have ~60-130 boundary cells
+        assert!(n_boundary > 20,
+            "expected boundary cells for disk, got {n_boundary}");
+        assert!(n_boundary < 300,
+            "too many boundary cells: {n_boundary}");
+    }
+
+    #[test]
+    fn fill_fraction_multihole_smooths_edges() {
+        let grid = Grid2D::new(128, 128, 4e-9, 4e-9, 3e-9);
+        let shape = MaskShape::MultiHole {
+            holes: vec![(0.0, 0.0)],
+            radius: 100e-9,
+        };
+
+        let ff = shape.to_fill_fractions(&grid, 8);
+        let n_boundary = fill_fraction_boundary_count(&ff);
+
+        // Should have partial cells around the hole boundary
+        assert!(n_boundary > 10,
+            "expected partial cells around hole, got {n_boundary}");
+    }
+
+    #[test]
+    fn to_mask_and_fill_consistent() {
+        let grid = Grid2D::new(32, 32, 2e-9, 2e-9, 1e-9);
+        let shape = MaskShape::Disk { center: (0.0, 0.0), radius: 15e-9 };
+
+        let (mask, ff) = shape.to_mask_and_fill(&grid, 8);
+
+        // mask should be true wherever fill > 0
+        for (k, (&m, &f)) in mask.iter().zip(ff.iter()).enumerate() {
+            if f > 0.0 {
+                assert!(m, "cell {k}: f={f} > 0 but mask=false");
+            }
+            if !m {
+                assert!(f == 0.0, "cell {k}: mask=false but f={f}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_fill_fractions_scales_m() {
+        let mut m = vec![[1.0, 0.0, 0.0]; 4];
+        let ff = vec![1.0, 0.5, 0.25, 0.0];
+        apply_fill_fractions(&mut m, &ff);
+
+        assert!((m[0][0] - 1.0).abs() < 1e-10);
+        assert!((m[1][0] - 0.5).abs() < 1e-10);
+        assert!((m[2][0] - 0.25).abs() < 1e-10);
+        assert!((m[3][0] - 0.0).abs() < 1e-10);
     }
 }
