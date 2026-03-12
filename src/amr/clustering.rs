@@ -92,6 +92,13 @@ pub struct ClusterPolicy {
     ///
     /// Set to 1.0 to disable the cap.
     pub max_flagged_fraction: f64,
+    /// Confine buffer-zone dilation to material cells only.
+    ///
+    /// When `true`, the Berger–Colella buffer dilation will not expand flagged
+    /// cells into vacuum.  Use for convex shapes (disks) where narrow vacuum
+    /// gaps between material and domain edge can be bridged by the buffer.
+    /// Default `false` preserves original behaviour for all other geometries.
+    pub confine_dilation: bool,
 }
 
 impl Default for ClusterPolicy {
@@ -106,6 +113,7 @@ impl Default for ClusterPolicy {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         }
     }
 }
@@ -124,6 +132,7 @@ impl ClusterPolicy {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         }
     }
 
@@ -144,6 +153,7 @@ impl ClusterPolicy {
             boundary_layer: 2,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         }
     }
 
@@ -171,6 +181,7 @@ impl ClusterPolicy {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         }
     }
 }
@@ -257,7 +268,20 @@ fn neighbour_offsets(conn: Connectivity) -> &'static [(isize, isize)] {
 /// into one giant box.
 ///
 /// Returns the updated flagged-cell count.
-fn dilate_mask(flagged: &mut [bool], nx: usize, ny: usize, radius: usize) -> usize {
+///
+/// If `geom_mask` is provided, dilation is restricted to material cells only.
+/// This prevents buffer zones from expanding into vacuum, keeping boundary
+/// patches tight to the material edge (García-Cervera conformance).
+/// Without this, BFS pushes flagged cells through the material–vacuum
+/// interface, causing bounding boxes to overshoot curved boundaries (e.g.
+/// disk edges) and creating spurious magnetisation in vacuum cells.
+fn dilate_mask(
+    flagged: &mut [bool],
+    nx: usize,
+    ny: usize,
+    radius: usize,
+    geom_mask: Option<&[bool]>,
+) -> usize {
     if radius == 0 {
         return flagged.iter().filter(|&&f| f).count();
     }
@@ -294,6 +318,16 @@ fn dilate_mask(flagged: &mut [bool], nx: usize, ny: usize, radius: usize) -> usi
                     continue;
                 }
                 let nk = nj as usize * nx + ni as usize;
+                // Do not dilate into vacuum cells.  Without this check,
+                // the BFS expands through the material–vacuum boundary,
+                // connecting separate arc segments of a disk boundary into
+                // one giant connected component and pushing bounding boxes
+                // well beyond the material edge.
+                if let Some(gm) = geom_mask {
+                    if !gm[nk] {
+                        continue;
+                    }
+                }
                 if dist[nk] > nd {
                     dist[nk] = nd;
                     flagged[nk] = true;
@@ -613,7 +647,24 @@ pub fn compute_patch_rects_clustered_from_indicator(
         }
 
         // ── 4) Dilate the flagged mask by buffer_cells ───────────────────
-        flagged_cells = dilate_mask(&mut flagged, nx, ny, policy.buffer_cells);
+        //
+        // When confine_dilation is true, dilation is restricted to material
+        // cells so that buffer zones do not bridge through narrow vacuum gaps.
+        // When false (default), dilation is unrestricted — original behaviour.
+        let confine = if policy.confine_dilation { geom_mask } else { None };
+        flagged_cells = dilate_mask(&mut flagged, nx, ny, policy.buffer_cells, confine);
+
+        // Belt-and-suspenders: clamp to material after dilation (only when confining).
+        if policy.confine_dilation {
+            if let Some(gm) = geom_mask {
+                for k in 0..(nx * ny) {
+                    if flagged[k] && !gm[k] {
+                        flagged[k] = false;
+                        flagged_cells = flagged_cells.saturating_sub(1);
+                    }
+                }
+            }
+        }
 
         // ── 4b) Post-dilation coverage cap ───────────────────────────────
         //
@@ -962,6 +1013,7 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         };
 
         let result = compute_patch_rects_clustered_from_indicator(&f, policy, None);
@@ -1005,6 +1057,7 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         };
 
         let result = compute_patch_rects_clustered_from_indicator(&f, policy, None);
@@ -1040,6 +1093,7 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         };
 
         let result = compute_patch_rects_clustered_from_indicator(&f, policy, None);
@@ -1079,6 +1133,7 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.0,
             max_flagged_fraction: 1.0,
+            confine_dilation: false,
         };
 
         let policy_with_bl = ClusterPolicy {
@@ -1138,6 +1193,7 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         };
 
         let result = compute_patch_rects_clustered_from_indicator(&f, policy, None);
@@ -1178,6 +1234,7 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         };
 
         let result = compute_patch_rects_clustered_from_indicator(&f, policy, None);
@@ -1301,6 +1358,7 @@ mod tests {
             boundary_layer: 2,
             min_efficiency: 0.70,
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
         };
 
         let result = compute_patch_rects_clustered_from_indicator(&f, policy, Some(&mask));
@@ -1391,10 +1449,12 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.0,
             max_flagged_fraction: 1.0, // disabled
+            confine_dilation: false,
         };
 
         let policy_with_cap = ClusterPolicy {
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
             ..policy_no_cap
         };
 
@@ -1479,10 +1539,12 @@ mod tests {
             boundary_layer: 0,
             min_efficiency: 0.0,
             max_flagged_fraction: 1.0, // disabled
+            confine_dilation: false,
         };
 
         let policy_with_cap = ClusterPolicy {
             max_flagged_fraction: 0.50,
+            confine_dilation: false,
             ..policy_no_cap
         };
 

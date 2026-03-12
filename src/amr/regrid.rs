@@ -402,6 +402,7 @@ pub fn maybe_regrid_multi_patch(
     let old_u = union_of_rects(&cur)?;
     let new_u = union_of_rects(&new_rects)?;
 
+    // Accept if union bbox changed materially (original check)
     if material_change(
         old_u,
         new_u,
@@ -409,10 +410,49 @@ pub fn maybe_regrid_multi_patch(
         policy.min_area_change_frac,
     ) {
         h.replace_patches_preserve_overlap(new_rects.clone());
-        Some((new_rects, stats))
-    } else {
-        None
+        return Some((new_rects, stats));
     }
+
+    // Also accept if the proposal contains a genuinely NEW region — a patch
+    // that doesn't substantially overlap any single existing patch.  This catches
+    // features that appear INSIDE the existing union bbox (e.g. a vortex-core
+    // patch appearing inside the boundary-arc ring) without triggering on
+    // clustering noise that reshuffles existing arcs (6→7→6 fluctuations).
+    //
+    // "Genuinely new" = proposed patch has <50% overlap with every existing patch.
+    // This is conservative: a patch shifted by half its width would still have
+    // ~50% overlap, so it won't trigger.  Only a patch in a truly new location
+    // (like a core patch appearing among boundary arcs) triggers acceptance.
+    if new_rects.len() > cur.len() {
+        let has_genuinely_new = new_rects.iter().any(|nr| {
+            let nr_area = (nr.nx * nr.ny).max(1) as f64;
+            cur.iter().all(|cr| {
+                let overlap = rect_intersection(*nr, *cr)
+                    .map(|int| (int.nx * int.ny) as f64)
+                    .unwrap_or(0.0);
+                overlap / nr_area < 0.5
+            })
+        });
+        if has_genuinely_new {
+            h.replace_patches_preserve_overlap(new_rects.clone());
+            return Some((new_rects, stats));
+        }
+    }
+
+    // Also accept if total individual-patch area changed by min_area_change_frac.
+    // This catches cases where individual patches grew/shrank but the union
+    // didn't change (e.g. a boundary patch expanded to cover a nearby feature).
+    let old_total: usize = cur.iter().map(|r| r.nx * r.ny).sum();
+    let new_total: usize = new_rects.iter().map(|r| r.nx * r.ny).sum();
+    let total_frac = if old_total > 0 {
+        (new_total as f64 - old_total as f64).abs() / old_total as f64
+    } else { 1.0 };
+    if total_frac >= policy.min_area_change_frac {
+        h.replace_patches_preserve_overlap(new_rects.clone());
+        return Some((new_rects, stats));
+    }
+
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -533,10 +573,26 @@ fn indicator_at_level(base: IndicatorKind, ratio: usize, level: usize) -> Indica
         }
         _ => {
             // Progressive tightening for relative-threshold modes.
+            //
+            // The default tighten_factor depends on the indicator:
+            //   - Composite: 1.0 (no tightening).  The composite map is already
+            //     normalised to [0,1] by dividing each constituent by its own max.
+            //     Tightening the frac per level over-suppresses the signal on the
+            //     already-partially-resolved parent field, causing L3 to miss
+            //     features (e.g. vortex cores) that are clearly present.
+            //   - Grad2/Div/Curl: 1.5 (original).  These have scale-dependent
+            //     values, so tightening at deeper levels appropriately focuses
+            //     on the sharpest remaining features.
+            //
+            // Override via `LLG_AMR_LEVEL_TIGHTEN` env var.
+            let default_tighten = match base {
+                IndicatorKind::Composite { .. } => 1.0,
+                _ => 1.5,
+            };
             let tighten_factor: f64 = std::env::var("LLG_AMR_LEVEL_TIGHTEN")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1.5);
+                .unwrap_or(default_tighten);
 
             let depth = (level - 1) as i32;
             let scale = tighten_factor.powi(depth);
@@ -638,6 +694,12 @@ pub fn maybe_regrid_nested_levels(
 
     let mut changed_deep = false;
 
+    // Track which levels changed in this regrid cycle.  When a parent level's
+    // patches shifted, child levels should unconditionally accept re-clustering
+    // (the hierarchy has moved, so holding the old child patches is wrong).
+    let mut level_changed: Vec<bool> = vec![false; max_level + 1];
+    level_changed[1] = lvl1_res.is_some();
+
     // ── Clear levels above max_level if they exist ───────────────────────
     let levels_to_clear_above: Vec<usize> = h
         .patches_l2plus
@@ -708,10 +770,32 @@ pub fn maybe_regrid_nested_levels(
         }
 
         // Cluster policy for this level: adjust indicator for nesting depth.
+        //
+        // By default, boundary_layer is 0 for L2+ levels.
+        // The García-Cervera boundary criterion (flag cells near material–vacuum
+        // interface) is a level-1 concern: L1 patches resolve surface charges
+        // σ=M·n̂ at fine dx.  Once the boundary is resolved at L1, deeper levels
+        // should be purely indicator-driven — refining where the magnetisation
+        // has sharp features (vortex cores, domain walls), not re-refining the
+        // already-resolved boundary.
+        //
+        // Without this, BFS boundary flooding at L2/L3 dominates the clustering:
+        // ~48 boundary cells flagged vs ~4-8 core cells → L3 patches sit at the
+        // disk edge instead of tracking the vortex core.  The core remains at L0
+        // resolution (unresolved), causing instability at low α.
+        //
+        // Override: set LLG_AMR_L2PLUS_BOUNDARY_LAYER to a non-zero value to
+        // enable boundary flooding at L2+ (e.g. for shaped geometries where
+        // tight boundary conformance at all levels is desired).  Static problems
+        // like bench_composite_vcycle should leave this unset (default 0).
+        let l2plus_bl: usize = std::env::var("LLG_AMR_L2PLUS_BOUNDARY_LAYER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let level_indicator = indicator_at_level(cluster_policy_level1.indicator, h.ratio, level);
         let cp = ClusterPolicy {
             indicator: level_indicator,
-            boundary_layer: cluster_policy_level1.boundary_layer,
+            boundary_layer: l2plus_bl,  // L2+: default 0 (indicator-only), override via env
             buffer_cells: cluster_policy_level1.buffer_cells,
             connectivity: cluster_policy_level1.connectivity,
             merge_distance: cluster_policy_level1.merge_distance,
@@ -724,6 +808,7 @@ pub fn maybe_regrid_nested_levels(
             // full grid and broadly distributed features can degenerate into
             // "refine everything".
             max_flagged_fraction: 1.0,
+            confine_dilation: false,
         };
 
         // Compute candidate rects on the parent-resolution grid.
@@ -783,9 +868,84 @@ pub fn maybe_regrid_nested_levels(
         let mut cur = rects_at_level_base(h, level);
         cur.sort_by_key(|r| (r.i0, r.j0, r.nx, r.ny));
 
+        // Did the parent level change in this regrid cycle?
+        let parent_changed = level_changed.get(parent_level).copied().unwrap_or(false);
+
+        // L2+ hysteresis to prevent refine-derefine oscillation.
+        //
+        // The oscillation cycle:
+        //   1. Indicator on parent composite (with existing patches) → smooth
+        //      → fewer patches flagged → patches REMOVED
+        //   2. Without patches → parent field is coarser → indicator spikes
+        //      → patches RECREATED → goto 1
+        //
+        // Fix: asymmetric acceptance thresholds.
+        // - Growing (adding patches) is always accepted — features need refinement.
+        // - Shrinking (removing patches) requires that the new set has <50% of old
+        //   total area.  Small fluctuations in the clustering (e.g. 53→49 or 10→8)
+        //   are suppressed.  Only genuine de-refinement (e.g. feature leaves the
+        //   region entirely) triggers patch removal.
+        //
+        // Additional bypass conditions:
+        // - If the parent level changed, unconditionally accept.  The parent's
+        //   patches have shifted, so the old child layout is stale.
+        // - If the weighted centroid of proposed patches moved by >2 base cells,
+        //   accept regardless of area change.  This catches a moving feature
+        //   (e.g. vortex core) that the area-only check would reject because
+        //   the new patch at the new position has similar area to the old patch
+        //   at the old position.
         if cur != rects_base {
-            h.replace_level_patches_preserve_overlap(level, rects_base);
-            changed_deep = true;
+            let old_area: usize = cur.iter().map(|r| r.nx * r.ny).sum();
+            let new_area: usize = rects_base.iter().map(|r| r.nx * r.ny).sum();
+
+            let mut accept = if cur.is_empty() {
+                true // always accept if creating from nothing
+            } else if rects_base.is_empty() {
+                true // always accept full removal (no parent patches → no children)
+            } else if parent_changed {
+                true // parent shifted → child layout is stale
+            } else if new_area >= old_area {
+                true // growing or same → always accept
+            } else {
+                // Shrinking: only accept if new area is less than 50% of old.
+                // This prevents the 53→4→52→4 oscillation where the clustering
+                // alternates between "boundary+core" and "core only" because the
+                // indicator sees the refined-vs-unrefined field.
+                let shrink_frac = new_area as f64 / old_area.max(1) as f64;
+                shrink_frac < 0.50
+            };
+
+            // Centroid-shift detection: if the proposed patches' area-weighted
+            // centroid moved by more than 2 base cells from the current patches,
+            // accept regardless of area change.  This lets L2/L3 track a moving
+            // vortex core even when the total patch area didn't change much.
+            if !accept && !cur.is_empty() && !rects_base.is_empty() && old_area > 0 && new_area > 0 {
+                let centroid = |rects: &[Rect2i], total_area: usize| -> (f64, f64) {
+                    let mut cx = 0.0_f64;
+                    let mut cy = 0.0_f64;
+                    for r in rects {
+                        let a = (r.nx * r.ny) as f64;
+                        cx += (r.i0 as f64 + r.nx as f64 * 0.5) * a;
+                        cy += (r.j0 as f64 + r.ny as f64 * 0.5) * a;
+                    }
+                    let ta = total_area.max(1) as f64;
+                    (cx / ta, cy / ta)
+                };
+                let (old_cx, old_cy) = centroid(&cur, old_area);
+                let (new_cx, new_cy) = centroid(&rects_base, new_area);
+                let shift = ((new_cx - old_cx).powi(2) + (new_cy - old_cy).powi(2)).sqrt();
+                if shift > 2.0 {
+                    accept = true;
+                }
+            }
+
+            if accept {
+                h.replace_level_patches_preserve_overlap(level, rects_base);
+                changed_deep = true;
+                if level < level_changed.len() {
+                    level_changed[level] = true;
+                }
+            }
         }
 
         // If this level ended up empty, clear deeper and stop.

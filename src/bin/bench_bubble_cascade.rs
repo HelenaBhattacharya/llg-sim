@@ -1,15 +1,13 @@
 // src/bin/bench_bubble_cascade.rs
 //
-// AMR Dynamics Showcase: 3 mixed-size magnetic bubble domains in a PMA + DMI film.
+// AMR Dynamics Showcase: 3 magnetic bubbles in a chain-collision cascade.
 //
-// Redesigned "hero problem" for the thesis.  Three bubbles of different radii
-// undergo a staged relaxation cascade at zero applied field:
-//   Phase 1 (0..phase2_step): Wall sharpening from seed profile.  Dumbbell
-//            neck evolves, walls tighten to physical δ ≈ 4 nm width.
-//   Phase 2 (phase2_step..phase3_step): Continued shrinkage.  Merged domain
-//            contracts, smallest bubble may collapse.  Topology changes.
-//   Phase 3 (phase3_step..steps): Equilibration.  AMR coverage drops as
-//            dynamics slow — demonstrates late-stage efficiency.
+// Three Néel-type bubbles (R=100, 80, 70 nm) in a compact 800×400 nm
+// PMA+DMI film, positioned as a chain with walls nearly touching.
+// A −200 mT expansion field drives a cascade: ①② merge immediately,
+// then the merged domain reaches ③.  α=0.30 keeps the subcycling
+// ratio 64 well within stability, producing clean RMSE separation
+// (AMR ~4% vs coarse ~20%).
 //
 // Three simulations run in parallel from the same initial state:
 //   1. Uniform coarse (L0 only) — fast but WRONG wall physics
@@ -736,8 +734,8 @@ fn main() {
 
     let base_nx = env_usize("LLG_BC_NX", 128);
     let base_ny = env_usize("LLG_BC_NY", 64);
-    let lx = env_f64("LLG_BC_LX", 1.0e-6);   // 1000 nm
-    let ly = env_f64("LLG_BC_LY", 0.5e-6);    // 500 nm
+    let lx = env_f64("LLG_BC_LX", 0.8e-6);    // 800 nm
+    let ly = env_f64("LLG_BC_LY", 0.4e-6);    // 400 nm
     let dz = env_f64("LLG_BC_DZ", 4.0e-10);   // 0.4 nm monolayer
 
     let dx = lx / base_nx as f64;
@@ -757,29 +755,22 @@ fn main() {
 
     // ── Stepping parameters ──────────────────────────────────────────────
 
-    let steps_base     = env_usize("LLG_BC_STEPS", 6400);
+    let steps_base     = env_usize("LLG_BC_STEPS", 6000);
     let dt             = env_f64("LLG_BC_DT", 5.0e-14);
-    let out_every_base = env_usize("LLG_BC_OUTPUT", 50);
-    let regrid_every_base = env_usize("LLG_BC_REGRID", 30);
-    let alpha          = env_f64("LLG_BC_ALPHA", 0.3);   // fast relaxation
+    let out_every_base = env_usize("LLG_BC_OUTPUT", 25);
+    let regrid_every_base = env_usize("LLG_BC_REGRID", 25);
+    let alpha          = env_f64("LLG_BC_ALPHA", 0.30);
 
-    // ── Relaxation phases (no applied field) ────────────────────────────
+    // ── Single-phase expansion + chain collision ──────────────────────────
     //
-    // ── 3-phase field protocol ─────────────────────────────────────────
-    //
-    // Phase 1: Bz = −150 mT  EXPAND.  Reverse field pushes bubble walls
-    //          outward.  ① and ② (initially just touching) collide and
-    //          merge into a dumbbell.  <mz> DECREASES.
-    // Phase 2: Bz = +300 mT  CONTRACT strongly.  The merged dumbbell
-    //          shrinks rapidly; the neck may pinch off, splitting the
-    //          dumbbell back into two skyrmions.  <mz> INCREASES sharply.
-    // Phase 3: Bz = 0        EQUILIBRATE.  System relaxes to zero-field
-    //          configuration.  <mz> plateaus.  AMR coverage drops.
+    // Bz = −200 mT drives bubble walls outward. ① and ② collide first
+    // (walls nearly touching at t=0), then the merged domain reaches ③.
+    // Phases 2 & 3 disabled — the collision cascade IS the show.
 
-    let bz_phase1    = env_f64("LLG_BC_BZ_PHASE1", -0.15);     // −150 mT (expand)
-    let bz_phase2    = env_f64("LLG_BC_BZ_PHASE2",  0.30);     // +300 mT (contract)
-    let phase2_step  = env_usize("LLG_BC_PHASE2_STEP", 2000);  // Ph1→Ph2
-    let phase3_step  = env_usize("LLG_BC_PHASE3_STEP", 4000);  // Ph2→Ph3
+    let bz_phase1    = env_f64("LLG_BC_BZ_PHASE1", -0.20);     // −200 mT
+    let bz_phase2    = env_f64("LLG_BC_BZ_PHASE2",  0.30);     // (unused)
+    let phase2_step  = env_usize("LLG_BC_PHASE2_STEP", 99999);
+    let phase3_step  = env_usize("LLG_BC_PHASE3_STEP", 99999);
 
     // ── Material: Co/Pt with interfacial DMI ─────────────────────────────
 
@@ -812,24 +803,22 @@ fn main() {
         b_ext: [0.0, 0.0, bz_phase1],  // start in Phase 1 field
     };
 
-    // ── Bubble placement (3 mixed-size bubbles) ──────────────────────────
+    // ── Bubble placement (3 bubbles in a collision chain) ──────────────
     //
-    //  ① Large  (R= 80nm) at ( -60,  20) nm
-    //  ② Medium (R= 60nm) at (  65, -15) nm  ← 10nm gap to ① (JUST TOUCHING)
-    //  ③ Small  (R= 50nm) at ( 250,  30) nm  ← isolated
+    //  ① Large  (R=100nm) at (-100,  20) nm
+    //  ② Medium (R= 80nm) at (  80, -15) nm — walls ~3nm from ①
+    //  ③ Small  (R= 70nm) at ( 220,  10) nm — walls overlap with ②
     //
-    //  ①↔②: d=130nm, R₁+R₂=140nm → gap=10nm.  Walls barely separated.
-    //        Under −150mT (Phase 1), bubbles expand and walls COLLIDE → merger.
-    //  ②↔③: d=191nm, R₂+R₃=110nm, gap=81nm → no direct interaction
-    //  ①↔③: d=311nm, R₁+R₃=130nm, gap=181nm → isolated
+    //  Under −200 mT the expansion drives a chain reaction:
+    //  ① merges with ② immediately, then the merged domain reaches ③.
 
-    let wall_width = env_f64("LLG_BC_WALL_WIDTH", 15.0e-9);
+    let wall_width = env_f64("LLG_BC_WALL_WIDTH", 20.0e-9);
     let helicity = 0.0; // Néel
 
     let bubbles: Vec<BubbleDesc> = vec![
-        ( -60e-9,   20e-9, env_f64("LLG_BC_R0_1",  80e-9), wall_width),
-        (  65e-9,  -15e-9, env_f64("LLG_BC_R0_2",  60e-9), wall_width),
-        ( 250e-9,   30e-9, env_f64("LLG_BC_R0_3",  50e-9), wall_width),
+        (-100e-9,   20e-9, env_f64("LLG_BC_R0_1", 100e-9), wall_width),
+        (  80e-9,  -15e-9, env_f64("LLG_BC_R0_2",  80e-9), wall_width),
+        ( 220e-9,   10e-9, env_f64("LLG_BC_R0_3",  70e-9), wall_width),
     ];
 
     // ── Print header ─────────────────────────────────────────────────────
@@ -838,7 +827,7 @@ fn main() {
     let thin = "─".repeat(68);
 
     println!("╔{bar}╗");
-    println!("║{:^68}║", "Bubble Cascade — AMR Dynamics Showcase");
+    println!("║{:^68}║", "Bubble Cascade — Chain-Collision AMR Showcase");
     println!("╚{bar}╝");
     println!();
     println!("  Domain:      {:.0} nm × {:.0} nm × {:.1} nm",
@@ -908,6 +897,7 @@ fn main() {
         max_patches: 0,
         min_efficiency: 0.75,      // higher → tighter B-R bisection (G-C: 70-85%)
         max_flagged_fraction: 0.25, // cap coverage — force threshold up if too many flags
+        confine_dilation: false,
     };
     let regrid_policy = RegridPolicy {
         indicator: indicator_kind,
@@ -1287,7 +1277,7 @@ fn main() {
 
     println!();
     println!("╔{bar}╗");
-    println!("║{:^68}║", "BUBBLE CASCADE — RESULTS SUMMARY");
+    println!("║{:^68}║", "BUBBLE CASCADE — CHAIN COLLISION RESULTS");
     println!("╚{bar}╝");
 
     println!();

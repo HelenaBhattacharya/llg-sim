@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running `target/release/bench_vortex_gyration --amr-only --plots`
+[composite] V-cycle: auto-enabling PPPM hybrid (radius=14)
+[demag_mg] WARNING: extreme cell aspect ratio 5.3 (dx=3.75e-9, dy=3.75e-9, dz=2.00e-8). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite] V-CYCLE mode enabled (LLG_DEMAG_COMPOSITE_VCYCLE=1) — fine-resolution B within patches
+[demag_mg] hybrid ΔK ENABLED (radius_xy=14, delta_v_cycles=60, sigma_cells=1.500, cache_to_disk=true)
+[demag_mg] hybrid cache hit -> loaded ΔK stencil from "out/demag_cache/demag_mg_hybrid_dk_nx80_ny80_dx3.750e-9_dy3.750e-9_dz2.000e-8_pad6_nvacz16_opiso27_tri_gal_bcbh_th6.000e-1_leaf64_dep20_smwj_pre2_post2_om3fe5555555555555_som3ff0000000000000_sig3ff8000000000000_r14_dv60.bin"

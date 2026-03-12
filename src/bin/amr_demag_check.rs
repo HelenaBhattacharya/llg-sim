@@ -573,6 +573,7 @@ fn main() {
         max_patches: 0,
         min_efficiency: 0.70,
         max_flagged_fraction: 0.50,
+        confine_dilation: false,
     };
     let regrid_policy = RegridPolicy {
         indicator: indicator_kind,

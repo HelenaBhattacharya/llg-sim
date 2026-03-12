@@ -1,6 +1,5 @@
 // src/bin/st_problems/main.rs
 
-mod fmr;
 mod sk1;
 mod sp2;
 mod sp4;
@@ -11,8 +10,7 @@ fn usage() -> ! {
         "Usage:
   cargo run --release --bin st_problems -- sp2
   cargo run --release --bin st_problems -- sp4 <a|b>
-  cargo run --release --bin st_problems -- fmr
-  cargo run --release --bin st_problems -- sk1 <a|b>
+  cargo run --release --bin st_problems -- sk1 <a|b|c|d|e|f>
 "
     );
     std::process::exit(2);
@@ -31,10 +29,6 @@ fn main() -> std::io::Result<()> {
             let Some(case) = args.next() else { usage() };
             let c = case.chars().next().unwrap_or('a');
             sp4::run_sp4(c)
-        }
-        "fmr" => {
-            // No extra args needed
-            fmr::run_fmr()
         }
         "sk1" => {
             let Some(case) = args.next() else { usage() };

@@ -583,6 +583,49 @@ def save_residuals_figure(
     print(f"Wrote {out_path}")
 
 
+def _save_sp4a_residuals(
+    out_path: Path,
+    t_m: Array, mx_m: Array, my_m: Array, mz_m: Array,
+    t_r: Array, mx_r: Array, my_r: Array, mz_r: Array,
+    *,
+    pub: bool = False,
+    dpi: int = 200,
+) -> None:
+    """Save a single-panel SP4a residual plot."""
+    lo, hi = overlap_window(t_m, t_r)
+    t_m2, mx_m2, my_m2, mz_m2 = clip_time(t_m, mx_m, my_m, mz_m, lo=lo, hi=hi)
+    t_r2, mx_r2, my_r2, mz_r2 = clip_time(t_r, mx_r, my_r, mz_r, lo=lo, hi=hi)
+
+    t_m2s, _ = _sanitize_xy(t_m2, mx_m2)
+    t_ns = t_m2s * 1e9
+
+    res_mx = residual_on_grid(t_m2s, mx_m2, t_r2, mx_r2, sign="rust-minus-mumax")
+    res_my = residual_on_grid(t_m2s, my_m2, t_r2, my_r2, sign="rust-minus-mumax")
+    res_mz = residual_on_grid(t_m2s, mz_m2, t_r2, mz_r2, sign="rust-minus-mumax")
+
+    if pub:
+        fig, ax = plt.subplots(1, 1, figsize=(3.4, 2.0))
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(5, 3))
+
+    lw = 1.2 if pub else RUST_LW
+    ax.plot(t_ns, res_mx, label=r"$\Delta m_x$", linewidth=lw, color="#d62728")
+    ax.plot(t_ns, res_my, label=r"$\Delta m_y$", linewidth=lw, color="#1f77b4")
+    ax.plot(t_ns, res_mz, label=r"$\Delta m_z$", linewidth=lw, color="#7f7f7f")
+    ax.axhline(0.0, linewidth=0.5, color="0.6")
+
+    ax.set_xlabel(r"Time (ns)")
+    ax.set_ylabel(r"$\Delta m$ (Rust $-$ MuMax3)")
+    ax.legend(fontsize=8 if pub else 7, frameon=True, framealpha=0.95, edgecolor="0.8",
+              borderpad=0.3, labelspacing=0.3)
+
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Plot Standard Problem 4 (a,b) MuMax outputs, optionally overlay Rust outputs."
@@ -609,6 +652,16 @@ def main():
         "--mark-mx-zero",
         action="store_true",
         help="Mark the first <mx>=0 crossing time for MuMax and Rust (if present).",
+    )
+    ap.add_argument(
+        "--sp4a-only",
+        action="store_true",
+        help="Plot only SP4a (single panel) instead of both SP4a and SP4b.",
+    )
+    ap.add_argument(
+        "--pub",
+        action="store_true",
+        help="Publication-quality styling: larger fonts, LaTeX labels, 'This work' labelling, PDF-ready.",
     )
 
     # metrics
@@ -668,43 +721,65 @@ def main():
 
     # --- MuMax paths ---
     mumax_a = args.mumax_root / "sp4a_out" / "table.txt"
-    mumax_b = args.mumax_root / "sp4b_out" / "table.txt"
-
     t_a, mx_a, my_a, mz_a = load_mumax_table(mumax_a)
-    t_b, mx_b, my_b, mz_b = load_mumax_table(mumax_b)
-
-    # Convert to ns
     t_a_ns = t_a * 1e9
-    t_b_ns = t_b * 1e9
+
+    # SP4b data: bundled as optional tuple so Pylance can narrow with one check
+    mumax_b: Optional[Tuple[Array, Array, Array, Array]] = None
+    t_b_ns: Optional[Array] = None
+    if not args.sp4a_only:
+        mumax_b_path = args.mumax_root / "sp4b_out" / "table.txt"
+        mumax_b = load_mumax_table(mumax_b_path)
+        t_b_ns = mumax_b[0] * 1e9
 
     # --- Optional Rust ---
     rust_a = rust_b = None
     if args.rust_root is not None:
         ra = args.rust_root / "sp4a_rust" / "table.csv"
-        rb = args.rust_root / "sp4b_rust" / "table.csv"
-        if ra.exists() and rb.exists():
+        if ra.exists():
             rust_a = load_rust_csv(ra)
-            rust_b = load_rust_csv(rb)
         else:
-            print(f"[warn] Rust tables not found at:\n  {ra}\n  {rb}\nContinuing with MuMax only.")
+            print(f"[warn] Rust SP4a table not found at: {ra}")
+
+        if not args.sp4a_only:
+            rb = args.rust_root / "sp4b_rust" / "table.csv"
+            if rb.exists():
+                rust_b = load_rust_csv(rb)
+            else:
+                print(f"[warn] Rust SP4b table not found at: {rb}")
 
     # --- metrics printout ---
     if args.metrics:
-        if rust_a is None or rust_b is None:
-            print("[metrics] Rust outputs not available; metrics require --rust-root with sp4a_rust/table.csv and sp4b_rust/table.csv")
+        if rust_a is None:
+            print("[metrics] Rust SP4a outputs not available; metrics require --rust-root with sp4a_rust/table.csv")
         else:
             t_ra, mx_ra, my_ra, mz_ra = rust_a
+
+            print_metrics_block(
+                "SP4a",
+                t_a, mx_a, my_a, mz_a,
+                t_ra, mx_ra, my_ra, mz_ra,
+                tmin=args.metrics_tmin,
+                tmax=args.metrics_tmax,
+                interp_to=args.metrics_interp,
+            )
+
+            # --- frequency + phase drift diagnostics ---
+            print_dynamics_block(
+                "SP4a",
+                t_a, mx_a, my_a, mz_a,
+                t_ra, mx_ra, my_ra, mz_ra,
+                dyn_tmin=args.dyn_tmin,
+                dyn_tmax=args.dyn_tmax,
+                dyn_component=args.dyn_component,
+                dyn_rel_bw=args.dyn_rel_bw,
+            )
+
+        if not args.sp4a_only and rust_b is not None and mumax_b is not None:
+            t_b, mx_b, my_b, mz_b = mumax_b
             t_rb, mx_rb, my_rb, mz_rb = rust_b
 
             print_metrics_block(
-                "SP4a",
-                t_a, mx_a, my_a, mz_a,
-                t_ra, mx_ra, my_ra, mz_ra,
-                tmin=args.metrics_tmin,
-                tmax=args.metrics_tmax,
-                interp_to=args.metrics_interp,
-            )
-            print_metrics_block(
                 "SP4b",
                 t_b, mx_b, my_b, mz_b,
                 t_rb, mx_rb, my_rb, mz_rb,
@@ -713,16 +788,6 @@ def main():
                 interp_to=args.metrics_interp,
             )
 
-            # --- NEW: frequency + phase drift diagnostics ---
-            print_dynamics_block(
-                "SP4a",
-                t_a, mx_a, my_a, mz_a,
-                t_ra, mx_ra, my_ra, mz_ra,
-                dyn_tmin=args.dyn_tmin,
-                dyn_tmax=args.dyn_tmax,
-                dyn_component=args.dyn_component,
-                dyn_rel_bw=args.dyn_rel_bw,
-            )
             print_dynamics_block(
                 "SP4b",
                 t_b, mx_b, my_b, mz_b,
@@ -733,46 +798,182 @@ def main():
                 dyn_rel_bw=args.dyn_rel_bw,
             )
 
-    # --- Plot layout (UNCHANGED) ---
+    # ======================================================================
+    # Publication-quality style setup
+    # ======================================================================
+    if args.pub:
+        plt.rcParams.update({
+            "font.family": "serif",
+            "font.size": 9,
+            "axes.labelsize": 10,
+            "axes.titlesize": 10,
+            "legend.fontsize": 8,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+            "axes.linewidth": 0.6,
+            "lines.linewidth": 1.2,
+            "lines.markersize": 1.5,
+            "figure.dpi": 300,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.02,
+        })
+        # Publication labels
+        _our_label = "Rust"
+        _ref_label = "MuMax3"
+        _mumax_ms = 1.5
+        _rust_lw = 1.2
+        _mumax_marker = "o"
+        _legend_fs = 8
+        _dpi = 300
+    else:
+        _our_label = "Rust"
+        _ref_label = "MuMax"
+        _mumax_ms = MUMAX_MS
+        _rust_lw = RUST_LW
+        _mumax_marker = "o"
+        _legend_fs = 6
+        _dpi = 200
+
+    # ======================================================================
+    # Colour definitions (greyscale-safe via line style distinction)
+    # ======================================================================
+    # MuMax3 uses markers only (no connecting line) — visually "dots"
+    # Our solver uses solid lines — visually "lines"
+    # Colour encodes component: red=mx, blue=my, grey=mz
+    _cx = "#d62728"   # red
+    _cy = "#1f77b4"   # blue
+    _cz = "#7f7f7f"   # grey
+
+    # ======================================================================
+    # SP4a-only mode: single clean panel
+    # ======================================================================
+    if args.sp4a_only:
+        if args.pub:
+            # Full-width to align with the freeze-frame triptych below (2000×561 px @ 300 dpi)
+            fig, ax = plt.subplots(1, 1, figsize=(6.667, 2.2))
+        else:
+            fig, ax = plt.subplots(1, 1, figsize=(6.667, 2.8))
+
+        # MuMax3: small markers, no connecting line (no individual labels)
+        ax.plot(t_a_ns, mx_a, marker=_mumax_marker, linestyle="None",
+                color=_cx, markersize=_mumax_ms, zorder=1)
+        ax.plot(t_a_ns, my_a, marker=_mumax_marker, linestyle="None",
+                color=_cy, markersize=_mumax_ms, zorder=1)
+        ax.plot(t_a_ns, mz_a, marker=_mumax_marker, linestyle="None",
+                color=_cz, markersize=_mumax_ms, zorder=1)
+
+        # Our solver: solid lines (no individual labels)
+        if rust_a is not None:
+            t_r, mx_r, my_r, mz_r = rust_a
+            t_r_ns = t_r * 1e9
+            ax.plot(t_r_ns, mx_r, linestyle="-", color=_cx, linewidth=_rust_lw, zorder=2)
+            ax.plot(t_r_ns, my_r, linestyle="-", color=_cy, linewidth=_rust_lw, zorder=2)
+            ax.plot(t_r_ns, mz_r, linestyle="-", color=_cz, linewidth=_rust_lw, zorder=2)
+
+        ax.set_xlabel(r"Time (ns)")
+        ax.set_ylabel(r"$\langle m_i \rangle$")
+        ax.set_xlim(0, 1.0)
+        ax.set_ylim(-1.05, 1.05)
+
+        # Compact custom legend: single row ABOVE the axes so it can't overlap data
+        from matplotlib.lines import Line2D
+        _fs = 7 if args.pub else 6
+        handles = [
+            Line2D([], [], color="k", linestyle="-", linewidth=_rust_lw, label="Rust"),
+            Line2D([], [], color="k", marker="o", linestyle="None", markersize=2.5, label="MuMax3"),
+            Line2D([], [], color=_cx, linestyle="-", linewidth=2, label=r"$m_x$"),
+            Line2D([], [], color=_cy, linestyle="-", linewidth=2, label=r"$m_y$"),
+            Line2D([], [], color=_cz, linestyle="-", linewidth=2, label=r"$m_z$"),
+        ]
+        ax.legend(
+            handles=handles, ncol=5,
+            loc="lower center", bbox_to_anchor=(0.5, 1.0),
+            frameon=False,
+            borderpad=0.1, labelspacing=0.15, handletextpad=0.3,
+            columnspacing=0.8, handlelength=1.2, fontsize=_fs,
+        )
+
+        # Optional mx=0 crossing markers
+        if args.mark_mx_zero:
+            t0_ma = first_zero_crossing_time(t_a_ns, mx_a)
+            if t0_ma is not None:
+                ax.axvline(float(t0_ma), linestyle=":", linewidth=VLINE_LW, color="0.5")
+            if rust_a is not None:
+                t_r, mx_r, _, _ = rust_a
+                t0_ra = first_zero_crossing_time(t_r * 1e9, mx_r)
+                if t0_ra is not None:
+                    ax.axvline(float(t0_ra), linestyle="--", linewidth=VLINE_LW, color="0.5")
+
+        fig.subplots_adjust(left=0.08, right=0.98, bottom=0.18, top=0.88)
+
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(args.out, dpi=_dpi)
+            print(f"Wrote {args.out}")
+
+            # Also save residuals for SP4a only
+            if rust_a is not None:
+                t_ra, mx_ra, my_ra, mz_ra = rust_a
+                residual_path = args.out.parent / f"{args.out.stem}_residuals{args.out.suffix}"
+                _save_sp4a_residuals(
+                    residual_path, t_a, mx_a, my_a, mz_a,
+                    t_ra, mx_ra, my_ra, mz_ra,
+                    pub=args.pub, dpi=_dpi,
+                )
+
+            plt.close(fig)
+        else:
+            plt.show()
+        return
+
+    # ======================================================================
+    # Original 2-panel mode (SP4a + SP4b)
+    # ======================================================================
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(6, 6))
     ax_a, ax_b = axes
 
     # ---------- SP4a ----------
-    # MuMax: circles, points only
-    plot_triplet(ax_a, t_a_ns, mx_a, my_a, mz_a, marker="o", linestyle="None", prefix="MuMax ", ms=MUMAX_MS, lw=RUST_LW)
-    ax_a.set_ylabel("<m>")
+    plot_triplet(ax_a, t_a_ns, mx_a, my_a, mz_a, marker="o", linestyle="None", prefix=f"{_ref_label} ", ms=_mumax_ms, lw=_rust_lw)
+    ax_a.set_ylabel(r"$\langle m_i \rangle$")
     ax_a.set_title("SP4a")
 
-    # Rust: solid line, no markers
     if rust_a is not None:
         t_r, mx_r, my_r, mz_r = rust_a
-        plot_triplet(ax_a, t_r * 1e9, mx_r, my_r, mz_r, marker=None, linestyle="-", prefix="Rust ", ms=MUMAX_MS, lw=RUST_LW)
+        plot_triplet(ax_a, t_r * 1e9, mx_r, my_r, mz_r, marker=None, linestyle="-", prefix=f"{_our_label} ", ms=_mumax_ms, lw=_rust_lw)
 
-    ax_a.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
+    ax_a.legend(fontsize=_legend_fs, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
 
     # ---------- SP4b ----------
-    plot_triplet(ax_b, t_b_ns, mx_b, my_b, mz_b, marker="o", linestyle="None", prefix="MuMax ", ms=MUMAX_MS, lw=RUST_LW)
-    ax_b.set_xlabel("t (ns)")
-    ax_b.set_ylabel("<m>")
-    ax_b.set_title("SP4b")
+    if mumax_b is not None and t_b_ns is not None:
+        t_b, mx_b, my_b, mz_b = mumax_b
+        plot_triplet(ax_b, t_b_ns, mx_b, my_b, mz_b, marker="o", linestyle="None", prefix=f"{_ref_label} ", ms=_mumax_ms, lw=_rust_lw)
+        ax_b.set_xlabel("t (ns)")
+        ax_b.set_ylabel(r"$\langle m_i \rangle$")
+        ax_b.set_title("SP4b")
 
-    if rust_b is not None:
-        t_r, mx_r, my_r, mz_r = rust_b
-        plot_triplet(ax_b, t_r * 1e9, mx_r, my_r, mz_r, marker=None, linestyle="-", prefix="Rust ", ms=MUMAX_MS, lw=RUST_LW)
+        if rust_b is not None:
+            t_r, mx_r, my_r, mz_r = rust_b
+            plot_triplet(ax_b, t_r * 1e9, mx_r, my_r, mz_r, marker=None, linestyle="-", prefix=f"{_our_label} ", ms=_mumax_ms, lw=_rust_lw)
 
-    ax_b.legend(fontsize=6, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
+        ax_b.legend(fontsize=_legend_fs, frameon=True, framealpha=0.9, borderpad=0.3, labelspacing=0.3, handletextpad=0.4)
 
     # ---------- Optional mx=0 markers ----------
     if args.mark_mx_zero:
-        # MuMax crossings
         t0_ma = first_zero_crossing_time(t_a_ns, mx_a)
-        t0_mb = first_zero_crossing_time(t_b_ns, mx_b)
         if t0_ma is not None:
             ax_a.axvline(float(t0_ma), linestyle=":", linewidth=VLINE_LW)
-        if t0_mb is not None:
-            ax_b.axvline(float(t0_mb), linestyle=":", linewidth=VLINE_LW)
 
-        # Rust crossings
+        if mumax_b is not None and t_b_ns is not None:
+            t_b, mx_b, my_b, mz_b = mumax_b
+            t0_mb = first_zero_crossing_time(t_b_ns, mx_b)
+            if t0_mb is not None:
+                ax_b.axvline(float(t0_mb), linestyle=":", linewidth=VLINE_LW)
+
         if rust_a is not None:
             t_r, mx_r, _, _ = rust_a
             t0_ra = first_zero_crossing_time(t_r * 1e9, mx_r)
@@ -789,30 +990,28 @@ def main():
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(args.out, dpi=200)
+        plt.savefig(args.out, dpi=_dpi)
         print(f"Wrote {args.out}")
 
-        # --- NEW: residuals plot saved next to overlay ---
-        if rust_a is not None and rust_b is not None:
+        # --- Residuals plot saved next to overlay ---
+        if rust_a is not None and rust_b is not None and mumax_b is not None:
             t_ra, mx_ra, my_ra, mz_ra = rust_a
             t_rb, mx_rb, my_rb, mz_rb = rust_b
+            t_b, mx_b, my_b, mz_b = mumax_b
 
             residual_path = args.out.parent / f"{args.out.stem}_residuals{args.out.suffix}"
             save_residuals_figure(
                 residual_path,
-                # SP4a
                 t_a, mx_a, my_a, mz_a,
                 t_ra, mx_ra, my_ra, mz_ra,
-                # SP4b
                 t_b, mx_b, my_b, mz_b,
                 t_rb, mx_rb, my_rb, mz_rb,
-                dpi=200,
+                dpi=_dpi,
             )
         else:
             print("[residuals] Rust outputs not available; residual plot requires --rust-root.")
         plt.close(fig)
     else:
-        # Interactive mode unchanged: only show the overlay window
         plt.show()
 
 

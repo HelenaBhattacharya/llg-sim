@@ -738,6 +738,7 @@ fn main() {
         connectivity: Connectivity::Eight,
         min_efficiency: 0.70,
         max_flagged_fraction: 0.50,  // ADD
+        confine_dilation: false,
     };
 
     // Logs

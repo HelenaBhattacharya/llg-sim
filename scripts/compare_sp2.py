@@ -372,6 +372,7 @@ def main() -> None:
         help="Output PNG path for combined two-panel figure. Defaults to <rust-root>/sp2_overlay.png.",
     )
     ap.add_argument("--paper-style", action="store_true", help="Match MuMax3 paper axis limits/ticks.")
+    ap.add_argument("--pub", action="store_true", help="Publication-quality styling with coordinated colours.")
     ap.add_argument(
         "--metrics",
         action="store_true",
@@ -440,89 +441,117 @@ def main() -> None:
     # ---------------------------
     # Combined figure (two panels)
     # ---------------------------
-    fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(7.2, 7.6))
 
-    # ---- Top: Fig. 13 remanence style ----
-    ax_top.plot(d_m, mx_m, "s", color="red", markersize=4, markeredgewidth=0.0)
-    ax_top.plot(d_r, mx_r, "-", color="red", linewidth=1.2)
+    # Colours coordinated with SP4 figure
+    _cx = "#d62728"   # red  — mx / MuMax3
+    _cy = "#1f77b4"   # blue — my / OOMMF
+    _cz = "#7f7f7f"   # grey
+    _ck = "#2c2c2c"   # near-black — Rust
 
-    ax_top.set_xlabel(r"$d/\ell_{ex}$")
-    ax_top.set_ylabel(r"$<mx>$")
+    if args.pub:
+        plt.rcParams.update({
+            "font.family": "serif",
+            "font.size": 9,
+            "axes.labelsize": 10,
+            "axes.titlesize": 10,
+            "legend.fontsize": 7.5,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": False,  # we have twinx, handle manually
+            "axes.linewidth": 0.6,
+            "lines.linewidth": 1.2,
+            "lines.markersize": 3,
+            "figure.dpi": 300,
+            "savefig.dpi": 300,
+        })
+        _dpi = 300
+        # Match SP4 figure width (6.667 in) for alignment
+        fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(6.667, 4.2))
+    else:
+        _dpi = args.dpi
+        fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(7.2, 7.6))
+
+    # ---- Top: Remanence ----
+    # MuMax3: markers only
+    ax_top.plot(d_m, mx_m, "o", color=_cx, markersize=3.5, markeredgewidth=0.0, zorder=1)
+    # Rust: solid line
+    ax_top.plot(d_r, mx_r, "-", color=_cx, linewidth=1.2, zorder=2)
+
+    ax_top.set_xlabel(r"$d / \ell_\mathrm{ex}$")
+    ax_top.set_ylabel(r"$\langle m_x \rangle$", color=_cx)
+    ax_top.tick_params(axis="y", colors=_cx)
 
     ax_top_r = ax_top.twinx()
-    ax_top_r.plot(d_m, my_m, "s", color="limegreen", markersize=4, markeredgewidth=0.0)
-    ax_top_r.plot(d_r, my_r, "-", color="limegreen", linewidth=1.2)
-    ax_top_r.set_ylabel(r"$<my>$")
+    ax_top_r.plot(d_m, my_m, "o", color=_cy, markersize=3.5, markeredgewidth=0.0, zorder=1)
+    ax_top_r.plot(d_r, my_r, "-", color=_cy, linewidth=1.2, zorder=2)
+    ax_top_r.set_ylabel(r"$\langle m_y \rangle$", color=_cy)
+    ax_top_r.tick_params(axis="y", colors=_cy, direction="in")
 
-    if args.paper_style:
+    if args.paper_style or args.pub:
         ax_top.set_xlim(0, 30)
         ax_top.set_ylim(0.9, 1.001)
-        ax_top.set_xticks([0, 10, 20, 30])
-        ax_top.set_yticks([0.9, 0.95, 1.0])
+        ax_top.set_xticks([0, 5, 10, 15, 20, 25, 30])
+        ax_top.set_yticks([0.90, 0.95, 1.00])
 
         ax_top_r.set_ylim(0.0, 0.1)
         ax_top_r.set_yticks([0.0, 0.05, 0.1])
 
-    legend_handles = [
-        Line2D([0], [0], marker="s", linestyle="None", color="red", markersize=6, label=r"$<mx>$"),
-        Line2D([0], [0], marker="s", linestyle="None", color="limegreen", markersize=6, label=r"$<my>$"),
+    # Legend for remanence: style encodes source, colour encodes component
+    rem_handles = [
+        Line2D([], [], color="k", linestyle="-", linewidth=1.2, label="Rust"),
+        Line2D([], [], color="k", marker="o", linestyle="None", markersize=3, label="MuMax3"),
+        Line2D([], [], color=_cx, linestyle="-", linewidth=2, label=r"$m_x$"),
+        Line2D([], [], color=_cy, linestyle="-", linewidth=2, label=r"$m_y$"),
     ]
-    ax_top.legend(handles=legend_handles, loc="lower right", frameon=True)
+    ax_top.legend(
+        handles=rem_handles, ncol=4,
+        loc="lower center", bbox_to_anchor=(0.5, 1.0),
+        frameon=False, fontsize=7, handlelength=1.2,
+        handletextpad=0.3, columnspacing=0.8,
+    )
+
     ax_top.grid(False)
     ax_top_r.grid(False)
 
-    # ---- Bottom: Fig. 14 coercivity style ----
-    # Plot points only for all three series (MuMax, Rust, OOMMF).
+    # ---- Bottom: Coercivity ----
+    # MuMax3: red squares
     ax_bot.plot(
-        d_m,
-        hc_m,
-        linestyle="None",
-        marker="s",
-        color="red",
-        markersize=4,
-        markeredgewidth=0.0,
-        label="mumax",
+        d_m, hc_m, linestyle="None", marker="s", color=_cx,
+        markersize=3.5, markeredgewidth=0.0, label="MuMax3", zorder=1,
     )
 
+    # OOMMF: blue triangles
     if oommf_table is not None and oommf_table.exists():
         ax_bot.plot(
-            d_o,
-            hc_o,
-            linestyle="None",
-            marker="^",
-            color="tab:blue",
-            markersize=3,
-            markeredgewidth=0.0,
-            label="oommf (Donahue)",
+            d_o, hc_o, linestyle="None", marker="^", color=_cy,
+            markersize=3, markeredgewidth=0.0, label="OOMMF (Donahue)", zorder=1,
         )
 
+    # Rust: black x's
     ax_bot.plot(
-        d_r,
-        hc_r,
-        linestyle="None",
-        marker="x",
-        color="black",
-        markersize=5,
-        markeredgewidth=1.0,
-        label="rust",
+        d_r, hc_r, linestyle="None", marker="x", color=_ck,
+        markersize=4, markeredgewidth=0.8, label="Rust", zorder=2,
     )
 
-    ax_bot.set_xlabel(r"$d/\ell_{ex}$")
-    ax_bot.set_ylabel(r"$Hc/Msat$")
+    ax_bot.set_xlabel(r"$d / \ell_\mathrm{ex}$")
+    ax_bot.set_ylabel(r"$H_c / M_s$")
 
-    if args.paper_style:
+    if args.paper_style or args.pub:
         ax_bot.set_xlim(0, 30)
-        ax_bot.set_ylim(0.044, 0.064)
+        ax_bot.set_ylim(0.044, 0.058)
         ax_bot.set_xticks([0, 5, 10, 15, 20, 25, 30])
-        ax_bot.set_yticks([0.044, 0.046, 0.048, 0.050, 0.052, 0.054, 0.056, 0.058, 0.060, 0.062, 0.064])
 
     ax_bot.grid(False)
-    ax_bot.legend(loc="upper right", frameon=True)
+    ax_bot.legend(loc="upper right", frameon=True, framealpha=0.95, edgecolor="0.8",
+                  fontsize=7, borderpad=0.3, handletextpad=0.4)
 
     # Save
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(args.out, dpi=args.dpi)
+    fig.savefig(args.out, dpi=_dpi)
     print(f"Wrote: {args.out}")
     print(f"Using MuMax table: {mumax_table}")
     print(f"Using Rust table:  {rust_table}")
@@ -541,4 +570,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

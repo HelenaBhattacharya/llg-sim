@@ -1,126 +1,61 @@
 // src/bin/bench_antidot.rs
 //
-// Anti-dot demag benchmark — Phase 2 of the P-FFT implementation plan
-// ====================================================================
+// Multi-Hole Antidot — Composite V-Cycle Demag Benchmark
+// =======================================================
 //
-// PURPOSE: Demonstrate that (a) uniform fine FFT is accurate but slow,
-// (b) coarse-grid FFT + AMR is fast but inaccurate at geometric boundaries,
-// and therefore (c) P-FFT edge correction (Phase 3) is needed.
+// Purpose-built to validate the composite V-cycle on a multi-boundary
+// geometry: 3 circular holes arranged in an equilateral triangle.
+// Multiple interacting boundaries stress the solver harder than a
+// single hole, and should show a more pronounced composite advantage.
 //
-// The benchmark compares THREE classes of solver on a hexagonal anti-dot
-// array in Permalloy, using a fine-grid FFT as the gold reference:
+// Setup:
+//   - Square Permalloy domain (500 nm × 500 nm) with 3 circular holes
+//   - Holes: r = 75 nm in equilateral triangle (pitch = 220 nm)
+//   - Saturated +x magnetisation (frozen — no LLG dynamics)
+//   - AMR patches placed around all hole boundaries (boundary-layer flagging)
+//   - Three solvers compared at patch cells:
+//       1. Uniform fine FFT (reference)
+//       2. Coarse-FFT + bilinear interpolation to patches
+//       3. Composite V-cycle (defect correction) + fine δ∇φ on patches
 //
-//   Method 1 — fft_fine:     FFT on the fine-equivalent grid (1024² for
-//              L0=512).  Slow (~150ms) but accurate: resolves hole boundaries
-//              at fine dx and captures the full near-field B_demag structure.
-//              This is the reference all others are compared against.
+// Modes:
+//   Single run (default):  accuracy + timing at one grid size
+//   Crossover sweep (--sweep):  timing-only across multiple L0 sizes → CSV + plot
 //
-//   Method 2 — fft_l0:       FFT on the L0 grid (512²).  Faster (~25ms) but
-//              uses the coarse staircase boundary.  Shows ~18% edge RMSE from
-//              staircase alone — the "best you can do" without fine resolution.
-//
-//   Method 3 — coarse_fft:   AMR hierarchy + M-restriction + super-coarse FFT
-//              (R=1,2,4).  Designed for dynamic AMR problems (like vortex relax)
-//              where patches carry real texture.  For the static saturated state
-//              here, masked restriction preserves the binary staircase exactly,
-//              so coarse_fft R=1 ≈ fft_l0 plus AMR overhead.
-//              At R>1, the L0→demag_grid restriction (UN-masked) smooths the
-//              staircase, which paradoxically reduces edge RMSE at R=2 but
-//              corrupts the bulk.  This is NOT a real improvement — P-FFT will
-//              provide true edge correction via direct Newell summation.
-//
-// RMSE is split into three physically meaningful regions:
-//   Edge   — material cells within 5 cells of a hole boundary
-//   Bulk   — material cells >20 cells from any hole boundary
-//   Global — all material cells
-//
-// Timing is split into:
-//   Setup  — kernel build, hierarchy construction, regrid (one-time)
-//   Eval   — restrict + FFT + interpolate (per-timestep cost)
-//
-// Outputs in out/bench_antidot/:
-//   - summary.txt             — human-readable results
-//   - results.csv             — machine-readable RMSE per mode
-//   - error_heatmap_*.ppm     — spatial error maps (holes=black, error=blue→red)
-//   - patch_map.png           — AMR patch layout (L1=yellow, L2=green, L3=blue)
-//   - mesh_geom.png           — antidot geometry with multi-level grid overlay
-//   - mesh_error_*.png        — error field with multi-level grid overlay
-//   - b_edge_profile_*.csv    — per-edge-cell error breakdown (with --csv)
-//   - restricted_m_diag.csv   — M-restriction diagnostic (with --csv)
-//
-// Run examples:
-//   # Full comparison (default 512×512 L0, 1024² fine ref):
+// Run:
 //   cargo run --release --bin bench_antidot
 //
-//   # Quick iteration at 256×256 L0 (512² fine ref):
-//   LLG_AD_BASE_NX=256 LLG_AD_BASE_NY=256 \
+// With V-cycle + L3 patches + plots:
+//   LLG_DEMAG_COMPOSITE_VCYCLE=1 cargo run --release --bin bench_antidot -- --plots
+//
+// Crossover sweep (timing only, no fine ref):
+//   LLG_DEMAG_COMPOSITE_VCYCLE=1 cargo run --release --bin bench_antidot -- --sweep
+//
+// Custom grid / levels:
+//   LLG_CV_BASE_NX=256 LLG_AMR_MAX_LEVEL=3 LLG_DEMAG_COMPOSITE_VCYCLE=1 \
 //     cargo run --release --bin bench_antidot
 //
-//   # Sweep super-coarse ratios:
-//   LLG_DEMAG_COARSEN_RATIO=1 cargo run --release --bin bench_antidot
-//   LLG_DEMAG_COARSEN_RATIO=2 cargo run --release --bin bench_antidot
-//   LLG_DEMAG_COARSEN_RATIO=4 cargo run --release --bin bench_antidot
-//
-//   # MG+hybrid composite crossover test:
-//   LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \
-//     cargo run --release --bin bench_antidot -- --no-plots
-//
-//   # Crossover sweep (increasing grid size):
-//   for NX in 256 512 1024 2048; do
-//     LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \
-//       LLG_AD_BASE_NX=$NX LLG_AD_BASE_NY=$NX \
-//       cargo run --release --bin bench_antidot -- --no-plots
-//   done
-//
-//   # Sparse holes (wider pitch → lower AMR coverage → earlier crossover):
-//   LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \
-//     LLG_AD_HOLE_PITCH=800e-9 LLG_AD_BASE_NX=1024 \
-//     cargo run --release --bin bench_antidot -- --no-plots
-//
-//   # Skip fine reference (timing mode only):
-//   cargo run --release --bin bench_antidot -- --skip-fine-ref
-//
-//   # With per-cell CSV for plotting:
-//   cargo run --release --bin bench_antidot -- --csv
-//
-//   # Skip plots (headless/CI mode):
-//   cargo run --release --bin bench_antidot -- --no-plots
+// Same command as bench_composite_vcycle — just change the binary name.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use plotters::prelude::*;
 
 use llg_sim::effective_field::coarse_fft_demag;
 use llg_sim::effective_field::demag_fft_uniform;
+use llg_sim::effective_field::demag_poisson_mg;
 use llg_sim::effective_field::mg_composite;
 use llg_sim::grid::Grid2D;
 use llg_sim::params::{DemagMethod, Material};
 use llg_sim::vector_field::VectorField2D;
 
 use llg_sim::amr::indicator::IndicatorKind;
+use llg_sim::amr::interp::sample_bilinear;
 use llg_sim::amr::regrid::maybe_regrid_nested_levels;
 use llg_sim::amr::{AmrHierarchy2D, ClusterPolicy, Connectivity, Rect2i, RegridPolicy};
-use llg_sim::geometry_mask::{hex_hole_centres, mask_count, MaskShape};
-
-// =====================================================================
-// Constants & utilities
-// =====================================================================
-
-const PI: f64 = std::f64::consts::PI;
-
-fn ensure_dir(path: &str) {
-    if !Path::new(path).exists() {
-        fs::create_dir_all(path).unwrap();
-    }
-}
-
-#[inline]
-fn idx(i: usize, j: usize, nx: usize) -> usize {
-    j * nx + i
-}
+use llg_sim::geometry_mask::{MaskShape, edge_smooth_n, fill_fraction_boundary_count, apply_fill_fractions};
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -129,1741 +64,1518 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-#[allow(dead_code)]
-fn pow_usize(mut base: usize, mut exp: usize) -> usize {
-    let mut out = 1usize;
-    while exp > 0 {
-        if (exp & 1) == 1 { out = out.saturating_mul(base); }
-        exp >>= 1;
-        if exp > 0 { base = base.saturating_mul(base); }
-    }
-    out
-}
+// ---------------------------------------------------------------------------
+// Hole arrangement generators
+// ---------------------------------------------------------------------------
 
-// =====================================================================
-// Edge / bulk cell classification (BFS distance to vacuum)
-// =====================================================================
-
-/// Classify material cells by BFS distance to nearest hole boundary.
-/// Returns (distance_field, edge_mask, bulk_mask).
-fn classify_cells(
-    geom_mask: &[bool],
-    nx: usize,
-    ny: usize,
-    edge_dist: usize,
-    bulk_dist: usize,
-) -> (Vec<u32>, Vec<bool>, Vec<bool>) {
-    let n = nx * ny;
-
-    // BFS: compute distance-to-nearest-vacuum for each material cell.
-    let mut dist = vec![u32::MAX; n];
-    let mut queue = std::collections::VecDeque::new();
-
-    // Seed: material cells with at least one von-Neumann vacuum neighbour
-    for j in 0..ny {
-        for i in 0..nx {
-            let k = idx(i, j, nx);
-            if !geom_mask[k] { continue; }
-            let has_hole_nbr =
-                (i > 0      && !geom_mask[idx(i-1, j, nx)]) ||
-                (i+1 < nx   && !geom_mask[idx(i+1, j, nx)]) ||
-                (j > 0      && !geom_mask[idx(i, j-1, nx)]) ||
-                (j+1 < ny   && !geom_mask[idx(i, j+1, nx)]);
-            if has_hole_nbr {
-                dist[k] = 1;
-                queue.push_back((i, j));
-            }
-        }
-    }
-
-    // BFS flood (4-connected) — propagate through material cells
-    while let Some((ci, cj)) = queue.pop_front() {
-        let d = dist[idx(ci, cj, nx)];
-        if d >= bulk_dist as u32 + 5 { continue; } // no need to go further
-        for &(di, dj) in &[(!0usize, 0), (1, 0), (0, !0usize), (0, 1)] {
-            let ni = ci.wrapping_add(di);
-            let nj = cj.wrapping_add(dj);
-            if ni >= nx || nj >= ny { continue; }
-            let nk = idx(ni, nj, nx);
-            if !geom_mask[nk] { continue; }
-            if d + 1 < dist[nk] {
-                dist[nk] = d + 1;
-                queue.push_back((ni, nj));
-            }
-        }
-    }
-
-    let mut edge_mask = vec![false; n];
-    let mut bulk_mask = vec![false; n];
-    for k in 0..n {
-        if !geom_mask[k] { continue; }
-        if dist[k] <= edge_dist as u32 {
-            edge_mask[k] = true;
-        } else if dist[k] > bulk_dist as u32 || dist[k] == u32::MAX {
-            bulk_mask[k] = true;
-        }
-    }
-    (dist, edge_mask, bulk_mask)
-}
-
-// =====================================================================
-// RMSE computation (material-cell-only variants)
-// =====================================================================
-
-fn global_rmse(
-    a: &VectorField2D, b: &VectorField2D, material_mask: &[bool],
-) -> (f64, f64, f64, f64, f64) {
-    let mut sx = 0.0_f64; let mut sy = 0.0_f64; let mut sz = 0.0_f64;
-    let mut maxd = 0.0_f64; let mut n = 0usize;
-    for k in 0..a.data.len().min(b.data.len()) {
-        if !material_mask[k] { continue; }
-        let da = a.data[k]; let db = b.data[k];
-        let ex = da[0]-db[0]; let ey = da[1]-db[1]; let ez = da[2]-db[2];
-        sx += ex*ex; sy += ey*ey; sz += ez*ez;
-        let d = (ex*ex + ey*ey + ez*ez).sqrt();
-        if d > maxd { maxd = d; }
-        n += 1;
-    }
-    let nf = n.max(1) as f64;
-    ((sx/nf).sqrt(), (sy/nf).sqrt(), (sz/nf).sqrt(), ((sx+sy+sz)/nf).sqrt(), maxd)
-}
-
-fn region_rmse(a: &VectorField2D, b: &VectorField2D, region: &[bool]) -> (f64, usize) {
-    let mut sum = 0.0_f64; let mut n = 0usize;
-    for k in 0..a.data.len().min(b.data.len()) {
-        if !region[k] { continue; }
-        let da = a.data[k]; let db = b.data[k];
-        sum += (da[0]-db[0]).powi(2) + (da[1]-db[1]).powi(2) + (da[2]-db[2]).powi(2);
-        n += 1;
-    }
-    (if n > 0 { (sum / n as f64).sqrt() } else { 0.0 }, n)
-}
-
-// =====================================================================
-// Magnetisation initialisation: flower state or saturated
-// =====================================================================
-
-/// Compute flower-state magnetisation at position (x_cent, y_cent) in centred coords.
+/// Generate 3 hole centres in an equilateral triangle centred at (0,0).
 ///
-/// Uses potential flow around cylinders: M follows the streamlines of an
-/// ideal fluid flowing in +x̂ around circular obstacles. Near each hole,
-/// M curves tangentially to reduce the normal component M·n̂ (and thus
-/// the surface charge σ = M·n̂). Far from holes, M → [1, 0, 0].
+/// Layout (top view):
+///         ●           ← top
+///       /   \
+///      ●     ●        ← bottom-left, bottom-right
 ///
-/// This is the magnetostatic equilibrium (ignoring exchange), and creates
-/// genuine ∇·M variation near hole boundaries that fine patches resolve
-/// better than the coarse staircase.
-fn flower_m_at(
+/// `pitch` is the edge length of the equilateral triangle (centre-to-centre
+/// distance between adjacent holes). The centroid is at (0,0).
+fn equilateral_triangle_centres(pitch: f64) -> Vec<(f64, f64)> {
+    // Centroid-to-vertex distance = pitch / √3
+    let r_circ = pitch / (3.0_f64).sqrt();
+    vec![
+        // Top vertex
+        ( 0.0,            r_circ),
+        // Bottom-left
+        (-pitch * 0.5,   -r_circ * 0.5),
+        // Bottom-right
+        ( pitch * 0.5,   -r_circ * 0.5),
+    ]
+}
+
+/// Minimum signed distance from point (x,y) to the nearest hole boundary.
+/// Negative = inside a hole, positive = in material.
+#[inline]
+fn min_dist_to_boundary(
     x: f64, y: f64,
-    holes: &[(f64, f64)],
-    radius: f64,
-    shape: &MaskShape,
-) -> [f64; 3] {
-    if !shape.contains(x, y) {
-        return [0.0, 0.0, 0.0];
-    }
-
-    let r2_h = radius * radius;
-    let mut mx = 1.0_f64;
-    let mut my = 0.0_f64;
-
-    for &(hx, hy) in holes {
-        let rx = x - hx;
-        let ry = y - hy;
-        let r2 = rx * rx + ry * ry;
-        if r2 < 1e-30 { continue; }
-        let r4 = r2 * r2;
-
-        // Potential flow correction: dipolar field from each hole
-        mx -= r2_h * (rx * rx - ry * ry) / r4;
-        my -= r2_h * 2.0 * rx * ry / r4;
-    }
-
-    // Normalize to unit vector
-    let mag = (mx * mx + my * my).sqrt();
-    if mag < 1e-15 { return [1.0, 0.0, 0.0]; }
-    [mx / mag, my / mag, 0.0]
+    hole_centres: &[(f64, f64)],
+    hole_radius: f64,
+) -> f64 {
+    hole_centres.iter()
+        .map(|&(cx, cy)| (x - cx).hypot(y - cy) - hole_radius)
+        .fold(f64::INFINITY, f64::min)
 }
 
-/// Compute magnetisation at (x_cent, y_cent) — dispatches on init mode.
-fn init_m_at(
-    x: f64, y: f64,
-    holes: &[(f64, f64)],
-    radius: f64,
-    shape: &MaskShape,
-    use_flower: bool,
-) -> [f64; 3] {
-    if use_flower {
-        flower_m_at(x, y, holes, radius, shape)
-    } else {
-        if shape.contains(x, y) { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] }
-    }
-}
-
-// =====================================================================
-// Fine-grid reference
-// =====================================================================
-
-fn build_fine_m(
-    fine_grid: &Grid2D,
-    shape: &MaskShape,
-    holes: &[(f64, f64)],
-    radius: f64,
-    use_flower: bool,
-) -> VectorField2D {
-    let mut m = VectorField2D::new(*fine_grid);
-    let half_lx = fine_grid.nx as f64 * fine_grid.dx * 0.5;
-    let half_ly = fine_grid.ny as f64 * fine_grid.dy * 0.5;
-    for j in 0..fine_grid.ny {
-        let y_cent = (j as f64 + 0.5) * fine_grid.dy - half_ly;
-        for i in 0..fine_grid.nx {
-            let x_cent = (i as f64 + 0.5) * fine_grid.dx - half_lx;
-            let k = j * fine_grid.nx + i;
-            m.data[k] = init_m_at(x_cent, y_cent, holes, radius, shape, use_flower);
-        }
-    }
-    m
-}
-
-fn downsample_b_to_l0(
-    b_fine: &VectorField2D, b_l0: &mut VectorField2D, ratio: usize,
-) {
-    let nx_l0 = b_l0.grid.nx;
-    let ny_l0 = b_l0.grid.ny;
-    let nx_f = b_fine.grid.nx;
-    let inv = 1.0 / ((ratio * ratio) as f64);
-    for j in 0..ny_l0 {
-        for i in 0..nx_l0 {
-            let mut sum = [0.0_f64; 3];
-            let fi0 = i * ratio;
-            let fj0 = j * ratio;
-            for fj in 0..ratio {
-                for fi in 0..ratio {
-                    let v = b_fine.data[(fj0 + fj) * nx_f + (fi0 + fi)];
-                    sum[0] += v[0]; sum[1] += v[1]; sum[2] += v[2];
-                }
-            }
-            b_l0.data[j * nx_l0 + i] = [sum[0]*inv, sum[1]*inv, sum[2]*inv];
-        }
-    }
-}
-
-// =====================================================================
-// Reinitialise AMR patch magnetisation at fine resolution
-// =====================================================================
-
-fn reinit_patches(
-    h: &mut AmrHierarchy2D,
-    shape: &MaskShape,
-    holes: &[(f64, f64)],
-    radius: f64,
-    use_flower: bool,
-) {
-    let base_dx = h.base_grid.dx;
-    let base_dy = h.base_grid.dy;
-    let half_lx = h.base_grid.nx as f64 * base_dx * 0.5;
-    let half_ly = h.base_grid.ny as f64 * base_dy * 0.5;
-
-    for p in &mut h.patches {
-        let pdx = p.grid.dx; let pdy = p.grid.dy;
-        let pnx = p.grid.nx; let pny = p.grid.ny;
-        let gh = p.ghost; let cr = p.coarse_rect;
-        let x0 = cr.i0 as f64 * base_dx - gh as f64 * pdx;
-        let y0 = cr.j0 as f64 * base_dy - gh as f64 * pdy;
-        for j in 0..pny {
-            let y_cent = y0 + (j as f64 + 0.5) * pdy - half_ly;
-            for i in 0..pnx {
-                let x_cent = x0 + (i as f64 + 0.5) * pdx - half_lx;
-                p.m.data[j * pnx + i] = init_m_at(x_cent, y_cent, holes, radius, shape, use_flower);
-            }
-        }
-    }
-    for lvl_patches in &mut h.patches_l2plus {
-        for p in lvl_patches {
-            let pdx = p.grid.dx; let pdy = p.grid.dy;
-            let pnx = p.grid.nx; let pny = p.grid.ny;
-            let gh = p.ghost; let cr = p.coarse_rect;
-            let x0 = cr.i0 as f64 * base_dx - gh as f64 * pdx;
-            let y0 = cr.j0 as f64 * base_dy - gh as f64 * pdy;
-            for j in 0..pny {
-                let y_cent = y0 + (j as f64 + 0.5) * pdy - half_ly;
-                for i in 0..pnx {
-                    let x_cent = x0 + (i as f64 + 0.5) * pdx - half_lx;
-                    p.m.data[j * pnx + i] = init_m_at(x_cent, y_cent, holes, radius, shape, use_flower);
-                }
-            }
-        }
-    }
-}
-
-// =====================================================================
-// PPM error heatmap
-// =====================================================================
-
-fn write_error_heatmap(
-    path: &str, nx: usize, ny: usize,
-    error: &[f64], geom_mask: &[bool], edge_mask: &[bool],
-) {
-    let f = File::create(path).unwrap();
-    let mut w = BufWriter::new(f);
-    write!(w, "P6\n{} {}\n255\n", nx, ny).unwrap();
-
-    let mut emax = 1e-30_f64;
-    for k in 0..nx*ny {
-        if geom_mask[k] && error[k] > emax { emax = error[k]; }
-    }
-    let log_max = emax.log10();
-    let log_min = (emax * 1e-4).log10();
-
-    for j in (0..ny).rev() {
-        for i in 0..nx {
-            let k = idx(i, j, nx);
-            let (r, g, b) = if !geom_mask[k] {
-                (30u8, 30, 30)
-            } else {
-                let t = if error[k] > 0.0 {
-                    ((error[k].log10() - log_min) / (log_max - log_min)).clamp(0.0, 1.0)
-                } else { 0.0 };
-                if edge_mask[k] {
-                    ((180.0 + 75.0*t) as u8, (200.0*(1.0-t)) as u8, 20u8)
-                } else {
-                    ((180.0*t) as u8, (180.0*t) as u8, (60.0 + 195.0*(1.0 - t*0.5)) as u8)
-                }
-            };
-            w.write_all(&[r, g, b]).unwrap();
-        }
-    }
-}
-
-// =====================================================================
-// Plotters-based visualisation (ported from amr_vortex_relax)
-// =====================================================================
-
-#[allow(dead_code)]
-fn hsv_to_rgb(h: f64, s: f64, v: f64) -> RGBColor {
-    let h = h.rem_euclid(1.0);
-    let i = (h * 6.0).floor() as i32;
-    let f = h * 6.0 - (i as f64);
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - f * s);
-    let t = v * (1.0 - (1.0 - f) * s);
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    RGBColor(
-        (r.clamp(0.0, 1.0) * 255.0) as u8,
-        (g.clamp(0.0, 1.0) * 255.0) as u8,
-        (b.clamp(0.0, 1.0) * 255.0) as u8,
-    )
-}
-
-fn level_rects(h: &AmrHierarchy2D, lvl: usize) -> Vec<Rect2i> {
-    match lvl {
-        1 => h.patches.iter().map(|p| p.coarse_rect).collect(),
-        l if l >= 2 => h.patches_l2plus.get(l - 2)
-            .map(|v| v.iter().map(|p| p.coarse_rect).collect())
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// Save patch map: patch rectangles by refinement level.
-/// L1=yellow, L2=green, L3=blue — same style as amr_vortex_relax.
-fn save_patch_map(
-    base_grid: &Grid2D,
-    l1: &[Rect2i], l2: &[Rect2i], l3: &[Rect2i],
-    path: &str, caption: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let nx0 = base_grid.nx as f64;
-    let ny0 = base_grid.ny as f64;
-
-    let root = BitMapBackend::new(path, (900, 700)).into_drawing_area();
-    root.fill(&WHITE)?;
-
-    let mut chart = ChartBuilder::on(&root)
-        .caption(caption, ("sans-serif", 22))
-        .margin(15)
-        .x_label_area_size(35)
-        .y_label_area_size(35)
-        .build_cartesian_2d(0f64..1f64, 0f64..1f64)?;
-
-    chart.configure_mesh().x_desc("x/L").y_desc("y/L").disable_mesh().draw()?;
-
-    // L1 (yellow)
-    for r in l1 {
-        let x0 = r.i0 as f64 / nx0;
-        let y0 = r.j0 as f64 / ny0;
-        let x1 = (r.i0 + r.nx) as f64 / nx0;
-        let y1 = (r.j0 + r.ny) as f64 / ny0;
-        chart.draw_series(std::iter::once(Rectangle::new(
-            [(x0, y0), (x1, y1)], RGBColor(240, 220, 0).filled(),
-        )))?;
-        chart.draw_series(std::iter::once(PathElement::new(
-            vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
-            BLACK.stroke_width(2),
-        )))?;
-    }
-
-    // L2 (green)
-    for r in l2 {
-        let x0 = r.i0 as f64 / nx0;
-        let y0 = r.j0 as f64 / ny0;
-        let x1 = (r.i0 + r.nx) as f64 / nx0;
-        let y1 = (r.j0 + r.ny) as f64 / ny0;
-        chart.draw_series(std::iter::once(Rectangle::new(
-            [(x0, y0), (x1, y1)], RGBColor(0, 200, 0).filled(),
-        )))?;
-        chart.draw_series(std::iter::once(PathElement::new(
-            vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
-            RED.stroke_width(2),
-        )))?;
-    }
-
-    // L3 (blue)
-    for r in l3 {
-        let x0 = r.i0 as f64 / nx0;
-        let y0 = r.j0 as f64 / ny0;
-        let x1 = (r.i0 + r.nx) as f64 / nx0;
-        let y1 = (r.j0 + r.ny) as f64 / ny0;
-        chart.draw_series(std::iter::once(Rectangle::new(
-            [(x0, y0), (x1, y1)], RGBColor(0, 120, 255).filled(),
-        )))?;
-        chart.draw_series(std::iter::once(PathElement::new(
-            vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
-            RGBColor(0, 60, 140).stroke_width(2),
-        )))?;
-    }
-
-    root.present()?;
-    Ok(())
-}
-
-/// Save geometry + mesh zoom: antidot pattern colored by distance-to-boundary,
-/// with multi-level grid overlay (L0=gray, L1=black, L2=red, L3=blue).
-///
-/// Zooms into a region containing a few holes so individual cells are visible.
-fn save_mesh_geom(
-    base_grid: &Grid2D,
-    geom_mask: &[bool],
-    dist_field: &[u32],
-    edge_dist: usize,
-    _ratio: usize,
-    _amr_max_level: usize,
-    l1: &[Rect2i], l2: &[Rect2i], l3: &[Rect2i],
-    path: &str,
-    caption: &str,
-    zoom_centre: Option<(usize, usize)>,
-    zoom_radius_cells: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let nx = base_grid.nx;
-    let ny = base_grid.ny;
-
-    // Determine zoom window (in L0 cell coords)
-    let (cx, cy) = zoom_centre.unwrap_or((nx / 2, ny / 2));
-    let r = zoom_radius_cells;
-    let x0 = cx.saturating_sub(r);
-    let y0 = cy.saturating_sub(r);
-    let x1 = (cx + r).min(nx);
-    let y1 = (cy + r).min(ny);
-    let img_size = 900u32;
-    let root = BitMapBackend::new(path, (img_size, img_size)).into_drawing_area();
-    root.fill(&WHITE)?;
-
-    let mut chart = ChartBuilder::on(&root)
-        .caption(caption, ("sans-serif", 20))
-        .margin(10)
-        .set_all_label_area_size(0)
-        .build_cartesian_2d(x0 as i32..x1 as i32, y0 as i32..y1 as i32)?;
-    chart.configure_mesh().disable_mesh().draw()?;
-
-    // Background: antidot geometry colored by distance to boundary
-    let max_d = (edge_dist as f64) * 3.0;
-    chart.draw_series((y0..y1).flat_map(|j| {
-        (x0..x1).map(move |i| {
-            let k = idx(i, j, nx);
-            let col = if !geom_mask[k] {
-                // Vacuum (hole) — dark gray
-                RGBColor(40, 40, 45)
-            } else {
-                let d = dist_field[k];
-                if d <= edge_dist as u32 {
-                    // Edge cells: orange→yellow gradient
-                    let t = d as f64 / edge_dist as f64;
-                    RGBColor(
-                        (255.0 - 30.0 * t) as u8,
-                        (140.0 + 80.0 * t) as u8,
-                        (50.0 + 20.0 * t) as u8,
-                    )
-                } else {
-                    // Bulk/transition: green gradient fading to teal
-                    let t = ((d as f64 - edge_dist as f64) / max_d).min(1.0);
-                    RGBColor(
-                        (100.0 * (1.0 - t)) as u8,
-                        (180.0 + 40.0 * t) as u8,
-                        (120.0 + 100.0 * t) as u8,
-                    )
-                }
-            };
-            Rectangle::new(
-                [(i as i32, j as i32), (i as i32 + 1, j as i32 + 1)],
-                col.filled(),
-            )
-        })
-    }))?;
-
-    // L0 grid lines (light gray)
-    {
-        let mut x = x0;
-        while x <= x1 {
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(x as i32, y0 as i32), (x as i32, y1 as i32)],
-                RGBColor(120, 120, 120).stroke_width(1),
-            )))?;
-            x += 1;
-        }
-        let mut y = y0;
-        while y <= y1 {
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(x0 as i32, y as i32), (x1 as i32, y as i32)],
-                RGBColor(120, 120, 120).stroke_width(1),
-            )))?;
-            y += 1;
-        }
-    }
-
-    // Patch outlines: L1=red, L2=green, L3=blue (thick border only, no internal grid
-    // — at L0 zoom level the fine grid would be too dense to render clearly)
-    for (rects, color) in &[
-        (l1, RGBColor(220, 40, 40)),
-        (l2, RGBColor(0, 200, 0)),
-        (l3, RGBColor(0, 100, 255)),
-    ] {
-        for r in *rects {
-            let ri0 = r.i0.max(x0) as i32;
-            let rj0 = r.j0.max(y0) as i32;
-            let ri1 = ((r.i0 + r.nx).min(x1)) as i32;
-            let rj1 = ((r.j0 + r.ny).min(y1)) as i32;
-            if ri1 <= ri0 || rj1 <= rj0 { continue; }
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(ri0, rj0), (ri1, rj0), (ri1, rj1), (ri0, rj1), (ri0, rj0)],
-                color.stroke_width(3),
-            )))?;
-        }
-    }
-
-    root.present()?;
-    Ok(())
-}
-
-/// Save error field with mesh overlay: error magnitude at each cell
-/// with multi-level grid overlay.  Zooms into a region with a few holes.
-fn save_mesh_error(
-    base_grid: &Grid2D,
-    geom_mask: &[bool],
-    edge_mask: &[bool],
-    error: &[f64],
-    l1: &[Rect2i], l2: &[Rect2i], l3: &[Rect2i],
-    path: &str,
-    caption: &str,
-    zoom_centre: Option<(usize, usize)>,
-    zoom_radius_cells: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let nx = base_grid.nx;
-    let ny = base_grid.ny;
-
-    let (cx, cy) = zoom_centre.unwrap_or((nx / 2, ny / 2));
-    let r = zoom_radius_cells;
-    let x0 = cx.saturating_sub(r);
-    let y0 = cy.saturating_sub(r);
-    let x1 = (cx + r).min(nx);
-    let y1 = (cy + r).min(ny);
-
-    // Find max error in the zoom window for scaling
-    let mut emax = 1e-30_f64;
-    for j in y0..y1 {
-        for i in x0..x1 {
-            let k = idx(i, j, nx);
-            if geom_mask[k] && error[k] > emax { emax = error[k]; }
-        }
-    }
-
-    let img_size = 900u32;
-    let root = BitMapBackend::new(path, (img_size, img_size)).into_drawing_area();
-    root.fill(&WHITE)?;
-
-    let mut chart = ChartBuilder::on(&root)
-        .caption(caption, ("sans-serif", 20))
-        .margin(10)
-        .set_all_label_area_size(0)
-        .build_cartesian_2d(x0 as i32..x1 as i32, y0 as i32..y1 as i32)?;
-    chart.configure_mesh().disable_mesh().draw()?;
-
-    // Background: error magnitude (blue→red for material, dark for vacuum)
-    chart.draw_series((y0..y1).flat_map(|j| {
-        (x0..x1).map(move |i| {
-            let k = idx(i, j, nx);
-            let col = if !geom_mask[k] {
-                RGBColor(30, 30, 30)
-            } else {
-                let t = if emax > 0.0 { (error[k] / emax).clamp(0.0, 1.0) } else { 0.0 };
-                if edge_mask[k] {
-                    // Edge: yellow → red
-                    RGBColor(
-                        (180.0 + 75.0 * t) as u8,
-                        (200.0 * (1.0 - t)) as u8,
-                        20u8,
-                    )
-                } else {
-                    // Bulk/transition: blue → purple
-                    RGBColor(
-                        (200.0 * t) as u8,
-                        (80.0 * (1.0 - t)) as u8,
-                        (80.0 + 175.0 * (1.0 - t * 0.5)) as u8,
-                    )
-                }
-            };
-            Rectangle::new(
-                [(i as i32, j as i32), (i as i32 + 1, j as i32 + 1)],
-                col.filled(),
-            )
-        })
-    }))?;
-
-    // L0 grid lines
-    {
-        let mut x = x0;
-        while x <= x1 {
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(x as i32, y0 as i32), (x as i32, y1 as i32)],
-                RGBColor(80, 80, 80).stroke_width(1),
-            )))?;
-            x += 1;
-        }
-        let mut y = y0;
-        while y <= y1 {
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(x0 as i32, y as i32), (x1 as i32, y as i32)],
-                RGBColor(80, 80, 80).stroke_width(1),
-            )))?;
-            y += 1;
-        }
-    }
-
-    // Patch outlines
-    for (rects, color) in &[
-        (l1, RGBColor(220, 40, 40)),
-        (l2, RGBColor(0, 200, 0)),
-        (l3, RGBColor(0, 100, 255)),
-    ] {
-        for r in *rects {
-            let ri0 = r.i0.max(x0) as i32;
-            let rj0 = r.j0.max(y0) as i32;
-            let ri1 = ((r.i0 + r.nx).min(x1)) as i32;
-            let rj1 = ((r.j0 + r.ny).min(y1)) as i32;
-            if ri1 <= ri0 || rj1 <= rj0 { continue; }
-            chart.draw_series(std::iter::once(PathElement::new(
-                vec![(ri0, rj0), (ri1, rj0), (ri1, rj1), (ri0, rj1), (ri0, rj0)],
-                color.stroke_width(3),
-            )))?;
-        }
-    }
-
-    root.present()?;
-    Ok(())
-}
-
-// =====================================================================
-// CSV output
-// =====================================================================
-
-fn write_b_csv(path: &str, b: &VectorField2D) {
-    let f = File::create(path).unwrap();
-    let mut w = BufWriter::new(f);
-    writeln!(w, "i,j,bx,by,bz").unwrap();
-    for j in 0..b.grid.ny {
-        for i in 0..b.grid.nx {
-            let v = b.data[idx(i, j, b.grid.nx)];
-            writeln!(w, "{},{},{:.10e},{:.10e},{:.10e}", i, j, v[0], v[1], v[2]).unwrap();
-        }
-    }
-}
-
-fn write_edge_profile_csv(
-    path: &str, b_test: &VectorField2D, b_ref: &VectorField2D,
-    edge_mask: &[bool], nx: usize, ny: usize,
-) {
-    let f = File::create(path).unwrap();
-    let mut w = BufWriter::new(f);
-    writeln!(w, "i,j,bx_ref,by_ref,bz_ref,bx_test,by_test,bz_test,error_mag").unwrap();
-    for j in 0..ny {
-        for i in 0..nx {
-            let k = idx(i, j, nx);
-            if !edge_mask[k] { continue; }
-            let vr = b_ref.data[k]; let vt = b_test.data[k];
-            let err = ((vt[0]-vr[0]).powi(2)+(vt[1]-vr[1]).powi(2)+(vt[2]-vr[2]).powi(2)).sqrt();
-            writeln!(w, "{},{},{:.10e},{:.10e},{:.10e},{:.10e},{:.10e},{:.10e},{:.10e}",
-                i, j, vr[0], vr[1], vr[2], vt[0], vt[1], vt[2], err).unwrap();
-        }
-    }
-}
-
-fn write_m_restriction_diagnostic(
-    path: &str,
-    m_binary: &VectorField2D, m_restricted: &VectorField2D,
-    geom_mask: &[bool], edge_mask: &[bool],
-    nx: usize, ny: usize,
-) {
-    let f = File::create(path).unwrap();
-    let mut w = BufWriter::new(f);
-    writeln!(w, "i,j,is_edge,mx_binary,my_binary,mz_binary,mx_restr,my_restr,mz_restr,mag_restr,delta_mag").unwrap();
-    for j in 0..ny {
-        for i in 0..nx {
-            let k = idx(i, j, nx);
-            if !geom_mask[k] { continue; }
-            let vb = m_binary.data[k];
-            let vr = m_restricted.data[k];
-            let delta = ((vb[0]-vr[0]).powi(2)+(vb[1]-vr[1]).powi(2)+(vb[2]-vr[2]).powi(2)).sqrt();
-            if delta < 1e-14 { continue; }
-            let mag = (vr[0]*vr[0]+vr[1]*vr[1]+vr[2]*vr[2]).sqrt();
-            writeln!(w, "{},{},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6},{:.6e}",
-                i, j, if edge_mask[k] { 1 } else { 0 },
-                vb[0], vb[1], vb[2], vr[0], vr[1], vr[2], mag, delta).unwrap();
-        }
-    }
-}
-
-// =====================================================================
-// Hierarchy helpers
-// =====================================================================
-
-fn total_patch_fine_cells(h: &AmrHierarchy2D) -> usize {
-    let mut n = 0usize;
-    for p in &h.patches { n += p.grid.nx * p.grid.ny; }
-    for lvl in &h.patches_l2plus {
-        for p in lvl { n += p.grid.nx * p.grid.ny; }
-    }
-    n
-}
-
-// =====================================================================
-// Main
-// =====================================================================
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let do_csv = args.iter().any(|a| a == "--csv");
-    let skip_fine = args.iter().any(|a| a == "--skip-fine-ref");
-    let no_plots = args.iter().any(|a| a == "--no-plots");
-
-    let out_dir = "out/bench_antidot";
-    ensure_dir(out_dir);
-
-    // ---- AMR parameters ----
-    let amr_max_level: usize = env_or("LLG_AMR_MAX_LEVEL", 3);
-    let ratio = 2usize;
-    let ghost = 2usize;
-
-    // ---- Physical domain ----
-    let base_nx: usize = env_or("LLG_AD_BASE_NX", 512);
-    let base_ny: usize = env_or("LLG_AD_BASE_NY", 512);
-    let lx: f64 = env_or("LLG_AD_LX", 2.0e-6);
-    let ly: f64 = env_or("LLG_AD_LY", 2.0e-6);
-    let dz: f64 = env_or("LLG_AD_DZ", 1.0e-9);
-
-    let dx = lx / base_nx as f64;
-    let dy = ly / base_ny as f64;
-
-    let fine_ratio: usize = env_or("LLG_AD_FINE_RATIO", 2);
-    let fine_nx = base_nx * fine_ratio;
-    let fine_ny = base_ny * fine_ratio;
-    let fine_dx = dx / fine_ratio as f64;
-    let fine_dy = dy / fine_ratio as f64;
-
-    // ---- Anti-dot geometry ----
-    // CROSSOVER TUNING: Edit hole_pitch to control feature sparsity.
-    // Wider pitch = fewer holes = less AMR coverage = lower N_eff = earlier crossover.
-    //   400e-9  (default) — dense, ~17 holes in 2μm domain
-    //   800e-9            — sparse, ~4 holes
-    //   1000e-9           — very sparse, ~2 holes
-    let hole_diam: f64 = env_or("LLG_AD_HOLE_DIAM", 80.0e-9);
-    let hole_pitch: f64 = env_or("LLG_AD_HOLE_PITCH", 400.0e-9);
-    let hole_radius = hole_diam * 0.5;
-    let hole_centres = hex_hole_centres(lx, ly, hole_pitch);
-    let n_holes = hole_centres.len();
-
-    // ---- Material: Permalloy ----
-    let ms: f64 = env_or("LLG_AD_MS", 8.0e5);
-    let a_ex: f64 = env_or("LLG_AD_AEX", 1.3e-11);
-    let l_ex = (2.0 * a_ex / (4.0 * PI * 1e-7 * ms * ms)).sqrt();
-
-    let mat = Material {
-        ms, a_ex,
-        k_u: 0.0,
-        easy_axis: [0.0, 0.0, 1.0],
-        dmi: None,
-        demag: true,
-        demag_method: DemagMethod::FftUniform,
-    };
-
+// ---------------------------------------------------------------------------
+// Core benchmark: run all three solvers at a given L0 grid size.
+// Returns (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp, n_l1, n_l2plus, n_edge)
+// If skip_fine, t_fine_ms = 0 and edge errors are NaN.
+// ---------------------------------------------------------------------------
+fn run_benchmark(
+    base_nx: usize, base_ny: usize, amr_levels: usize,
+    ratio: usize, ghost: usize,
+    domain_nm: f64, _hole_radius_nm: f64, _hole_pitch_nm: f64, dz: f64,
+    mat: &Material, shape: &MaskShape,
+    hole_centres: &[(f64, f64)], hole_radius: f64,
+    skip_fine: bool, verbose: bool,
+) -> (f64, f64, f64, f64, f64, usize, usize, usize) {
+    let dx = domain_nm * 1e-9 / base_nx as f64;
+    let dy = domain_nm * 1e-9 / base_ny as f64;
     let base_grid = Grid2D::new(base_nx, base_ny, dx, dy, dz);
-    let fine_grid = Grid2D::new(fine_nx, fine_ny, fine_dx, fine_dy, dz);
+    let total_ratio = ratio.pow(amr_levels as u32);
+    let fine_nx = base_nx * total_ratio;
+    let fine_ny = base_ny * total_ratio;
+    let fine_grid = Grid2D::new(fine_nx, fine_ny, dx / total_ratio as f64, dy / total_ratio as f64, dz);
 
-    // ---- Build geometry mask (on L0 grid) ----
-    let antidot_shape = MaskShape::MultiHole {
-        holes: hole_centres.clone(),
-        radius: hole_radius,
-    };
-    let geom_mask = antidot_shape.to_mask(&base_grid);
-    let n_material = mask_count(&geom_mask);
-    let n_vacuum = base_nx * base_ny - n_material;
-
-    // ---- Cell classification ----
-    let edge_dist: usize = env_or("LLG_AD_EDGE_DIST", 5);
-    let bulk_dist: usize = env_or("LLG_AD_BULK_DIST", 20);
-    let (dist_field, edge_mask, bulk_mask) =
-        classify_cells(&geom_mask, base_nx, base_ny, edge_dist, bulk_dist);
-    let n_edge = mask_count(&edge_mask);
-    let n_bulk = mask_count(&bulk_mask);
-    let n_transition = n_material - n_edge - n_bulk;
-
-    // ---- Initialise L0 magnetisation ----
-    // LLG_AD_INIT=flower  → potential-flow flower state (non-trivial ∇·M near holes)
-    // LLG_AD_INIT=saturated (default) → uniform +x̂ (binary mask, trivial ∇·M)
-    let use_flower = std::env::var("LLG_AD_INIT")
-        .map(|s| s.trim().to_ascii_lowercase() == "flower")
-        .unwrap_or(false);
-    let init_label = if use_flower { "flower (+x̂ curling around holes)" } else { "saturated +x̂" };
-
-    let half_lx = base_nx as f64 * dx * 0.5;
-    let half_ly = base_ny as f64 * dy * 0.5;
-    let mut m_binary = VectorField2D::new(base_grid);
+    // Build coarse M with EdgeSmooth volume-fraction weighting
+    let n_smooth = edge_smooth_n();
+    let (geom_mask, fill_frac) = shape.to_mask_and_fill(&base_grid, n_smooth);
+    let mut m_coarse = VectorField2D::new(base_grid);
     for j in 0..base_ny {
-        let y_cent = (j as f64 + 0.5) * dy - half_ly;
         for i in 0..base_nx {
-            let x_cent = (i as f64 + 0.5) * dx - half_lx;
             let k = j * base_nx + i;
-            m_binary.data[k] = init_m_at(x_cent, y_cent, &hole_centres, hole_radius, &antidot_shape, use_flower);
+            m_coarse.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
         }
     }
+    apply_fill_fractions(&mut m_coarse.data, &fill_frac);
 
-    let mode_filter: Option<String> = std::env::var("LLG_AMR_DEMAG_MODE").ok()
-        .map(|s| s.trim().to_ascii_lowercase());
+    // Build AMR hierarchy
+    let mut h = AmrHierarchy2D::new(base_grid, m_coarse, ratio, ghost);
+    h.set_geom_shape(shape.clone());
 
-    // ---- Header ----
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  Anti-Dot Demag Benchmark — Phase 2 P-FFT Validation        ║");
-    println!("╚════════════════════════════════════════════════════════════════╝");
-    println!();
-    println!("Domain:     {:.1} μm × {:.1} μm × {:.1} nm", lx*1e6, ly*1e6, dz*1e9);
-    println!("L0 grid:    {} × {}   dx={:.3e}  dy={:.3e}", base_nx, base_ny, dx, dy);
-    println!("Fine grid:  {} × {} ({}× L0)  dx={:.3e}", fine_nx, fine_ny, fine_ratio, fine_dx);
-    println!("Material:   Ms={ms:.2e}  A_ex={a_ex:.2e}  l_ex={:.2} nm", l_ex*1e9);
-    println!("Anti-dot:   {} holes, d={:.0} nm, pitch={:.0} nm (hex)",
-        n_holes, hole_diam*1e9, hole_pitch*1e9);
-    println!("            cells/hole_diam: L0≈{:.1}, fine≈{:.1}",
-        hole_diam / dx, hole_diam / fine_dx);
-    println!("Cells (L0): {} total, {} material ({:.1}%), {} vacuum",
-        base_nx*base_ny, n_material,
-        100.0 * n_material as f64 / (base_nx*base_ny) as f64, n_vacuum);
-    println!("            {} edge (≤{}), {} bulk (>{}), {} transition",
-        n_edge, edge_dist, n_bulk, bulk_dist, n_transition);
-    println!("Init:       {} (set LLG_AD_INIT=flower for non-trivial M near holes)", init_label);
-    println!("AMR:        {} level(s), ratio={}, ghost={}", amr_max_level, ratio, ghost);
-    println!("Output:     {out_dir}");
-    if skip_fine { println!("  --skip-fine-ref: skipping fine-grid FFT reference"); }
-    if do_csv { println!("  --csv: per-cell CSV output enabled"); }
-    if no_plots { println!("  --no-plots: skipping plot generation"); }
-    println!();
-
-    let t0 = Instant::now();
-
-    // =====================================================================
-    // Step 1: Fine-grid FFT reference
-    // =====================================================================
-
-    let b_ref_l0;
-    let ref_fine_time_ms;
-    let ref_setup_time_ms;
-    let bref_max;
-
-    if !skip_fine {
-        println!("═══════════════════════════════════════════════════════════════");
-        println!("  Computing fine-grid FFT reference ({fine_nx}×{fine_ny}) ...");
-        println!("═══════════════════════════════════════════════════════════════");
-
-        let t_setup = Instant::now();
-        let m_fine = build_fine_m(&fine_grid, &antidot_shape, &hole_centres, hole_radius, use_flower);
-        let fine_mask = antidot_shape.to_mask(&fine_grid);
-        let fine_n_mat = mask_count(&fine_mask);
-        let setup_ms = t_setup.elapsed().as_secs_f64() * 1e3;
-        println!("  Fine M built: {} material cells ({:.1}%), {:.1} ms",
-            fine_n_mat, 100.0 * fine_n_mat as f64 / (fine_nx*fine_ny) as f64, setup_ms);
-
-        println!("  Warming up FFT kernel for {}×{} grid ...", fine_nx, fine_ny);
-        let t_warmup = Instant::now();
-        {
-            let mut bw = VectorField2D::new(fine_grid);
-            demag_fft_uniform::compute_demag_field(&fine_grid, &m_fine, &mut bw, &mat);
-        }
-        let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1e3;
-        println!("  Kernel build + first FFT: {:.1} ms (one-time setup cost)", warmup_ms);
-        ref_setup_time_ms = warmup_ms;
-
-        let t_eval = Instant::now();
-        let mut b_fine = VectorField2D::new(fine_grid);
-        demag_fft_uniform::compute_demag_field(&fine_grid, &m_fine, &mut b_fine, &mat);
-        ref_fine_time_ms = t_eval.elapsed().as_secs_f64() * 1e3;
-        println!("  FFT eval: {:.1} ms (per-timestep cost)", ref_fine_time_ms);
-
-        let mut b_ref = VectorField2D::new(base_grid);
-        downsample_b_to_l0(&b_fine, &mut b_ref, fine_ratio);
-
-        bref_max = b_ref.data.iter().enumerate()
-            .filter(|&(k, _)| geom_mask[k])
-            .map(|(_, v)| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
-            .fold(0.0_f64, f64::max);
-        println!("  max|B_demag| = {:.4e} T (material cells, at L0 resolution)", bref_max);
-
-        if do_csv { write_b_csv(&format!("{out_dir}/b_ref_fine.csv"), &b_ref); }
-        println!();
-        b_ref_l0 = b_ref;
-    } else {
-        println!("═══════════════════════════════════════════════════════════════");
-        println!("  Computing L0 FFT reference ({base_nx}×{base_ny}) ...");
-        println!("  WARNING: --skip-fine-ref means coarse_fft R=1 will show ~0% error.");
-        println!("═══════════════════════════════════════════════════════════════");
-
-        let t_warmup = Instant::now();
-        {
-            let mut bw = VectorField2D::new(base_grid);
-            demag_fft_uniform::compute_demag_field(&base_grid, &m_binary, &mut bw, &mat);
-        }
-        ref_setup_time_ms = t_warmup.elapsed().as_secs_f64() * 1e3;
-
-        let t_eval = Instant::now();
-        let mut b_ref = VectorField2D::new(base_grid);
-        demag_fft_uniform::compute_demag_field(&base_grid, &m_binary, &mut b_ref, &mat);
-        ref_fine_time_ms = t_eval.elapsed().as_secs_f64() * 1e3;
-
-        bref_max = b_ref.data.iter().enumerate()
-            .filter(|&(k, _)| geom_mask[k])
-            .map(|(_, v)| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
-            .fold(0.0_f64, f64::max);
-        println!("  Kernel: {:.1} ms, eval: {:.1} ms, max|B|={:.4e} T",
-            ref_setup_time_ms, ref_fine_time_ms, bref_max);
-        println!();
-        b_ref_l0 = b_ref;
-    }
-
-    // =====================================================================
-    // Step 2: Build AMR hierarchy
-    // =====================================================================
-
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  Building AMR hierarchy ...");
-    println!("═══════════════════════════════════════════════════════════════");
-
-    let t_amr_setup = Instant::now();
-
-    let mut m_coarse_amr = VectorField2D::new(base_grid);
-    m_coarse_amr.data.copy_from_slice(&m_binary.data);
-    let mut h = AmrHierarchy2D::new(base_grid, m_coarse_amr, ratio, ghost);
-    h.set_geom_shape(antidot_shape.clone());
-
-    let indicator_kind = if std::env::var("LLG_AMR_INDICATOR").is_ok() {
-        IndicatorKind::from_env()
-    } else {
-        IndicatorKind::Composite { frac: 0.10 }
-    };
-
-    let buffer_cells = 4usize;
-    let boundary_layer: usize = env_or("LLG_AMR_BOUNDARY_LAYER", 2);
+    let indicator_kind = IndicatorKind::Composite { frac: 0.10 };
+    let boundary_layer: usize = env_or("LLG_AMR_BOUNDARY_LAYER", 4);
     let cluster_policy = ClusterPolicy {
         indicator: indicator_kind,
-        buffer_cells,
+        buffer_cells: 4,
         boundary_layer,
         connectivity: Connectivity::Eight,
         merge_distance: 1,
         min_patch_area: 16,
         max_patches: 0,
-        min_efficiency: 0.70,
+        min_efficiency: 0.65,
         max_flagged_fraction: 0.50,
+        confine_dilation: false,
     };
     let regrid_policy = RegridPolicy {
         indicator: indicator_kind,
-        buffer_cells,
+        buffer_cells: 4,
         boundary_layer,
         min_change_cells: 1,
         min_area_change_frac: 0.01,
     };
 
-    let current_patches: Vec<Rect2i> = Vec::new();
-    if let Some((_new_rects, stats)) =
-        maybe_regrid_nested_levels(&mut h, &current_patches, regrid_policy, cluster_policy)
-    {
-        println!("  Regrid: {} cells flagged, threshold={:.4e}",
-            stats.flagged_cells, stats.threshold);
+    let current: Vec<Rect2i> = Vec::new();
+    let _ = maybe_regrid_nested_levels(&mut h, &current, regrid_policy, cluster_policy);
+    h.fill_patch_ghosts();
+
+    // Reinitialise patch M at fine resolution with EdgeSmooth
+    for p in &mut h.patches {
+        p.rebuild_active_from_shape(&base_grid, shape);
+        let pnx = p.grid.nx;
+        let pny = p.grid.ny;
+        let pdx = p.grid.dx;
+        let pdy = p.grid.dy;
+        for j in 0..pny {
+            for i in 0..pnx {
+                let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
+                let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+            }
+        }
+    }
+    for lvl in &mut h.patches_l2plus {
+        for p in lvl {
+            p.rebuild_active_from_shape(&base_grid, shape);
+            let pnx = p.grid.nx;
+            let pny = p.grid.ny;
+            let pdx = p.grid.dx;
+            let pdy = p.grid.dy;
+            for j in 0..pny {
+                for i in 0..pnx {
+                    let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
+                    let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                    p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+                }
+            }
+        }
+    }
+    h.restrict_patches_to_coarse();
+
+    let n_l1 = h.patches.len();
+    let n_l2: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
+
+    if verbose {
+        println!("  Patches: L1={}, L2+={}", n_l1, n_l2);
+    }
+
+    // Fixed physical distance for edge classification (meters).
+    let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 8.0);
+    let edge_dist = edge_dist_nm * 1e-9;
+
+    // Fine FFT reference
+    let mut t_fine_ms = 0.0f64;
+    let b_fine_opt = if !skip_fine {
+        if verbose { println!("  Computing fine FFT reference ({} × {}) ...", fine_nx, fine_ny); }
+        let mut m_fine = VectorField2D::new(fine_grid);
+        let fine_half_lx = fine_nx as f64 * fine_grid.dx * 0.5;
+        let fine_half_ly = fine_ny as f64 * fine_grid.dy * 0.5;
+        let fine_dx = fine_grid.dx;
+        let fine_dy = fine_grid.dy;
+        for j in 0..fine_ny {
+            for i in 0..fine_nx {
+                let x = (i as f64 + 0.5) * fine_dx - fine_half_lx;
+                let y = (j as f64 + 0.5) * fine_dy - fine_half_ly;
+                let ff = shape.fill_fraction(x, y, fine_dx, fine_dy, n_smooth);
+                m_fine.data[j * fine_nx + i] = [ff, 0.0, 0.0];
+            }
+        }
+        let t1 = Instant::now();
+        let mut b_fine = VectorField2D::new(fine_grid);
+        demag_fft_uniform::compute_demag_field(&fine_grid, &m_fine, &mut b_fine, mat);
+        t_fine_ms = t1.elapsed().as_secs_f64() * 1e3;
+        if verbose { println!("  Fine FFT:    {:.1} ms", t_fine_ms); }
+        Some(b_fine)
     } else {
-        println!("  Regrid: no patches created (try lowering LLG_AMR_INDICATOR_FRAC)");
+        None
+    };
+
+    // Coarse-FFT — warm up (builds Newell kernel on first call), then time
+    {
+        let mut bw = VectorField2D::new(base_grid);
+        let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, mat, &mut bw);
+    }
+    let t1 = Instant::now();
+    let mut b_coarse_fft = VectorField2D::new(base_grid);
+    let (b_l1_cfft, b_l2_cfft) = coarse_fft_demag::compute_coarse_fft_demag(&h, mat, &mut b_coarse_fft);
+    let t_cfft_ms = t1.elapsed().as_secs_f64() * 1e3;
+    if verbose { println!("  coarse-FFT:  {:.1} ms", t_cfft_ms); }
+
+    // Composite — warm up then time
+    {
+        let mut bw = VectorField2D::new(base_grid);
+        let _ = mg_composite::compute_composite_demag(&h, mat, &mut bw);
+    }
+    let t2 = Instant::now();
+    let mut b_coarse_comp = VectorField2D::new(base_grid);
+    let (b_l1_comp, b_l2_comp) = mg_composite::compute_composite_demag(&h, mat, &mut b_coarse_comp);
+    let t_comp_ms = t2.elapsed().as_secs_f64() * 1e3;
+    if verbose { println!("  composite:   {:.1} ms", t_comp_ms); }
+
+    // Compute edge RMSE across ALL levels if we have the fine reference
+    let mut edge_rmse_cfft = f64::NAN;
+    let mut edge_rmse_comp = f64::NAN;
+    let mut n_edge = 0usize;
+    if let Some(ref b_fine) = b_fine_opt {
+        let b_max = b_fine.data.iter()
+            .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
+            .fold(0.0f64, f64::max);
+
+        let mut se_cfft = 0.0f64;
+        let mut se_comp = 0.0f64;
+
+        // Helper: measure edge error on a single patch
+        let mut measure_patch = |patch: &llg_sim::amr::patch::Patch2D, bc: &[[f64; 3]], bv: &[[f64; 3]]| {
+            let pnx = patch.grid.nx;
+            let gi0 = patch.interior_i0();
+            let gj0 = patch.interior_j0();
+            let gi1 = patch.interior_i1();
+            let gj1 = patch.interior_j1();
+            for j in gj0..gj1 {
+                for i in gi0..gi1 {
+                    let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                    if !shape.contains(x, y) { continue; }
+                    let dist = min_dist_to_boundary(x, y, hole_centres, hole_radius);
+                    if dist.abs() >= edge_dist { continue; }
+                    let (xc, yc) = patch.cell_center_xy(i, j);
+                    let br = sample_bilinear(b_fine, xc, yc);
+                    let idx = j * pnx + i;
+                    se_cfft += (bc[idx][0]-br[0]).powi(2) + (bc[idx][1]-br[1]).powi(2) + (bc[idx][2]-br[2]).powi(2);
+                    se_comp += (bv[idx][0]-br[0]).powi(2) + (bv[idx][1]-br[1]).powi(2) + (bv[idx][2]-br[2]).powi(2);
+                    n_edge += 1;
+                }
+            }
+        };
+
+        // L1 patches
+        for (pi, patch) in h.patches.iter().enumerate() {
+            if pi < b_l1_cfft.len() && pi < b_l1_comp.len() {
+                measure_patch(patch, &b_l1_cfft[pi], &b_l1_comp[pi]);
+            }
+        }
+
+        // L2+ patches
+        for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+            let bc_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+            let bv_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+            for (pi, patch) in lvl_patches.iter().enumerate() {
+                if pi < bc_lvl.len() && pi < bv_lvl.len() {
+                    measure_patch(patch, &bc_lvl[pi], &bv_lvl[pi]);
+                }
+            }
+        }
+
+        if n_edge > 0 {
+            edge_rmse_cfft = (se_cfft / n_edge as f64).sqrt() / b_max * 100.0;
+            edge_rmse_comp = (se_comp / n_edge as f64).sqrt() / b_max * 100.0;
+        }
+    }
+
+    (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp, n_l1, n_l2, n_edge)
+}
+
+fn main() {
+    let t0 = Instant::now();
+    let args: Vec<String> = std::env::args().collect();
+    let do_plots = args.iter().any(|a| a == "--plots");
+    let do_sweep = args.iter().any(|a| a == "--sweep");
+
+    // ---- Configuration (same env vars as bench_composite_vcycle) ----
+    let base_nx: usize = env_or("LLG_CV_BASE_NX", 128);
+    let base_ny: usize = env_or("LLG_CV_BASE_NY", base_nx);
+    let amr_levels: usize = env_or("LLG_AMR_MAX_LEVEL", 3);
+    let ratio: usize = 2;
+    let ghost: usize = 2;
+    let skip_fine: bool = env_or("LLG_CV_SKIP_FINE", 0usize) != 0;
+
+    let domain_nm = 500.0;
+    let hole_radius_nm: f64 = env_or("LLG_CV_HOLE_RADIUS_NM", 75.0);
+    let hole_pitch_nm: f64 = env_or("LLG_CV_HOLE_PITCH_NM", 220.0);
+    let dz: f64 = env_or("LLG_CV_DZ", 3e-9);
+
+    let ms = 8.0e5;
+    let a_ex = 1.3e-11;
+    let mat = Material {
+        ms, a_ex, k_u: 0.0, easy_axis: [0.0, 0.0, 1.0],
+        dmi: None, demag: true, demag_method: DemagMethod::FftUniform,
+    };
+
+    let hole_radius = hole_radius_nm * 1e-9;
+    let hole_pitch = hole_pitch_nm * 1e-9;
+    let hole_centres = equilateral_triangle_centres(hole_pitch);
+    let n_holes = hole_centres.len();
+
+    let shape = MaskShape::MultiHole {
+        holes: hole_centres.clone(),
+        radius: hole_radius,
+    };
+
+    let vcycle_on = std::env::var("LLG_DEMAG_COMPOSITE_VCYCLE")
+        .map(|v| v == "1").unwrap_or(false);
+
+    // Fixed physical distance for edge classification.
+    let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 2.0);
+    let edge_dist = edge_dist_nm * 1e-9;
+
+    // ════════════════════════════════════════════════════════════════
+    // SWEEP MODE: timing + accuracy across grid sizes → CSV + plot
+    // ════════════════════════════════════════════════════════════════
+    if do_sweep {
+        let sweep_sizes: Vec<usize> = if let Ok(s) = std::env::var("LLG_CV_SWEEP_SIZES") {
+            s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+        } else {
+            vec![32, 48, 64, 96, 128, 256, 512]
+        };
+        let sweep_levels: usize = amr_levels;
+        let sweep_skip_fine = env_or("LLG_CV_SWEEP_SKIP_FINE", 0usize) != 0;
+        let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 2.0);
+
+        let diag_dir = "out/bench_antidot_diag";
+        fs::create_dir_all(diag_dir).ok();
+        let csv_path = format!("{}/crossover_sweep.csv", diag_dir);
+
+        println!("╔════════════════════════════════════════════════════════════════╗");
+        println!("║  Multi-Hole Antidot — Crossover Sweep                       ║");
+        println!("╚════════════════════════════════════════════════════════════════╝");
+        println!();
+        println!("  Holes:       {} (r={:.0} nm, pitch={:.0} nm, triangle)", n_holes, hole_radius_nm, hole_pitch_nm);
+        println!("  AMR levels:  {} (ratio {}×, total {}×)", sweep_levels, ratio, ratio.pow(sweep_levels as u32));
+        println!("  V-cycle:     {}", if vcycle_on { "ON" } else { "OFF" });
+        println!("  Fine ref:    {}", if sweep_skip_fine { "SKIPPED" } else { "ON" });
+        println!("  Edge dist:   {:.1} nm (fixed physical distance)", edge_dist_nm);
+        println!("  Grid sizes:  {:?}", sweep_sizes);
+        println!();
+
+        let mut csv_f = BufWriter::new(fs::File::create(&csv_path).unwrap());
+        writeln!(csv_f, "base_nx,fine_nx,amr_levels,t_fine_ms,t_cfft_ms,t_comp_ms,\
+            edge_rmse_cfft_pct,edge_rmse_comp_pct,n_l1,n_l2plus,fine_cells,comp_cells_est,n_edge").unwrap();
+
+        println!("  {:>6} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}",
+            "L0", "fine", "t_fine", "t_cfft", "t_comp", "e_cfft%", "e_comp%", "n_edge");
+        println!("  {:->6} {:->7} {:->10} {:->10} {:->10} {:->10} {:->10} {:->7}",
+            "", "", "", "", "", "", "", "");
+
+        struct SweepRow { _base_nx: usize, fine_nx: usize, t_fine: f64, t_cfft: f64, t_comp: f64, e_cfft: f64, e_comp: f64, _n_edge: usize }
+        let mut rows: Vec<SweepRow> = Vec::new();
+
+        for &nx in &sweep_sizes {
+            let tr = ratio.pow(sweep_levels as u32);
+            let fnx = nx * tr;
+            let (tf, tc, tv, ec, ev, nl1, nl2, ne) = run_benchmark(
+                nx, nx, sweep_levels, ratio, ghost,
+                domain_nm, hole_radius_nm, hole_pitch_nm, dz,
+                &mat, &shape,
+                &hole_centres, hole_radius,
+                sweep_skip_fine, false,
+            );
+            let fine_cells = fnx * fnx;
+            let comp_cells_est = nx * nx + (nl1 + nl2) * 400;
+
+            writeln!(csv_f, "{},{},{},{:.1},{:.1},{:.1},{:.2},{:.2},{},{},{},{},{}",
+                nx, fnx, sweep_levels, tf, tc, tv, ec, ev, nl1, nl2, fine_cells, comp_cells_est, ne).unwrap();
+
+            let ec_str = if ec.is_nan() { "N/A".to_string() } else { format!("{:.2}", ec) };
+            let ev_str = if ev.is_nan() { "N/A".to_string() } else { format!("{:.2}", ev) };
+            println!("  {:>6} {:>7} {:>9.0}ms {:>9.1}ms {:>9.1}ms {:>9}% {:>9}% {:>7}",
+                nx, fnx, tf, tc, tv, ec_str, ev_str, ne);
+
+            rows.push(SweepRow { _base_nx: nx, fine_nx: fnx, t_fine: tf, t_cfft: tc, t_comp: tv, e_cfft: ec, e_comp: ev, _n_edge: ne });
+        }
+
+        println!();
+        println!("  CSV: {}", csv_path);
+
+        // ---- Crossover plot ----
+        if do_plots && rows.len() >= 2 {
+            // Plot 1: Runtime vs fine-equivalent grid size
+            let plot_path = format!("{}/crossover_timing.png", diag_dir);
+            let root = BitMapBackend::new(&plot_path, (900, 550)).into_drawing_area();
+            root.fill(&WHITE).unwrap();
+
+            let x_max = rows.iter().map(|r| r.fine_nx as f64).fold(0.0f64, f64::max) * 1.2;
+            let t_max = rows.iter().map(|r| r.t_fine.max(r.t_cfft).max(r.t_comp))
+                .fold(0.0f64, f64::max) * 1.3;
+            let t_max = if t_max < 10.0 { 100.0 } else { t_max };
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("Demag Solver Runtime vs Fine-Equivalent Grid Size ({}-hole antidot)", n_holes), ("sans-serif", 20))
+                .margin(15)
+                .x_label_area_size(40)
+                .y_label_area_size(60)
+                .build_cartesian_2d((50f64..x_max).log_scale(), (0.1f64..t_max).log_scale())
+                .unwrap();
+
+            chart.configure_mesh()
+                .x_desc("Fine-equivalent grid N (N×N)")
+                .y_desc("Time (ms)")
+                .draw().unwrap();
+
+            // Fine FFT points (skip zeros)
+            let fft_pts: Vec<(f64, f64)> = rows.iter()
+                .filter(|r| r.t_fine > 0.0)
+                .map(|r| (r.fine_nx as f64, r.t_fine))
+                .collect();
+            if !fft_pts.is_empty() {
+                chart.draw_series(LineSeries::new(fft_pts.clone(), BLUE.stroke_width(2)))
+                    .unwrap()
+                    .label("fine FFT")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE.stroke_width(2)));
+                chart.draw_series(fft_pts.iter().map(|&(x, y)| Circle::new((x, y), 4, BLUE.filled())))
+                    .unwrap();
+            }
+
+            // Coarse-FFT
+            let cfft_pts: Vec<(f64, f64)> = rows.iter()
+                .map(|r| (r.fine_nx as f64, r.t_cfft))
+                .collect();
+            chart.draw_series(LineSeries::new(cfft_pts.clone(), GREEN.stroke_width(2)))
+                .unwrap()
+                .label("coarse FFT")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN.stroke_width(2)));
+            chart.draw_series(cfft_pts.iter().map(|&(x, y)| Circle::new((x, y), 4, GREEN.filled())))
+                .unwrap();
+
+            // Composite
+            let comp_pts: Vec<(f64, f64)> = rows.iter()
+                .map(|r| (r.fine_nx as f64, r.t_comp))
+                .collect();
+            chart.draw_series(LineSeries::new(comp_pts.clone(), RED.stroke_width(2)))
+                .unwrap()
+                .label("composite MG")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED.stroke_width(2)));
+            chart.draw_series(comp_pts.iter().map(|&(x, y)| Circle::new((x, y), 4, RED.filled())))
+                .unwrap();
+
+            chart.configure_series_labels()
+                .background_style(WHITE.mix(0.8))
+                .border_style(BLACK)
+                .position(SeriesLabelPosition::UpperLeft)
+                .draw().unwrap();
+
+            root.present().unwrap();
+            println!("  Plot: {}", plot_path);
+
+            // Plot 2: Accuracy vs grid size (if we have error data)
+            if rows.iter().any(|r| !r.e_cfft.is_nan()) {
+                let acc_path = format!("{}/crossover_accuracy.png", diag_dir);
+                let root = BitMapBackend::new(&acc_path, (900, 550)).into_drawing_area();
+                root.fill(&WHITE).unwrap();
+
+                let e_max = rows.iter()
+                    .filter(|r| !r.e_cfft.is_nan())
+                    .map(|r| r.e_cfft.max(r.e_comp))
+                    .fold(0.0f64, f64::max) * 1.3;
+
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(format!("Edge RMSE (%) vs L0 Grid Size ({}-hole antidot)", n_holes), ("sans-serif", 20))
+                    .margin(15)
+                    .x_label_area_size(40)
+                    .y_label_area_size(55)
+                    .build_cartesian_2d(
+                        (50f64..x_max).log_scale(),
+                        0.0..e_max.max(1.0),
+                    ).unwrap();
+
+                chart.configure_mesh()
+                    .x_desc("Fine-equivalent grid N")
+                    .y_desc("Edge RMSE (%)")
+                    .draw().unwrap();
+
+                let cfft_acc: Vec<(f64, f64)> = rows.iter()
+                    .filter(|r| !r.e_cfft.is_nan())
+                    .map(|r| (r.fine_nx as f64, r.e_cfft))
+                    .collect();
+                let comp_acc: Vec<(f64, f64)> = rows.iter()
+                    .filter(|r| !r.e_comp.is_nan())
+                    .map(|r| (r.fine_nx as f64, r.e_comp))
+                    .collect();
+
+                chart.draw_series(LineSeries::new(cfft_acc.clone(), GREEN.stroke_width(2)))
+                    .unwrap()
+                    .label("coarse-FFT edge RMSE")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN.stroke_width(2)));
+                chart.draw_series(cfft_acc.iter().map(|&(x, y)| Circle::new((x, y), 4, GREEN.filled())))
+                    .unwrap();
+
+                chart.draw_series(LineSeries::new(comp_acc.clone(), RED.stroke_width(2)))
+                    .unwrap()
+                    .label("composite edge RMSE")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED.stroke_width(2)));
+                chart.draw_series(comp_acc.iter().map(|&(x, y)| Circle::new((x, y), 4, RED.filled())))
+                    .unwrap();
+
+                chart.configure_series_labels()
+                    .background_style(WHITE.mix(0.8))
+                    .border_style(BLACK)
+                    .position(SeriesLabelPosition::UpperRight)
+                    .draw().unwrap();
+
+                root.present().unwrap();
+                println!("  Plot: {}", acc_path);
+            }
+        }
+
+        let wall = t0.elapsed().as_secs_f64();
+        println!();
+        println!("  Total sweep time: {:.1} s", wall);
+        println!();
+        return;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // SINGLE-RUN MODE: detailed accuracy comparison at one grid size
+    // ════════════════════════════════════════════════════════════════
+    let dx = domain_nm * 1e-9 / base_nx as f64;
+    let dy = domain_nm * 1e-9 / base_ny as f64;
+    let base_grid = Grid2D::new(base_nx, base_ny, dx, dy, dz);
+    let total_ratio = ratio.pow(amr_levels as u32);
+    let fine_nx = base_nx * total_ratio;
+    let fine_ny = base_ny * total_ratio;
+    let fine_grid = Grid2D::new(fine_nx, fine_ny, dx / total_ratio as f64, dy / total_ratio as f64, dz);
+
+    // ---- Build AMR hierarchy with EdgeSmooth ----
+    let n_smooth = edge_smooth_n();
+    let (geom_mask, fill_frac) = shape.to_mask_and_fill(&base_grid, n_smooth);
+    let n_boundary = fill_fraction_boundary_count(&fill_frac);
+
+    // Print hole centres for reference
+    let edge_gap_nm = hole_pitch_nm - 2.0 * hole_radius_nm;
+
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║  Multi-Hole Antidot Benchmark — Equilateral Triangle         ║");
+    println!("╚════════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  Domain:      {:.0} nm × {:.0} nm, dz = {:.1} nm", domain_nm, domain_nm, dz * 1e9);
+    println!("  Holes:       {} × r = {:.0} nm, pitch = {:.0} nm (edge gap = {:.0} nm)",
+        n_holes, hole_radius_nm, hole_pitch_nm, edge_gap_nm);
+    println!("  Base grid:   {} × {}, dx = {:.2} nm", base_nx, base_ny, dx * 1e9);
+    println!("  Fine grid:   {} × {} ({}× refinement, {} AMR levels)",
+        fine_nx, fine_ny, total_ratio, amr_levels);
+    println!("  V-cycle:     {}", if vcycle_on { "ON (fine ∇φ on patches)" } else { "OFF (interpolated coarse B)" });
+    println!("  EdgeSmooth:  n={} ({} boundary cells with partial fill)", n_smooth, n_boundary);
+    println!();
+
+    let mut m_coarse = VectorField2D::new(base_grid);
+    for j in 0..base_ny {
+        for i in 0..base_nx {
+            let k = j * base_nx + i;
+            m_coarse.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+        }
+    }
+    apply_fill_fractions(&mut m_coarse.data, &fill_frac);
+
+    let mut h = AmrHierarchy2D::new(base_grid, m_coarse, ratio, ghost);
+    h.set_geom_shape(shape.clone());
+
+    // Regrid with boundary-layer flagging to place patches around all holes
+    let indicator_kind = IndicatorKind::Composite { frac: 0.10 };
+    let boundary_layer: usize = env_or("LLG_AMR_BOUNDARY_LAYER", 4);
+
+    let cluster_policy = ClusterPolicy {
+        indicator: indicator_kind,
+        buffer_cells: 4,
+        boundary_layer,
+        connectivity: Connectivity::Eight,
+        merge_distance: 1,
+        min_patch_area: 16,
+        max_patches: 0,
+        min_efficiency: 0.65,
+        max_flagged_fraction: 0.50,
+        confine_dilation: false,
+    };
+    let regrid_policy = RegridPolicy {
+        indicator: indicator_kind,
+        buffer_cells: 4,
+        boundary_layer,
+        min_change_cells: 1,
+        min_area_change_frac: 0.01,
+    };
+
+    let current: Vec<Rect2i> = Vec::new();
+    if let Some((_rects, stats)) = maybe_regrid_nested_levels(&mut h, &current, regrid_policy, cluster_policy) {
+        println!("  Regrid: {} cells flagged", stats.flagged_cells);
     }
 
     h.fill_patch_ghosts();
-    reinit_patches(&mut h, &antidot_shape, &hole_centres, hole_radius, use_flower);
-    h.restrict_patches_to_coarse();
 
-    let amr_setup_ms = t_amr_setup.elapsed().as_secs_f64() * 1e3;
-
-    // ---- AMR diagnostics ----
-    let l1 = level_rects(&h, 1);
-    let l2 = level_rects(&h, 2);
-    let l3 = level_rects(&h, 3);
-    let n_patches_total = l1.len() + l2.len() + l3.len();
-    let n_fine_cells = total_patch_fine_cells(&h);
-
-    println!("  Patches:    L1: {}  L2: {}  L3: {}", l1.len(), l2.len(), l3.len());
-    println!("  Fine cells: {} (in patches)", n_fine_cells);
-    println!("  AMR setup:  {:.1} ms", amr_setup_ms);
-
-    // M-restriction diagnostic
-    let mut n_m_changed = 0usize;
-    let mut max_m_delta = 0.0_f64;
-    for k in 0..base_nx * base_ny {
-        if !geom_mask[k] { continue; }
-        let vb = m_binary.data[k];
-        let vr = h.coarse.data[k];
-        let d = ((vb[0]-vr[0]).powi(2)+(vb[1]-vr[1]).powi(2)+(vb[2]-vr[2]).powi(2)).sqrt();
-        if d > 1e-14 {
-            n_m_changed += 1;
-            if d > max_m_delta { max_m_delta = d; }
+    // Reinitialise patch M at fine resolution using the shape with EdgeSmooth
+    for p in &mut h.patches {
+        p.rebuild_active_from_shape(&base_grid, &shape);
+        let pnx = p.grid.nx;
+        let pny = p.grid.ny;
+        let pdx = p.grid.dx;
+        let pdy = p.grid.dy;
+        for j in 0..pny {
+            for i in 0..pnx {
+                let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
+                let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+            }
         }
     }
-    println!("  M restriction changed {} L0 cells (max Δ|m| = {:.4e})", n_m_changed, max_m_delta);
-    if n_m_changed == 0 {
-        println!("  NOTE: masked restriction preserves m=[1,0,0] for all material cells.");
-        println!("        Patches resolve geometry at fine dx but the mask-aware averaging");
-        println!("        excludes vacuum sub-cells, so the coarse M is unchanged.");
-        println!("        This is expected for saturated states — P-FFT will bypass this");
-        println!("        limitation by correcting B_demag directly at edge cells.");
-    }
-
-    // BIT-EXACT M comparison: catch even floating-point rounding differences
-    {
-        let mut n_bitexact_diff = 0usize;
-        let mut first_diff: Option<(usize, usize, [f64; 3], [f64; 3])> = None;
-        for k in 0..base_nx * base_ny {
-            let vb = m_binary.data[k];
-            let vr = h.coarse.data[k];
-            if vb[0] != vr[0] || vb[1] != vr[1] || vb[2] != vr[2] {
-                n_bitexact_diff += 1;
-                if first_diff.is_none() {
-                    first_diff = Some((k % base_nx, k / base_nx, vb, vr));
+    for lvl in &mut h.patches_l2plus {
+        for p in lvl {
+            p.rebuild_active_from_shape(&base_grid, &shape);
+            let pnx = p.grid.nx;
+            let pny = p.grid.ny;
+            let pdx = p.grid.dx;
+            let pdy = p.grid.dy;
+            for j in 0..pny {
+                for i in 0..pnx {
+                    let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
+                    let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
+                    p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
                 }
             }
         }
-        if n_bitexact_diff > 0 {
-            println!("  ⚠ BIT-EXACT M comparison: {} cells differ (including vacuum)",
-                n_bitexact_diff);
-            if let Some((i, j, vb, vr)) = first_diff {
-                println!("    First diff at ({i},{j}): binary={:.15e},{:.15e},{:.15e}",
-                    vb[0], vb[1], vb[2]);
-                println!("                          coarse={:.15e},{:.15e},{:.15e}",
-                    vr[0], vr[1], vr[2]);
-            }
-            println!("    This may cause coarse_fft R=1 to differ from fft_l0.");
-        } else {
-            println!("  ✓ BIT-EXACT: enhanced M == binary M for all {} cells", base_nx * base_ny);
-        }
     }
+    h.restrict_patches_to_coarse();
 
-    if do_csv {
-        write_m_restriction_diagnostic(
-            &format!("{out_dir}/restricted_m_diag.csv"),
-            &m_binary, &h.coarse, &geom_mask, &edge_mask, base_nx, base_ny,
-        );
-    }
+    let n_l1 = h.patches.len();
+    let n_l2: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
+    println!("  Patches:     L1={}, L2+={}", n_l1, n_l2);
     println!();
 
-    // =====================================================================
-    // Step 2b: Plots — patch map and geometry+mesh zoom
-    // =====================================================================
+    // ---- Fine FFT reference ----
+    // Build fine-resolution M (reused for both FFT and MG references)
+    let m_fine_opt = if !skip_fine {
+        let mut m_fine = VectorField2D::new(fine_grid);
+        let fine_half_lx = fine_nx as f64 * fine_grid.dx * 0.5;
+        let fine_half_ly = fine_ny as f64 * fine_grid.dy * 0.5;
+        let fine_dx = fine_grid.dx;
+        let fine_dy = fine_grid.dy;
+        for j in 0..fine_ny {
+            for i in 0..fine_nx {
+                let x = (i as f64 + 0.5) * fine_dx - fine_half_lx;
+                let y = (j as f64 + 0.5) * fine_dy - fine_half_ly;
+                let ff = shape.fill_fraction(x, y, fine_dx, fine_dy, n_smooth);
+                m_fine.data[j * fine_nx + i] = [ff, 0.0, 0.0];
+            }
+        }
+        Some(m_fine)
+    } else {
+        None
+    };
 
-    if !no_plots {
-        println!("  Generating plots ...");
+    let b_fine_fft_opt = if let Some(ref m_fine) = m_fine_opt {
+        println!("  Computing fine FFT reference ({} × {}) ...", fine_nx, fine_ny);
+        let t1 = Instant::now();
+        let mut b_fine = VectorField2D::new(fine_grid);
+        demag_fft_uniform::compute_demag_field(&fine_grid, m_fine, &mut b_fine, &mat);
+        let t_fine = t1.elapsed().as_secs_f64();
+        println!("  Fine FFT:    {:.2} s", t_fine);
 
-        // Find a good zoom centre: pick a hole near the domain centre
-        let domain_cx = base_nx / 2;
-        let domain_cy = base_ny / 2;
-        let zoom_r = 30usize; // radius in L0 cells
+        let b_max = b_fine.data.iter()
+            .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
+            .fold(0.0f64, f64::max);
+        println!("  max|B|:      {:.4e} T", b_max);
+        Some(b_fine)
+    } else {
+        println!("  Fine FFT:    SKIPPED (LLG_CV_SKIP_FINE=1)");
+        None
+    };
 
-        // Patch map (full domain)
-        let pm_path = format!("{out_dir}/patch_map.png");
-        if let Err(e) = save_patch_map(
-            &base_grid, &l1, &l2, &l3, &pm_path,
-            "Anti-dot patch map (L1 yellow, L2 green, L3 blue)",
-        ) {
-            eprintln!("  Warning: patch_map plot failed: {e}");
-        } else {
-            println!("  Patch map:  {pm_path}");
+    // ---- Coarse-FFT solve ----
+    println!("  Running coarse-FFT ...");
+    // Warm up (builds Newell kernel on first call)
+    {
+        let mut bw = VectorField2D::new(base_grid);
+        let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut bw);
+    }
+    let t1 = Instant::now();
+    let mut b_coarse_fft = VectorField2D::new(base_grid);
+    let (b_l1_cfft, b_l2_cfft) = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut b_coarse_fft);
+    let t_cfft = t1.elapsed().as_secs_f64() * 1e3;
+    println!("  coarse-FFT:  {:.1} ms", t_cfft);
+
+    // ---- Composite solve ----
+    println!("  Running composite {} ...", if vcycle_on { "(V-cycle)" } else { "(enhanced-RHS)" });
+    // Warm up (builds MG hierarchy + ΔK cache on first call)
+    {
+        let mut bw = VectorField2D::new(base_grid);
+        let _ = mg_composite::compute_composite_demag(&h, &mat, &mut bw);
+    }
+    let t2 = Instant::now();
+    let mut b_coarse_comp = VectorField2D::new(base_grid);
+    let (b_l1_comp, b_l2_comp) = mg_composite::compute_composite_demag(&h, &mat, &mut b_coarse_comp);
+    let t_comp = t2.elapsed().as_secs_f64() * 1e3;
+    println!("  composite:   {:.1} ms", t_comp);
+    println!();
+
+    // ---- Fine MG reference (same formulation as composite, uniform fine grid) ----
+    let b_fine_mg_opt = if let Some(ref m_fine) = m_fine_opt {
+        println!("  Computing fine MG reference ({} × {}) ...", fine_nx, fine_ny);
+        let t1 = Instant::now();
+        let mut b_fine_mg = VectorField2D::new(fine_grid);
+        demag_poisson_mg::compute_demag_field_poisson_mg(
+            &fine_grid, m_fine, &mut b_fine_mg, &mat);
+        let t_mg = t1.elapsed().as_secs_f64();
+        println!("  Fine MG:     {:.2} s", t_mg);
+
+        let b_max_mg = b_fine_mg.data.iter()
+            .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
+            .fold(0.0f64, f64::max);
+        println!("  max|B|_MG:   {:.4e} T", b_max_mg);
+        println!();
+        Some(b_fine_mg)
+    } else {
+        None
+    };
+
+    // ---- Patch-level accuracy comparison ----
+    let compute_patch_errors = |b_ref: &VectorField2D, label: &str| {
+        let b_max_global = b_ref.data.iter()
+            .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
+            .fold(0.0f64, f64::max);
+
+        println!("╔════════════════════════════════════════════════════════════════╗");
+        println!("║  Patch-Level B Accuracy (vs {:<36})  ║", label);
+        println!("╚════════════════════════════════════════════════════════════════╝");
+        println!("  (normalised to max|B| = {:.4e} T)", b_max_global);
+        println!();
+
+        // Per-level accumulators
+        struct LevelStats {
+            edge_se_cfft: f64, edge_se_comp: f64,
+            bulk_se_cfft: f64, bulk_se_comp: f64,
+            edge_se_comp_bx: f64, edge_se_comp_by: f64, edge_se_comp_bz: f64,
+            edge_cells: usize, bulk_cells: usize,
+            material_cells: usize,
+        }
+        impl LevelStats {
+            fn new() -> Self { Self {
+                edge_se_cfft: 0.0, edge_se_comp: 0.0,
+                bulk_se_cfft: 0.0, bulk_se_comp: 0.0,
+                edge_se_comp_bx: 0.0, edge_se_comp_by: 0.0, edge_se_comp_bz: 0.0,
+                edge_cells: 0, bulk_cells: 0, material_cells: 0,
+            }}
         }
 
-        // Geometry + mesh zoom
-        let mg_path = format!("{out_dir}/mesh_geom.png");
-        if let Err(e) = save_mesh_geom(
-            &base_grid, &geom_mask, &dist_field, edge_dist,
-            ratio, amr_max_level, &l1, &l2, &l3,
-            &mg_path,
-            "Antidot geometry + AMR mesh (orange=edge, green=bulk, dark=hole)",
-            Some((domain_cx, domain_cy)), zoom_r,
-        ) {
-            eprintln!("  Warning: mesh_geom plot failed: {e}");
-        } else {
-            println!("  Mesh+geom:  {mg_path}");
+        let n_levels = 1 + h.patches_l2plus.len();
+        let mut level_stats: Vec<LevelStats> = (0..n_levels).map(|_| LevelStats::new()).collect();
+
+        // Process L1 patches (level index 0)
+        println!("  ── Level 1 ({} patches, dx={:.2} nm) ──", h.patches.len(),
+            if !h.patches.is_empty() { h.patches[0].grid.dx * 1e9 } else { 0.0 });
+
+        for (pi, patch) in h.patches.iter().enumerate() {
+            let pnx = patch.grid.nx;
+            let gi0 = patch.interior_i0();
+            let gj0 = patch.interior_j0();
+            let gi1 = patch.interior_i1();
+            let gj1 = patch.interior_j1();
+
+            let b_cfft = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
+            let b_comp = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
+            let stats = &mut level_stats[0];
+
+            for j in gj0..gj1 {
+                for i in gi0..gi1 {
+                    let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                    if !shape.contains(x, y) { continue; }
+                    stats.material_cells += 1;
+
+                    let dist_to_hole = min_dist_to_boundary(x, y, &hole_centres, hole_radius);
+                    let is_edge = dist_to_hole.abs() < edge_dist;
+
+                    let (xc, yc) = patch.cell_center_xy(i, j);
+                    let b_r = sample_bilinear(b_ref, xc, yc);
+                    let idx = j * pnx + i;
+
+                    let b_cf = b_cfft[idx];
+                    let b_co = b_comp[idx];
+
+                    let err_cfft = (b_cf[0]-b_r[0]).powi(2) + (b_cf[1]-b_r[1]).powi(2) + (b_cf[2]-b_r[2]).powi(2);
+                    let err_comp = (b_co[0]-b_r[0]).powi(2) + (b_co[1]-b_r[1]).powi(2) + (b_co[2]-b_r[2]).powi(2);
+
+                    if is_edge {
+                        stats.edge_se_cfft += err_cfft;
+                        stats.edge_se_comp += err_comp;
+                        stats.edge_se_comp_bx += (b_co[0]-b_r[0]).powi(2);
+                        stats.edge_se_comp_by += (b_co[1]-b_r[1]).powi(2);
+                        stats.edge_se_comp_bz += (b_co[2]-b_r[2]).powi(2);
+                        stats.edge_cells += 1;
+                    } else {
+                        stats.bulk_se_cfft += err_cfft;
+                        stats.bulk_se_comp += err_comp;
+                        stats.bulk_cells += 1;
+                    }
+                }
+            }
         }
+
+        // Process L2+ patches
+        for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+            let level_num = lvl_idx + 2;
+            println!("  ── Level {} ({} patches, dx={:.2} nm) ──", level_num, lvl_patches.len(),
+                if !lvl_patches.is_empty() { lvl_patches[0].grid.dx * 1e9 } else { 0.0 });
+
+            let b_cfft_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+            let b_comp_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+            let stats = &mut level_stats[lvl_idx + 1];
+
+            for (pi, patch) in lvl_patches.iter().enumerate() {
+                let pnx = patch.grid.nx;
+                let gi0 = patch.interior_i0();
+                let gj0 = patch.interior_j0();
+                let gi1 = patch.interior_i1();
+                let gj1 = patch.interior_j1();
+
+                let b_cfft = if pi < b_cfft_lvl.len() { &b_cfft_lvl[pi] } else { continue };
+                let b_comp = if pi < b_comp_lvl.len() { &b_comp_lvl[pi] } else { continue };
+
+                for j in gj0..gj1 {
+                    for i in gi0..gi1 {
+                        let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                        if !shape.contains(x, y) { continue; }
+                        stats.material_cells += 1;
+
+                        let dist_to_hole = min_dist_to_boundary(x, y, &hole_centres, hole_radius);
+                        let is_edge = dist_to_hole.abs() < edge_dist;
+
+                        let (xc, yc) = patch.cell_center_xy(i, j);
+                        let b_r = sample_bilinear(b_ref, xc, yc);
+                        let idx = j * pnx + i;
+
+                        let b_cf = b_cfft[idx];
+                        let b_co = b_comp[idx];
+
+                        let err_cfft = (b_cf[0]-b_r[0]).powi(2) + (b_cf[1]-b_r[1]).powi(2) + (b_cf[2]-b_r[2]).powi(2);
+                        let err_comp = (b_co[0]-b_r[0]).powi(2) + (b_co[1]-b_r[1]).powi(2) + (b_co[2]-b_r[2]).powi(2);
+
+                        if is_edge {
+                            stats.edge_se_cfft += err_cfft;
+                            stats.edge_se_comp += err_comp;
+                            stats.edge_se_comp_bx += (b_co[0]-b_r[0]).powi(2);
+                            stats.edge_se_comp_by += (b_co[1]-b_r[1]).powi(2);
+                            stats.edge_se_comp_bz += (b_co[2]-b_r[2]).powi(2);
+                            stats.edge_cells += 1;
+                        } else {
+                            stats.bulk_se_cfft += err_cfft;
+                            stats.bulk_se_comp += err_comp;
+                            stats.bulk_cells += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Print per-level results
+        for (li, stats) in level_stats.iter().enumerate() {
+            let level_num = if li == 0 { 1 } else { li + 1 };
+            if stats.edge_cells > 0 {
+                let e_cfft = (stats.edge_se_cfft / stats.edge_cells as f64).sqrt();
+                let e_comp = (stats.edge_se_comp / stats.edge_cells as f64).sqrt();
+                let n = stats.edge_cells as f64;
+                let bx_r = (stats.edge_se_comp_bx / n).sqrt();
+                let by_r = (stats.edge_se_comp_by / n).sqrt();
+                let bz_r = (stats.edge_se_comp_bz / n).sqrt();
+                println!("  L{}: {} edge, {} bulk, {} material cells",
+                    level_num, stats.edge_cells, stats.bulk_cells, stats.material_cells);
+                println!("    Edge:  cfft={:.2}%  comp={:.2}%  (Bx={:.2}% By={:.2}% Bz={:.2}%)",
+                    e_cfft / b_max_global * 100.0,
+                    e_comp / b_max_global * 100.0,
+                    bx_r / b_max_global * 100.0,
+                    by_r / b_max_global * 100.0,
+                    bz_r / b_max_global * 100.0);
+            }
+            if stats.bulk_cells > 0 {
+                let b_cfft = (stats.bulk_se_cfft / stats.bulk_cells as f64).sqrt();
+                let b_comp = (stats.bulk_se_comp / stats.bulk_cells as f64).sqrt();
+                if stats.edge_cells == 0 {
+                    println!("  L{}: {} bulk, {} material cells (no edge cells)",
+                        level_num, stats.bulk_cells, stats.material_cells);
+                }
+                println!("    Bulk:  cfft={:.2}%  comp={:.2}%",
+                    b_cfft / b_max_global * 100.0,
+                    b_comp / b_max_global * 100.0);
+            }
+        }
+
+        // Aggregate totals across all levels
+        let total_edge_se_cfft: f64 = level_stats.iter().map(|s| s.edge_se_cfft).sum();
+        let total_edge_se_comp: f64 = level_stats.iter().map(|s| s.edge_se_comp).sum();
+        let total_bulk_se_cfft: f64 = level_stats.iter().map(|s| s.bulk_se_cfft).sum();
+        let total_bulk_se_comp: f64 = level_stats.iter().map(|s| s.bulk_se_comp).sum();
+        let total_edge_cells: usize = level_stats.iter().map(|s| s.edge_cells).sum();
+        let total_bulk_cells: usize = level_stats.iter().map(|s| s.bulk_cells).sum();
+        let total_material: usize = level_stats.iter().map(|s| s.material_cells).sum();
+        let total_edge_se_comp_bx: f64 = level_stats.iter().map(|s| s.edge_se_comp_bx).sum();
+        let total_edge_se_comp_by: f64 = level_stats.iter().map(|s| s.edge_se_comp_by).sum();
+        let total_edge_se_comp_bz: f64 = level_stats.iter().map(|s| s.edge_se_comp_bz).sum();
+
+        println!();
+        println!("  ────────────────────────────────────────────────────");
+        println!("  ALL-LEVEL TOTALS (vs {}) — {} material cells", label, total_material);
+        println!("  ────────────────────────────────────────────────────");
+
+        if total_edge_cells > 0 {
+            let edge_rmse_cfft = (total_edge_se_cfft / total_edge_cells as f64).sqrt();
+            let edge_rmse_comp = (total_edge_se_comp / total_edge_cells as f64).sqrt();
+            let edge_rel_cfft = edge_rmse_cfft / b_max_global * 100.0;
+            let edge_rel_comp = edge_rmse_comp / b_max_global * 100.0;
+
+            println!("  EDGE ({} cells across all levels):", total_edge_cells);
+            println!("    coarse-FFT: {:.2}%", edge_rel_cfft);
+            println!("    composite:  {:.2}%", edge_rel_comp);
+
+            if edge_rmse_comp < edge_rmse_cfft {
+                println!("    → composite is {:.1}% MORE ACCURATE at edges",
+                    (1.0 - edge_rmse_comp / edge_rmse_cfft) * 100.0);
+            } else {
+                println!("    → composite is {:.1}% worse at edges",
+                    (edge_rmse_comp / edge_rmse_cfft - 1.0) * 100.0);
+            }
+
+            let n = total_edge_cells as f64;
+            let bx_rmse = (total_edge_se_comp_bx / n).sqrt();
+            let by_rmse = (total_edge_se_comp_by / n).sqrt();
+            let bz_rmse = (total_edge_se_comp_bz / n).sqrt();
+            println!("    Components: Bx={:.2}% By={:.2}% Bz={:.2}%",
+                bx_rmse / b_max_global * 100.0,
+                by_rmse / b_max_global * 100.0,
+                bz_rmse / b_max_global * 100.0);
+        }
+
+        if total_bulk_cells > 0 {
+            let bulk_rmse_cfft = (total_bulk_se_cfft / total_bulk_cells as f64).sqrt();
+            let bulk_rmse_comp = (total_bulk_se_comp / total_bulk_cells as f64).sqrt();
+            println!("  BULK ({} cells):", total_bulk_cells);
+            println!("    coarse-FFT: {:.2}%", bulk_rmse_cfft / b_max_global * 100.0);
+            println!("    composite:  {:.2}%", bulk_rmse_comp / b_max_global * 100.0);
+        }
+        println!();
+    };
+
+    // ---- Compare against fine FFT reference ----
+    if let Some(ref b_fine_fft) = b_fine_fft_opt {
+        compute_patch_errors(b_fine_fft, "uniform fine FFT (Newell)");
+    }
+
+    // ---- Compare against fine MG reference ----
+    if let Some(ref b_fine_mg) = b_fine_mg_opt {
+        compute_patch_errors(b_fine_mg, "uniform fine MG (same formulation)");
+    }
+
+    if b_fine_fft_opt.is_none() && b_fine_mg_opt.is_none() {
+        println!("  (Accuracy comparison skipped — set LLG_CV_SKIP_FINE=0 to enable)");
         println!();
     }
 
-    // =====================================================================
-    // Step 3: Evaluate modes and compare
-    // =====================================================================
-
-    struct ModeResult {
-        name: String,
-        setup_ms: f64,
-        eval_ms: f64,
-        rmse_global: f64,
-        rmse_edge: f64,
-        rmse_bulk: f64,
-        max_delta: f64,
-        n_edge: usize,
-        n_bulk: usize,
-    }
-    let mut results: Vec<ModeResult> = Vec::new();
-    // Store error fields for plotting
-    let mut error_fields: Vec<(String, Vec<f64>)> = Vec::new();
-
-    let should_run = |name: &str| -> bool {
-        match &mode_filter {
-            None => true,
-            Some(f) => {
-                let n = name.to_ascii_lowercase();
-                n.contains(f.as_str()) || f.contains(n.as_str())
-                    || (f == "coarsefft" && n.starts_with("coarse_fft"))
-                    || (f == "cfft" && n.starts_with("coarse_fft"))
-                    || (f == "composite" && n.contains("composite"))
-                    || (f == "amr" && n.contains("amr"))
-            }
-        }
-    };
-
-    // ---- Mode 1: fft_fine (the reference) ----
-    if !skip_fine && should_run("fft_fine") {
-        println!("Mode: fft_fine (FFT on {}×{} fine grid, downsampled to L0) ...", fine_nx, fine_ny);
-        println!("  (This IS the reference — RMSE = 0 by definition)");
-        println!("  Setup: {:.1} ms (kernel build)   Eval: {:.1} ms", ref_setup_time_ms, ref_fine_time_ms);
-        results.push(ModeResult {
-            name: "fft_fine".into(),
-            setup_ms: ref_setup_time_ms, eval_ms: ref_fine_time_ms,
-            rmse_global: 0.0, rmse_edge: 0.0, rmse_bulk: 0.0,
-            max_delta: 0.0, n_edge, n_bulk,
-        });
+    // ---- Timing summary ----
+    println!("  TIMING");
+    println!("  ────────────────────────────────────────────────────");
+    println!("    coarse-FFT:  {:.1} ms", t_cfft);
+    println!("    composite:   {:.1} ms", t_comp);
+    if !skip_fine {
+        println!("    fine FFT:    {:.1} ms (reference)", t0.elapsed().as_secs_f64() * 1e3);
     }
 
-    // ---- Mode 2: fft_l0 ----
-    if should_run("fft_l0") {
-        println!("Mode: fft_l0 (FFT on {}×{} L0, binary mask M) ...", base_nx, base_ny);
-
-        let t_warmup = Instant::now();
-        {
-            let mut bw = VectorField2D::new(base_grid);
-            demag_fft_uniform::compute_demag_field(&base_grid, &m_binary, &mut bw, &mat);
-        }
-        let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1e3;
-
-        let t_eval = Instant::now();
-        let mut b_l0 = VectorField2D::new(base_grid);
-        demag_fft_uniform::compute_demag_field(&base_grid, &m_binary, &mut b_l0, &mat);
-        let eval_ms = t_eval.elapsed().as_secs_f64() * 1e3;
-
-        let (_, _, _, rt, md) = global_rmse(&b_l0, &b_ref_l0, &geom_mask);
-        let (re, ne) = region_rmse(&b_l0, &b_ref_l0, &edge_mask);
-        let (rb, nb) = region_rmse(&b_l0, &b_ref_l0, &bulk_mask);
-        let grel = if bref_max > 0.0 { rt / bref_max * 100.0 } else { 0.0 };
-        let erel = if bref_max > 0.0 { re / bref_max * 100.0 } else { 0.0 };
-        let brel = if bref_max > 0.0 { rb / bref_max * 100.0 } else { 0.0 };
-
-        println!("  Setup: {:.1} ms (kernel, cached)   Eval: {:.1} ms", warmup_ms, eval_ms);
-        println!("  Global RMSE: {rt:.4e} T ({grel:.2}%)  max ΔB: {md:.3e} T");
-        println!("  Edge   RMSE: {re:.4e} T ({erel:.2}%)  [{ne} cells]");
-        println!("  Bulk   RMSE: {rb:.4e} T ({brel:.2}%)  [{nb} cells]");
-
-        let error_mag: Vec<f64> = (0..base_nx*base_ny).map(|k| {
-            let da = b_l0.data[k]; let db = b_ref_l0.data[k];
-            ((da[0]-db[0]).powi(2)+(da[1]-db[1]).powi(2)+(da[2]-db[2]).powi(2)).sqrt()
-        }).collect();
-        let hmap_path = format!("{out_dir}/error_heatmap_fft_l0.ppm");
-        write_error_heatmap(&hmap_path, base_nx, base_ny, &error_mag, &geom_mask, &edge_mask);
-        println!("  Heatmap: {hmap_path}");
-
-        error_fields.push(("fft_l0".into(), error_mag));
-
-        if do_csv {
-            write_b_csv(&format!("{out_dir}/b_fft_l0.csv"), &b_l0);
-            write_edge_profile_csv(
-                &format!("{out_dir}/b_edge_profile_fft_l0.csv"),
-                &b_l0, &b_ref_l0, &edge_mask, base_nx, base_ny,
-            );
-        }
-
-        results.push(ModeResult {
-            name: "fft_l0".into(),
-            setup_ms: warmup_ms, eval_ms,
-            rmse_global: rt, rmse_edge: re, rmse_bulk: rb,
-            max_delta: md, n_edge: ne, n_bulk: nb,
-        });
+    println!();
+    println!("  V-cycle mode: {}", if vcycle_on { "ON" } else { "OFF" });
+    if !vcycle_on {
+        println!("  → Run with LLG_DEMAG_COMPOSITE_VCYCLE=1 to test fine-resolution B");
     }
-
-    // ---- Mode 3: coarse_fft R=N ----
-    if should_run("coarse_fft") {
-        let r_val: usize = env_or("LLG_DEMAG_COARSEN_RATIO", 1);
-
-        let t_warmup = Instant::now();
-        {
-            let mut bw = VectorField2D::new(base_grid);
-            let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut bw);
-        }
-        let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1e3;
-
-        let demag_nx = if r_val <= 1 { base_nx } else { base_nx / r_val };
-        println!("Mode: coarse_fft R={} (AMR restrict → {}² FFT → interp) ...",
-            r_val, demag_nx);
-        println!("  Setup: {:.1} ms (AMR build {:.1} ms + kernel {:.1} ms)",
-            amr_setup_ms + warmup_ms, amr_setup_ms, warmup_ms);
-
-        let n_runs = 3;
-        let mut best_ms = f64::INFINITY;
-        let mut b_coarse = VectorField2D::new(base_grid);
-        for _ in 0..n_runs {
-            let t1 = Instant::now();
-            let mut b_tmp = VectorField2D::new(base_grid);
-            let _ = coarse_fft_demag::compute_coarse_fft_demag(&h, &mat, &mut b_tmp);
-            let dt = t1.elapsed().as_secs_f64() * 1e3;
-            if dt < best_ms {
-                best_ms = dt;
-                b_coarse.data.copy_from_slice(&b_tmp.data);
-            }
-        }
-        let eval_ms = best_ms;
-
-        let (_, _, _, rt, md) = global_rmse(&b_coarse, &b_ref_l0, &geom_mask);
-        let (re, ne) = region_rmse(&b_coarse, &b_ref_l0, &edge_mask);
-        let (rb, nb) = region_rmse(&b_coarse, &b_ref_l0, &bulk_mask);
-        let grel = if bref_max > 0.0 { rt / bref_max * 100.0 } else { 0.0 };
-        let erel = if bref_max > 0.0 { re / bref_max * 100.0 } else { 0.0 };
-        let brel = if bref_max > 0.0 { rb / bref_max * 100.0 } else { 0.0 };
-
-        println!("  Eval:    {eval_ms:.1} ms (best of {n_runs})");
-        println!("  Global RMSE: {rt:.4e} T ({grel:.2}%)  max ΔB: {md:.3e} T");
-        println!("  Edge   RMSE: {re:.4e} T ({erel:.2}%)  [{ne} cells]");
-        println!("  Bulk   RMSE: {rb:.4e} T ({brel:.2}%)  [{nb} cells]");
-
-        if r_val > 1 {
-            println!("  NOTE: R={r_val} edge RMSE may appear lower than R=1 — this is an artifact.");
-            println!("        The L0→demag_grid restriction (UN-masked) smooths the staircase,");
-            println!("        acting as a low-pass filter on Gibbs oscillations.  But bulk RMSE");
-            println!("        ({brel:.1}%) reveals the true cost: far-field accuracy is sacrificed.");
-        }
-
-        let error_mag: Vec<f64> = (0..base_nx*base_ny).map(|k| {
-            let da = b_coarse.data[k]; let db = b_ref_l0.data[k];
-            ((da[0]-db[0]).powi(2)+(da[1]-db[1]).powi(2)+(da[2]-db[2]).powi(2)).sqrt()
-        }).collect();
-        let hmap_path = format!("{out_dir}/error_heatmap_coarse_fft_r{r_val}.ppm");
-        write_error_heatmap(&hmap_path, base_nx, base_ny, &error_mag, &geom_mask, &edge_mask);
-        println!("  Heatmap: {hmap_path}");
-
-        error_fields.push((format!("coarse_fft_r{r_val}"), error_mag));
-
-        if do_csv {
-            write_b_csv(&format!("{out_dir}/b_coarse_fft_r{r_val}.csv"), &b_coarse);
-            write_edge_profile_csv(
-                &format!("{out_dir}/b_edge_profile_coarse_fft_r{r_val}.csv"),
-                &b_coarse, &b_ref_l0, &edge_mask, base_nx, base_ny,
-            );
-        }
-
-        results.push(ModeResult {
-            name: format!("coarse_fft R={r_val}"),
-            setup_ms: amr_setup_ms + warmup_ms, eval_ms,
-            rmse_global: rt, rmse_edge: re, rmse_bulk: rb,
-            max_delta: md, n_edge: ne, n_bulk: nb,
-        });
-    }
-    
-    // ---- Mode 4: CompositeGrid (AMR-aware Poisson/FK with enhanced RHS) ----
-    // This is the truly adaptive demag method:
-    //   - Computes fine-resolution ∇·M from AMR patches (smooth geometry)
-    //   - Injects into coarse-grid Poisson solve (enhanced RHS)
-    //   - MG V-cycle runs on the coarse grid only (fast!)
-    //   - Kzz convolution via FFT on coarse grid
-    //   - Result: B_demag at L0 with fine-geometry charge information
-    if should_run("composite_grid") {
-        println!("Mode: composite_grid (AMR enhanced-RHS MG/FK on {}×{} coarse grid) ...",
-            base_nx, base_ny);
-
-        // Warm up MG solver (first call builds hierarchy + boundary integral)
-        {
-            let mut bw = VectorField2D::new(base_grid);
-            let _ = mg_composite::compute_composite_demag(&h, &mat, &mut bw);
-        }
-
-        let n_runs = 3;
-        let mut best_ms = f64::INFINITY;
-        let mut b_composite = VectorField2D::new(base_grid);
-        for _ in 0..n_runs {
-            let t1 = Instant::now();
-            b_composite.set_uniform(0.0, 0.0, 0.0);
-            let _ = mg_composite::compute_composite_demag(&h, &mat, &mut b_composite);
-            // Zero vacuum cells
-            for k in 0..base_nx * base_ny {
-                if !geom_mask[k] {
-                    b_composite.data[k] = [0.0, 0.0, 0.0];
-                }
-            }
-            let dt = t1.elapsed().as_secs_f64() * 1e3;
-            if dt < best_ms { best_ms = dt; }
-        }
-        let eval_ms = best_ms;
-
-        let (_, _, _, rt, md) = global_rmse(&b_composite, &b_ref_l0, &geom_mask);
-        let (re, ne) = region_rmse(&b_composite, &b_ref_l0, &edge_mask);
-        let (rb, nb) = region_rmse(&b_composite, &b_ref_l0, &bulk_mask);
-        let grel = if bref_max > 0.0 { rt / bref_max * 100.0 } else { 0.0 };
-        let erel = if bref_max > 0.0 { re / bref_max * 100.0 } else { 0.0 };
-        let brel = if bref_max > 0.0 { rb / bref_max * 100.0 } else { 0.0 };
-
-        println!("  Eval:    {eval_ms:.1} ms (best of {n_runs})");
-        println!("  vs fine ref:");
-        println!("    Global RMSE: {rt:.4e} T ({grel:.2}%)  max ΔB: {md:.3e} T");
-        println!("    Edge   RMSE: {re:.4e} T ({erel:.2}%)  [{ne} cells]");
-        println!("    Bulk   RMSE: {rb:.4e} T ({brel:.2}%)  [{nb} cells]");
-
-        let error_mag: Vec<f64> = (0..base_nx*base_ny).map(|k| {
-            let da = b_composite.data[k]; let db = b_ref_l0.data[k];
-            ((da[0]-db[0]).powi(2)+(da[1]-db[1]).powi(2)+(da[2]-db[2]).powi(2)).sqrt()
-        }).collect();
-        let hmap_path = format!("{out_dir}/error_heatmap_composite_grid.ppm");
-        write_error_heatmap(&hmap_path, base_nx, base_ny, &error_mag, &geom_mask, &edge_mask);
-        println!("  Heatmap: {hmap_path}");
-        error_fields.push(("composite_grid".to_string(), error_mag));
-        if do_csv {
-            write_b_csv(&format!("{out_dir}/b_composite_grid.csv"), &b_composite);
-            write_edge_profile_csv(
-                &format!("{out_dir}/b_edge_profile_composite_grid.csv"),
-                &b_composite, &b_ref_l0, &edge_mask, base_nx, base_ny,
-            );
-        }
-        results.push(ModeResult {
-            name: "composite_grid".into(),
-            setup_ms: amr_setup_ms,
-            eval_ms,
-            rmse_global: rt, rmse_edge: re, rmse_bulk: rb,
-            max_delta: md, n_edge: ne, n_bulk: nb,
-        });
-    }
-
-    // ---- Mode 5: AMR-FFT (flatten AMR hierarchy to fine, run FFT) ----
-    // Uses AMR patch M at fine resolution near holes (smooth geometry from
-    // MaskShape), coarse M upsampled in bulk. Single FFT on the composite
-    // fine grid. Proves that AMR geometry data fixes the staircase error.
-    // Runtime is similar to fft_fine (both use 1024×1024 FFT).
-    if should_run("amr_fft") {
-        println!("Mode: amr_fft (flatten AMR → {}×{} fine grid, FFT on composite M) ...",
-            fine_nx, fine_ny);
-
-        let t_build = Instant::now();
-
-        // Step 1: Upsample L0 coarse M to fine grid (replicate each cell).
-        let mut m_amr_fine = VectorField2D::new(fine_grid);
-        for j in 0..base_ny {
-            for i in 0..base_nx {
-                let v = h.coarse.data[j * base_nx + i];
-                for fj in 0..fine_ratio {
-                    for fi in 0..fine_ratio {
-                        let fi_g = i * fine_ratio + fi;
-                        let fj_g = j * fine_ratio + fj;
-                        m_amr_fine.data[fj_g * fine_nx + fi_g] = v;
-                    }
-                }
-            }
-        }
-
-        // Step 2: Overlay L1 patches (fine-resolution M with smooth geometry).
-        for p in &h.patches {
-            let cr = &p.coarse_rect;
-            let gh = p.ghost;
-            let pnx = p.grid.nx;
-            for jf in 0..(cr.ny * ratio) {
-                for if_ in 0..(cr.nx * ratio) {
-                    let src_i = gh + if_;
-                    let src_j = gh + jf;
-                    let v = p.m.data[src_j * pnx + src_i];
-                    let dst_i = cr.i0 * ratio + if_;
-                    let dst_j = cr.j0 * ratio + jf;
-                    if dst_i < fine_nx && dst_j < fine_ny {
-                        m_amr_fine.data[dst_j * fine_nx + dst_i] = v;
-                    }
-                }
-            }
-        }
-        let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
-        println!("  M build: {:.1} ms ({} L1 patches overlaid)", build_ms, h.patches.len());
-
-        // Warm up FFT (reuses kernel from fft_fine).
-        {
-            let mut bw = VectorField2D::new(fine_grid);
-            demag_fft_uniform::compute_demag_field(&fine_grid, &m_amr_fine, &mut bw, &mat);
-        }
-
-        let n_runs = 3;
-        let mut best_ms = f64::INFINITY;
-        let mut b_amr_fine = VectorField2D::new(fine_grid);
-        for _ in 0..n_runs {
-            let t1 = Instant::now();
-            demag_fft_uniform::compute_demag_field(&fine_grid, &m_amr_fine, &mut b_amr_fine, &mat);
-            let dt = t1.elapsed().as_secs_f64() * 1e3;
-            if dt < best_ms { best_ms = dt; }
-        }
-        let eval_ms = best_ms;
-
-        let mut b_amr_l0 = VectorField2D::new(base_grid);
-        downsample_b_to_l0(&b_amr_fine, &mut b_amr_l0, fine_ratio);
-
-        let (_, _, _, rt, md) = global_rmse(&b_amr_l0, &b_ref_l0, &geom_mask);
-        let (re, ne) = region_rmse(&b_amr_l0, &b_ref_l0, &edge_mask);
-        let (rb, nb) = region_rmse(&b_amr_l0, &b_ref_l0, &bulk_mask);
-        let grel = if bref_max > 0.0 { rt / bref_max * 100.0 } else { 0.0 };
-        let erel = if bref_max > 0.0 { re / bref_max * 100.0 } else { 0.0 };
-        let brel = if bref_max > 0.0 { rb / bref_max * 100.0 } else { 0.0 };
-
-        println!("  Eval:    {eval_ms:.1} ms (best of {n_runs})");
-        println!("  vs fine ref:");
-        println!("    Global RMSE: {rt:.4e} T ({grel:.2}%)  max ΔB: {md:.3e} T");
-        println!("    Edge   RMSE: {re:.4e} T ({erel:.2}%)  [{ne} cells]");
-        println!("    Bulk   RMSE: {rb:.4e} T ({brel:.2}%)  [{nb} cells]");
-
-        let error_mag: Vec<f64> = (0..base_nx*base_ny).map(|k| {
-            let da = b_amr_l0.data[k]; let db = b_ref_l0.data[k];
-            ((da[0]-db[0]).powi(2)+(da[1]-db[1]).powi(2)+(da[2]-db[2]).powi(2)).sqrt()
-        }).collect();
-        let hmap_path = format!("{out_dir}/error_heatmap_amr_fft.ppm");
-        write_error_heatmap(&hmap_path, base_nx, base_ny, &error_mag, &geom_mask, &edge_mask);
-        println!("  Heatmap: {hmap_path}");
-        error_fields.push(("amr_fft".to_string(), error_mag));
-        if do_csv {
-            write_b_csv(&format!("{out_dir}/b_amr_fft.csv"), &b_amr_l0);
-            write_edge_profile_csv(
-                &format!("{out_dir}/b_edge_profile_amr_fft.csv"),
-                &b_amr_l0, &b_ref_l0, &edge_mask, base_nx, base_ny,
-            );
-        }
-        results.push(ModeResult {
-            name: "amr_fft".into(),
-            setup_ms: amr_setup_ms + build_ms,
-            eval_ms,
-            rmse_global: rt, rmse_edge: re, rmse_bulk: rb,
-            max_delta: md, n_edge: ne, n_bulk: nb,
-        });
-    }
-
-    
-    // =====================================================================
-    // Step 3b: Error + mesh zoom plots
-    // =====================================================================
-
-    if !no_plots && !error_fields.is_empty() {
-        let domain_cx = base_nx / 2;
-        let domain_cy = base_ny / 2;
-        let zoom_r = 30usize;
-
-        for (label, err) in &error_fields {
-            let me_path = format!("{out_dir}/mesh_error_{label}.png");
-            if let Err(e) = save_mesh_error(
-                &base_grid, &geom_mask, &edge_mask, err,
-                &l1, &l2, &l3,
-                &me_path,
-                &format!("Error + mesh: {label} (yellow=edge err, blue=bulk)"),
-                Some((domain_cx, domain_cy)), zoom_r,
-            ) {
-                eprintln!("  Warning: mesh_error plot failed: {e}");
-            } else {
-                println!("  Error+mesh: {me_path}");
-            }
-        }
-    }
-
-    // =====================================================================
-    // Step 4: Summary table
-    // =====================================================================
 
     let wall = t0.elapsed().as_secs_f64();
-    println!();
-    println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║  Anti-Dot Demag Accuracy Summary  (reference: fine-grid FFT {}×{})                              ║", fine_nx, fine_ny);
-    println!("╠══════════════════╤═══════╤═══════╤════════════╤════════════╤════════════╤════════╤═════════════════╣");
-    println!("║ Mode             │ setup │ eval  │ Global RMSE│  Edge RMSE │  Bulk RMSE │ max ΔB │ verdict         ║");
-    println!("║                  │  (ms) │ (ms)  │            │            │            │        │                 ║");
-    println!("╠══════════════════╪═══════╪═══════╪════════════╪════════════╪════════════╪════════╪═════════════════╣");
-    for r in &results {
-        let grel = if bref_max > 0.0 { r.rmse_global / bref_max * 100.0 } else { 0.0 };
-        let erel = if bref_max > 0.0 { r.rmse_edge / bref_max * 100.0 } else { 0.0 };
-        let brel = if bref_max > 0.0 { r.rmse_bulk / bref_max * 100.0 } else { 0.0 };
 
-        let verdict = if r.name == "fft_fine" {
-            "REFERENCE"
-        } else if erel < 3.0 && brel < 1.0 {
-            "good"
-        } else if erel < 10.0 && brel < 3.0 {
-            "fair"
-        } else if brel > 5.0 && erel < 18.0 {
-            "BULK CORRUPT" // R=2 case: edge looks OK but bulk is sacrificed
+    // ════════════════════════════════════════════════════════════════════
+    // DIAGNOSTIC CSV OUTPUT
+    // ════════════════════════════════════════════════════════════════════
+    let diag_dir = "out/bench_antidot_diag";
+    fs::create_dir_all(diag_dir).ok();
+
+    let half = domain_nm * 0.5;
+
+    // ---- 1. Patch map ----
+    {
+        let path = format!("{}/patch_map.csv", diag_dir);
+        let mut f = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(f, "patch_id,level,coarse_i0,coarse_j0,coarse_nx,coarse_ny,ratio,ghost,fine_nx,fine_ny,dx_nm,dy_nm").unwrap();
+        for (pi, p) in h.patches.iter().enumerate() {
+            let cr = &p.coarse_rect;
+            writeln!(f, "{},1,{},{},{},{},{},{},{},{},{:.4},{:.4}",
+                pi, cr.i0, cr.j0, cr.nx, cr.ny, p.ratio, p.ghost,
+                p.grid.nx, p.grid.ny, p.grid.dx * 1e9, p.grid.dy * 1e9).unwrap();
+        }
+        for (lvl_idx, lvl) in h.patches_l2plus.iter().enumerate() {
+            for (pi, p) in lvl.iter().enumerate() {
+                let cr = &p.coarse_rect;
+                let global_id = h.patches.len() + lvl_idx * 1000 + pi;
+                writeln!(f, "{},{},{},{},{},{},{},{},{},{},{:.4},{:.4}",
+                    global_id, lvl_idx + 2, cr.i0, cr.j0, cr.nx, cr.ny,
+                    p.ratio, p.ghost, p.grid.nx, p.grid.ny,
+                    p.grid.dx * 1e9, p.grid.dy * 1e9).unwrap();
+            }
+        }
+        println!("  Wrote {}", path);
+    }
+
+    // ---- 2. Per-cell error map for L1 patches near the holes ----
+    if let Some(ref b_fine_fft) = b_fine_fft_opt {
+        let path = format!("{}/error_map_l1.csv", diag_dir);
+        let mut f = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(f, "patch_id,i,j,x_nm,y_nm,dist_to_hole_nm,is_material,\
+            bx_fft,by_fft,bz_fft,bx_cfft,by_cfft,bz_cfft,bx_comp,by_comp,bz_comp,\
+            err_cfft,err_comp").unwrap();
+
+        for (pi, patch) in h.patches.iter().enumerate() {
+            let pnx = patch.grid.nx;
+            let gi0 = patch.interior_i0();
+            let gj0 = patch.interior_j0();
+            let gi1 = patch.interior_i1();
+            let gj1 = patch.interior_j1();
+
+            let b_cfft = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
+            let b_comp = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
+
+            for j in gj0..gj1 {
+                for i in gi0..gi1 {
+                    let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                    let is_mat = shape.contains(x, y);
+                    let dist_nm = min_dist_to_boundary(x, y, &hole_centres, hole_radius) * 1e9;
+
+                    let (xc, yc) = patch.cell_center_xy(i, j);
+                    let b_ref = sample_bilinear(b_fine_fft, xc, yc);
+                    let idx = j * pnx + i;
+                    let bc = b_cfft[idx];
+                    let bv = b_comp[idx];
+
+                    let err_c = ((bc[0]-b_ref[0]).powi(2) + (bc[1]-b_ref[1]).powi(2) + (bc[2]-b_ref[2]).powi(2)).sqrt();
+                    let err_v = ((bv[0]-b_ref[0]).powi(2) + (bv[1]-b_ref[1]).powi(2) + (bv[2]-b_ref[2]).powi(2)).sqrt();
+
+                    writeln!(f, "{},{},{},{:.4},{:.4},{:.2},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
+                        pi, i, j, x * 1e9, y * 1e9, dist_nm, is_mat as u8,
+                        b_ref[0], b_ref[1], b_ref[2],
+                        bc[0], bc[1], bc[2],
+                        bv[0], bv[1], bv[2],
+                        err_c, err_v).unwrap();
+                }
+            }
+        }
+        println!("  Wrote {}", path);
+    }
+
+    // ---- 3. L0-level B comparison along y=centre slice ----
+    {
+        let path = format!("{}/l0_slice_y_center.csv", diag_dir);
+        let mut f = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(f, "i,x_nm,is_material,\
+            bx_cfft,by_cfft,bz_cfft,bx_comp,by_comp,bz_comp,\
+            bx_fft_ref,by_fft_ref,bz_fft_ref").unwrap();
+
+        let jc = base_ny / 2;
+        let half_lx = base_nx as f64 * dx * 0.5;
+        for i in 0..base_nx {
+            let x_phys = (i as f64 + 0.5) * dx - half_lx;
+            let y_phys = (jc as f64 + 0.5) * dy - base_ny as f64 * dy * 0.5;
+            let is_mat = shape.contains(x_phys, y_phys);
+            let idx = jc * base_nx + i;
+
+            let bc_fft = b_coarse_fft.data[idx];
+            let bc_comp = b_coarse_comp.data[idx];
+
+            let xc = (i as f64 + 0.5) * dx;
+            let yc = (jc as f64 + 0.5) * dy;
+            let b_ref = if let Some(ref bf) = b_fine_fft_opt {
+                sample_bilinear(bf, xc, yc)
+            } else {
+                [0.0; 3]
+            };
+
+            writeln!(f, "{},{:.4},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
+                i, x_phys * 1e9, is_mat as u8,
+                bc_fft[0], bc_fft[1], bc_fft[2],
+                bc_comp[0], bc_comp[1], bc_comp[2],
+                b_ref[0], b_ref[1], b_ref[2]).unwrap();
+        }
+        println!("  Wrote {}", path);
+    }
+
+    // ---- 4. Bin-averaged radial Bx profile across ALL holes ----
+    //
+    // For each L1 patch cell, find the nearest hole centre and compute the
+    // radial distance from *that* hole. Pool all holes' worth of samples
+    // into radial bins (~0.5 nm wide) and average. This gives a much
+    // smoother, more convincing profile than a single-patch slice.
+    //
+    // Raw samples are also written to CSV for post-processing.
+    //
+    // Radial extent: we keep samples from 0 to hole_pitch/2 (half the
+    // inter-hole distance) so we see the boundary + the material between holes.
+
+    // Collect raw (r_nm, bx_fft, bx_cfft, bx_comp) from ALL L1 interior cells.
+    struct RadialSample { r_nm: f64, bx_fft: f64, bx_cfft: f64, bx_comp: f64 }
+    let mut raw_samples: Vec<RadialSample> = Vec::new();
+
+    let max_radial_nm = hole_pitch_nm * 0.5 + hole_radius_nm; // slightly past midpoint between holes
+
+    if !h.patches.is_empty() && !b_l1_comp.is_empty() {
+        for (pi, patch) in h.patches.iter().enumerate() {
+            let pnx = patch.grid.nx;
+            let gi0 = patch.interior_i0();
+            let gj0 = patch.interior_j0();
+            let gi1 = patch.interior_i1();
+            let gj1 = patch.interior_j1();
+
+            let b_cfft_p = if pi < b_l1_cfft.len() { &b_l1_cfft[pi] } else { continue };
+            let b_comp_p = if pi < b_l1_comp.len() { &b_l1_comp[pi] } else { continue };
+
+            for j in gj0..gj1 {
+                for i in gi0..gi1 {
+                    let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                    if !shape.contains(x, y) { continue; }
+
+                    // Find nearest hole and radial distance from its centre
+                    let mut best_r2 = f64::INFINITY;
+                    for &(hx, hy) in &hole_centres {
+                        let dr2 = (x - hx) * (x - hx) + (y - hy) * (y - hy);
+                        if dr2 < best_r2 { best_r2 = dr2; }
+                    }
+                    let r_nm = best_r2.sqrt() * 1e9;
+                    if r_nm > max_radial_nm { continue; }
+
+                    let idx = j * pnx + i;
+                    let bx_fft = if let Some(ref bf) = b_fine_fft_opt {
+                        let (xc, yc) = patch.cell_center_xy(i, j);
+                        sample_bilinear(bf, xc, yc)[0]
+                    } else {
+                        f64::NAN
+                    };
+
+                    raw_samples.push(RadialSample {
+                        r_nm,
+                        bx_fft,
+                        bx_cfft: b_cfft_p[idx][0],
+                        bx_comp: b_comp_p[idx][0],
+                    });
+                }
+            }
+        }
+    }
+
+    // Write raw samples to CSV
+    if !raw_samples.is_empty() {
+        let path = format!("{}/patch_radial_slice.csv", diag_dir);
+        let mut f = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(f, "r_nm,bx_fft,bx_cfft,bx_comp").unwrap();
+        for s in &raw_samples {
+            writeln!(f, "{:.4},{:.6e},{:.6e},{:.6e}",
+                s.r_nm, s.bx_fft, s.bx_cfft, s.bx_comp).unwrap();
+        }
+        println!("  Wrote {} ({} samples from {} holes)", path, raw_samples.len(), n_holes);
+    }
+
+    // Bin-average into ~0.5 nm bins
+    let bin_width_nm = 0.5;
+    struct BinAccum { sum_fft: f64, sum_cfft: f64, sum_comp: f64, count: usize }
+    let n_bins = ((max_radial_nm / bin_width_nm).ceil() as usize) + 1;
+    let mut bins: Vec<BinAccum> = (0..n_bins).map(|_| BinAccum { sum_fft: 0.0, sum_cfft: 0.0, sum_comp: 0.0, count: 0 }).collect();
+
+    let have_fft_ref = raw_samples.iter().any(|s| !s.bx_fft.is_nan());
+    for s in &raw_samples {
+        let bi = (s.r_nm / bin_width_nm) as usize;
+        if bi >= n_bins { continue; }
+        if have_fft_ref && !s.bx_fft.is_nan() { bins[bi].sum_fft += s.bx_fft; }
+        bins[bi].sum_cfft += s.bx_cfft;
+        bins[bi].sum_comp += s.bx_comp;
+        bins[bi].count += 1;
+    }
+
+    // Build averaged profile vectors
+    let mut avg_fft: Vec<(f64, f64)> = Vec::new();
+    let mut avg_cfft: Vec<(f64, f64)> = Vec::new();
+    let mut avg_comp: Vec<(f64, f64)> = Vec::new();
+    {
+        let path = format!("{}/radial_bx_averaged.csv", diag_dir);
+        let mut f = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(f, "r_nm,n_samples,bx_fft_avg,bx_cfft_avg,bx_comp_avg").unwrap();
+        for (bi, bin) in bins.iter().enumerate() {
+            if bin.count == 0 { continue; }
+            let r = (bi as f64 + 0.5) * bin_width_nm;
+            let n = bin.count as f64;
+            let fft_avg = bin.sum_fft / n;
+            let cfft_avg = bin.sum_cfft / n;
+            let comp_avg = bin.sum_comp / n;
+            writeln!(f, "{:.2},{},{:.6e},{:.6e},{:.6e}",
+                r, bin.count, fft_avg, cfft_avg, comp_avg).unwrap();
+            if have_fft_ref { avg_fft.push((r, fft_avg)); }
+            avg_cfft.push((r, cfft_avg));
+            avg_comp.push((r, comp_avg));
+        }
+        println!("  Wrote {} ({} bins, {:.1} nm width)", path, avg_cfft.len(), bin_width_nm);
+    }
+
+    // ---- 4b. THESIS FIGURE: Bin-averaged radial Bx across all holes ----
+    if !avg_cfft.is_empty() {
+        let all_pts = avg_fft.iter().chain(avg_cfft.iter()).chain(avg_comp.iter());
+        let r_min = all_pts.clone().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let r_max = all_pts.clone().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let b_all_min = all_pts.clone().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let b_all_max = all_pts.clone().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        let b_range = (b_all_max - b_all_min).max(0.01);
+        let y_lo = b_all_min - b_range * 0.1;
+        let y_hi = b_all_max + b_range * 0.1;
+
+        let path = format!("{}/radial_bx_thesis.png", diag_dir);
+        let root = BitMapBackend::new(&path, (900, 500)).into_drawing_area();
+        root.fill(&WHITE).unwrap();
+
+        let smooth_label = if n_smooth > 0 {
+            format!("Averaged Radial Bx — {}-Hole Antidot, L0={}, EdgeSmooth={}", n_holes, base_nx, n_smooth)
         } else {
-            "EDGE LOSSY"
+            format!("Averaged Radial Bx — {}-Hole Antidot, L0={}, Staircase", n_holes, base_nx)
         };
 
-        println!("║ {:16} │{:>6.0} │{:>6.1} │ {:.4e} │ {:.4e} │ {:.4e} │{:.3e}│ {:15} ║",
-            r.name, r.setup_ms, r.eval_ms,
-            r.rmse_global, r.rmse_edge, r.rmse_bulk, r.max_delta, verdict);
-        println!("║                  │       │       │  ({:5.2}%)  │  ({:5.2}%)  │  ({:5.2}%)  │        │                 ║",
-            grel, erel, brel);
-    }
-    println!("╚══════════════════╧═══════╧═══════╧════════════╧════════════╧════════════╧════════╧═════════════════╝");
+        let mut chart = ChartBuilder::on(&root)
+            .caption(&smooth_label, ("sans-serif", 20).into_font())
+            .margin(12)
+            .x_label_area_size(40)
+            .y_label_area_size(60)
+            .build_cartesian_2d(r_min..r_max, y_lo..y_hi)
+            .unwrap();
 
-    println!();
-    println!("Geometry:   {} holes, {} edge cells, {} bulk cells, {} transition",
-        n_holes, n_edge, n_bulk, n_transition);
-    println!("AMR:        {} patches, {} fine cells, M restriction changed {} L0 cells",
-        n_patches_total, n_fine_cells, n_m_changed);
-    println!("Reference:  max|B_demag| = {:.4e} T", bref_max);
-    println!("Total wall: {:.3} s", wall);
+        chart.configure_mesh()
+            .x_desc("Distance from nearest hole centre (nm)")
+            .y_desc("⟨Bx⟩ (T)")
+            .label_style(("sans-serif", 14))
+            .draw()
+            .unwrap();
 
-    // ---- Interpretation ----
-    println!();
-    println!("INTERPRETATION:");
-    println!("  fft_fine  = Gold reference.  Slow ({:.0}ms setup + {:.0}ms eval), but resolves holes at fine dx.",
-        ref_setup_time_ms, ref_fine_time_ms);
-    if let Some(r) = results.iter().find(|r| r.name == "fft_l0") {
-        let erel = if bref_max > 0.0 { r.rmse_edge / bref_max * 100.0 } else { 0.0 };
-        println!("  fft_l0    = L0 FFT ({:.0}ms eval).  Edge error {:.1}% from staircase boundary.",
-            r.eval_ms, erel);
-    }
-    if let Some(r) = results.iter().find(|r| r.name.starts_with("coarse_fft")) {
-        let erel = if bref_max > 0.0 { r.rmse_edge / bref_max * 100.0 } else { 0.0 };
-        let brel = if bref_max > 0.0 { r.rmse_bulk / bref_max * 100.0 } else { 0.0 };
-        println!("  {} = AMR + FFT ({:.0}ms eval).  Edge {:.1}%, bulk {:.1}%.",
-            r.name, r.eval_ms, erel, brel);
-        if brel > 5.0 {
-            println!("            Low edge % is misleading: un-masked L0→demag restriction smooths");
-            println!("            the staircase (acts as low-pass filter), reducing Gibbs oscillations");
-            println!("            at edges.  But the bulk field is corrupted ({:.1}%).  This is NOT a", brel);
-            println!("            real solution — P-FFT will provide correct edge correction.");
-        } else {
-            println!("            Both fft_l0 and coarse_fft suffer ~18% edge error from the L0");
-            println!("            staircase.  Masked restriction preserves m=[1,0,0] at all material");
-            println!("            cells, so AMR patches don't improve the coarse M for saturated states.");
-            println!("            P-FFT will fix this by correcting B_demag directly at edge cells.");
+        // Vertical line at hole boundary
+        chart.draw_series(std::iter::once(PathElement::new(
+            vec![(hole_radius_nm, y_lo), (hole_radius_nm, y_hi)],
+            BLACK.mix(0.4).stroke_width(1),
+        ))).unwrap();
+
+        let mid_y = (y_lo + y_hi) * 0.5;
+        chart.draw_series(std::iter::once(plotters::element::Text::new(
+            "material", (hole_radius_nm + 2.0, mid_y), ("sans-serif", 12).into_font().color(&BLACK.mix(0.5)),
+        ))).ok();
+        chart.draw_series(std::iter::once(plotters::element::Text::new(
+            "vacuum", (hole_radius_nm - 4.0, mid_y), ("sans-serif", 12).into_font().color(&BLACK.mix(0.5)),
+        ))).ok();
+
+        // FFT reference (blue, thick)
+        if !avg_fft.is_empty() {
+            chart.draw_series(LineSeries::new(avg_fft.clone(), BLUE.stroke_width(3)))
+                .unwrap()
+                .label("Fine FFT (reference)")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE.stroke_width(3)));
         }
+
+        // Coarse-FFT (green)
+        chart.draw_series(LineSeries::new(avg_cfft.clone(), GREEN.stroke_width(2)))
+            .unwrap()
+            .label("Coarse-FFT")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN.stroke_width(2)));
+        chart.draw_series(avg_cfft.iter().step_by(2).map(|&(rx, bx)|
+            Circle::new((rx, bx), 3, GREEN.filled())
+        )).unwrap();
+
+        // Composite (red)
+        chart.draw_series(LineSeries::new(avg_comp.clone(), RED.stroke_width(2)))
+            .unwrap()
+            .label("Composite MG")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED.stroke_width(2)));
+        chart.draw_series(avg_comp.iter().step_by(2).map(|&(rx, bx)|
+            Circle::new((rx, bx), 3, RED.filled())
+        )).unwrap();
+
+        chart.configure_series_labels()
+            .background_style(WHITE.mix(0.9))
+            .border_style(BLACK)
+            .label_font(("sans-serif", 13))
+            .position(SeriesLabelPosition::UpperLeft)
+            .draw()
+            .unwrap();
+
+        root.present().unwrap();
+        println!("  Wrote {} (thesis figure — averaged over {} holes)", path, n_holes);
     }
-    println!("  P-FFT target: edge RMSE < 3%, bulk < 1%, eval time close to coarse_fft.");
 
-    // =====================================================================
-    // CROSSOVER ANALYSIS: Uniform-Fine FFT vs AMR + Composite MG
-    // =====================================================================
+    // ---- 5. Summary file ----
     {
-        let fft_fine_r = results.iter().find(|r| r.name == "fft_fine");
-        let composite_r = results.iter().find(|r| r.name == "composite_grid");
-        let coarse_fft_r = results.iter().find(|r| r.name.starts_with("coarse_fft"));
+        let path = format!("{}/summary.txt", diag_dir);
+        let mut f = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(f, "Multi-Hole Antidot Benchmark Diagnostics").unwrap();
+        writeln!(f, "==========================================").unwrap();
+        writeln!(f, "Domain: {:.0} nm x {:.0} nm, dz = {:.1} nm", domain_nm, domain_nm, dz * 1e9).unwrap();
+        writeln!(f, "Holes: {} x r = {:.0} nm, pitch = {:.0} nm (equilateral triangle)", n_holes, hole_radius_nm, hole_pitch_nm).unwrap();
+        writeln!(f, "Base grid: {} x {}, dx = {:.2} nm", base_nx, base_ny, dx * 1e9).unwrap();
+        writeln!(f, "Fine grid: {} x {} ({} AMR levels)", fine_nx, fine_ny, amr_levels).unwrap();
+        writeln!(f, "V-cycle: {}", if vcycle_on { "ON" } else { "OFF" }).unwrap();
+        writeln!(f, "EdgeSmooth: n={} ({} boundary cells)", n_smooth, n_boundary).unwrap();
+        writeln!(f, "Patches: L1={}, L2+={}", n_l1, n_l2).unwrap();
+        writeln!(f, "coarse-FFT: {:.1} ms", t_cfft).unwrap();
+        writeln!(f, "composite: {:.1} ms", t_comp).unwrap();
+        writeln!(f, "").unwrap();
+        writeln!(f, "Hole centres (nm):").unwrap();
+        for (hi, &(cx, cy)) in hole_centres.iter().enumerate() {
+            writeln!(f, "  hole {}: ({:.1}, {:.1})", hi, cx * 1e9, cy * 1e9).unwrap();
+        }
+        writeln!(f, "").unwrap();
+        writeln!(f, "Files:").unwrap();
+        writeln!(f, "  patch_map.csv            — patch geometry (all levels)").unwrap();
+        writeln!(f, "  error_map_l1.csv         — per-cell B and error for L1 patches").unwrap();
+        writeln!(f, "  l0_slice_y_center.csv    — L0 B along y=centre slice").unwrap();
+        writeln!(f, "  patch_radial_slice.csv   — raw (r, Bx) samples from all holes").unwrap();
+        writeln!(f, "  radial_bx_averaged.csv   — bin-averaged radial Bx profile (0.5nm bins)").unwrap();
+        println!("  Wrote {}", path);
+    }
 
-        if fft_fine_r.is_some() || composite_r.is_some() || coarse_fft_r.is_some() {
-            println!();
-            println!("╔══════════════════════════════════════════════════════════════╗");
-            println!("║  CROSSOVER ANALYSIS: FFT (uniform) vs AMR+MG (adaptive)    ║");
-            println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  Diagnostics written to {}/", diag_dir);
 
-            // --- Cell counts ---
-            let n_fine_cells = fine_nx * fine_ny;
-            let n_fine_fft_padded = (2 * fine_nx) * (2 * fine_ny);
-            let n_l0_cells = base_nx * base_ny;
-            let n_l0_fft_padded = (2 * base_nx) * (2 * base_ny);
+    // ---- PNG PLOTS (--plots flag) ----
+    if do_plots {
+        println!();
+        println!("  Generating plots ...");
 
-            // MG padded box estimate
-            let mg_pad: usize = env_or("LLG_DEMAG_MG_PAD_XY", 6);
-            let mg_nvac: usize = env_or("LLG_DEMAG_MG_NVAC_Z", 16);
-            let mg_px = base_nx + 2 * mg_pad;
-            let mg_py = base_ny + 2 * mg_pad;
-            let mg_pz = 1 + 2 * mg_nvac;
-            let n_mg_padded = mg_px * mg_py * mg_pz;
+        // Plot 1: Patch map with all holes
+        {
+            let path = format!("{}/patch_map.png", diag_dir);
+            let root = BitMapBackend::new(&path, (800, 800)).into_drawing_area();
+            root.fill(&WHITE).unwrap();
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("Patch Map — {}-Hole Antidot (L0={}², {} AMR levels)", n_holes, base_nx, amr_levels), ("sans-serif", 18))
+                .margin(15).x_label_area_size(35).y_label_area_size(45)
+                .build_cartesian_2d(-half..half, -half..half).unwrap();
+            chart.configure_mesh().x_desc("x (nm)").y_desc("y (nm)").draw().unwrap();
 
-            // Patch coverage
-            let n_amr_patch_cells = n_fine_cells;
-            let patch_coverage_pct = 100.0 * n_amr_patch_cells as f64 / n_fine_cells as f64;
-
-            // N_eff for composite MG: MG padded box + patch cells for exchange/DMI
-            let n_eff_composite = n_mg_padded + n_amr_patch_cells;
-
-            // N_eff for coarse FFT: L0 padded FFT + patch cells
-            let n_eff_coarse_fft = n_l0_fft_padded + n_amr_patch_cells;
-
-            // Ratios
-            let ratio_vs_fine = n_fine_fft_padded as f64 / n_eff_composite as f64;
-            let ratio_coarse_fft = n_fine_fft_padded as f64 / n_eff_coarse_fft as f64;
-
-            println!();
-            println!("  Cell counts:");
-            println!("    Uniform-fine FFT:    {} × {} = {} cells (padded: {})",
-                fine_nx, fine_ny, n_fine_cells, n_fine_fft_padded);
-            println!("    L0 grid:             {} × {} = {} cells",
-                base_nx, base_ny, n_l0_cells);
-            println!("    MG padded box:       {} × {} × {} = {} cells",
-                mg_px, mg_py, mg_pz, n_mg_padded);
-            println!("    AMR patch cells:     {} ({:.1}% of fine-equiv)",
-                n_amr_patch_cells, patch_coverage_pct);
-            println!();
-            println!("    N_eff (composite MG): {} (MG padded + patches)", n_eff_composite);
-            println!("    N_eff (coarse FFT):   {} (L0 FFT padded + patches)", n_eff_coarse_fft);
-            println!("    Cell ratio (fine/composite): {:.1}×", ratio_vs_fine);
-            println!("    Cell ratio (fine/coarse_fft): {:.1}×", ratio_coarse_fft);
-
-            // --- Timing comparison ---
-            println!();
-            println!("  Timing comparison:");
-
-            if let Some(r) = fft_fine_r {
-                println!("    fft_fine:        {:.1} ms (setup) + {:.1} ms (eval)", r.setup_ms, r.eval_ms);
-            }
-            if let Some(r) = coarse_fft_r {
-                println!("    coarse_fft:      {:.1} ms (setup) + {:.1} ms (eval)", r.setup_ms, r.eval_ms);
-            }
-            if let Some(r) = composite_r {
-                println!("    composite_mg:    {:.1} ms (setup) + {:.1} ms (eval)", r.setup_ms, r.eval_ms);
+            // Draw all hole circles
+            let n_pts = 120;
+            for &(hx, hy) in &hole_centres {
+                let hx_nm = hx * 1e9;
+                let hy_nm = hy * 1e9;
+                let circle: Vec<(f64, f64)> = (0..=n_pts).map(|k| {
+                    let th = 2.0 * std::f64::consts::PI * k as f64 / n_pts as f64;
+                    (hx_nm + hole_radius_nm * th.cos(), hy_nm + hole_radius_nm * th.sin())
+                }).collect();
+                chart.draw_series(std::iter::once(PathElement::new(circle, BLACK.stroke_width(3)))).unwrap();
             }
 
-            // --- Speedup ratios ---
-            if let (Some(fine_r), Some(comp_r)) = (fft_fine_r, composite_r) {
-                let speedup_eval = fine_r.eval_ms / comp_r.eval_ms;
-                let per_unknown_ratio = if n_eff_composite > 0 && n_fine_fft_padded > 0 {
-                    (comp_r.eval_ms / n_eff_composite as f64)
-                        / (fine_r.eval_ms / n_fine_fft_padded as f64)
-                } else { f64::NAN };
-
-                println!();
-                if speedup_eval > 1.0 {
-                    println!("  >>> COMPOSITE MG IS {:.1}× FASTER than uniform-fine FFT <<<", speedup_eval);
+            // L1 patches (yellow/orange)
+            for p in h.patches.iter() {
+                let cr = &p.coarse_rect;
+                let x0 = cr.i0 as f64 * dx * 1e9 - half;
+                let y0 = cr.j0 as f64 * dy * 1e9 - half;
+                let x1 = (cr.i0 + cr.nx) as f64 * dx * 1e9 - half;
+                let y1 = (cr.j0 + cr.ny) as f64 * dy * 1e9 - half;
+                chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], RGBColor(255, 200, 0).mix(0.25).filled()))).unwrap();
+                chart.draw_series(std::iter::once(PathElement::new(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], RGBColor(200, 150, 0).stroke_width(2)))).unwrap();
+            }
+            // L2+ patches with distinct colors per level
+            let level_colors: Vec<(RGBColor, RGBColor)> = vec![
+                (RGBColor(0, 160, 0), RGBColor(0, 100, 0)),       // L2: green
+                (RGBColor(0, 100, 200), RGBColor(0, 60, 150)),     // L3: blue
+                (RGBColor(180, 0, 180), RGBColor(120, 0, 120)),    // L4: purple (if needed)
+            ];
+            for (lvl_idx, lvl) in h.patches_l2plus.iter().enumerate() {
+                let (fill_c, stroke_c) = if lvl_idx < level_colors.len() {
+                    level_colors[lvl_idx]
                 } else {
-                    println!("  >>> FFT is still {:.1}× faster (composite MG {:.1}× slower) <<<",
-                        1.0/speedup_eval, 1.0/speedup_eval);
+                    (RGBColor(128, 128, 128), RGBColor(80, 80, 80))
+                };
+                for p in lvl.iter() {
+                    let cr = &p.coarse_rect;
+                    let x0 = cr.i0 as f64 * dx * 1e9 - half;
+                    let y0 = cr.j0 as f64 * dy * 1e9 - half;
+                    let x1 = (cr.i0 + cr.nx) as f64 * dx * 1e9 - half;
+                    let y1 = (cr.j0 + cr.ny) as f64 * dy * 1e9 - half;
+                    chart.draw_series(std::iter::once(Rectangle::new([(x0, y0), (x1, y1)], fill_c.mix(0.2).filled()))).unwrap();
+                    chart.draw_series(std::iter::once(PathElement::new(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], stroke_c.stroke_width(1)))).unwrap();
                 }
-                println!("    Per-unknown: MG is {:.0}× slower than FFT", per_unknown_ratio);
-                println!("    Cell reduction: {:.1}× (fine/composite)", ratio_vs_fine);
-                println!("    Needed for crossover: cell reduction > {:.0}×", per_unknown_ratio);
+            }
+            root.present().unwrap();
+            println!("    Wrote {}", path);
+        }
 
-                // Accuracy comparison
-                println!();
-                println!("  Accuracy:");
-                let fine_grel = if bref_max > 0.0 { fine_r.rmse_global / bref_max * 100.0 } else { 0.0 };
-                let comp_grel = if bref_max > 0.0 { comp_r.rmse_global / bref_max * 100.0 } else { 0.0 };
-                println!("    fft_fine:     {:.2}% global RMSE (reference)", fine_grel);
-                println!("    composite_mg: {:.2}% global RMSE", comp_grel);
+        // Plot 2: Averaged radial Bx profile (same as thesis figure, redrawn for --plots consistency)
+        if !avg_cfft.is_empty() {
+            let path = format!("{}/radial_bx_profile.png", diag_dir);
+            let root = BitMapBackend::new(&path, (900, 500)).into_drawing_area();
+            root.fill(&WHITE).unwrap();
+
+            let all_pts = avg_fft.iter().chain(avg_cfft.iter()).chain(avg_comp.iter());
+            let r_min = all_pts.clone().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let r_max = all_pts.clone().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let b_min = all_pts.clone().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let b_max = all_pts.clone().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+            let b_range = (b_max - b_min).max(0.01);
+            let y_lo = b_min - b_range * 0.1;
+            let y_hi = b_max + b_range * 0.1;
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("⟨Bx⟩ vs Radial Distance (averaged over {} holes)", n_holes), ("sans-serif", 18))
+                .margin(10).x_label_area_size(35).y_label_area_size(55)
+                .build_cartesian_2d(r_min..r_max, y_lo..y_hi).unwrap();
+            chart.configure_mesh().x_desc("r (nm)").y_desc("⟨Bx⟩ (T)").draw().unwrap();
+            chart.draw_series(std::iter::once(PathElement::new(
+                vec![(hole_radius_nm, y_lo), (hole_radius_nm, y_hi)], BLACK.stroke_width(1),
+            ))).unwrap();
+            if !avg_fft.is_empty() {
+                chart.draw_series(LineSeries::new(avg_fft.clone(), BLUE.stroke_width(2))).unwrap()
+                    .label("FFT ref").legend(|(x, y)| PathElement::new(vec![(x, y), (x+20, y)], BLUE.stroke_width(2)));
+            }
+            chart.draw_series(LineSeries::new(avg_cfft.clone(), GREEN.stroke_width(2))).unwrap()
+                .label("coarse-FFT").legend(|(x, y)| PathElement::new(vec![(x, y), (x+20, y)], GREEN.stroke_width(2)));
+            chart.draw_series(LineSeries::new(avg_comp.clone(), RED.stroke_width(2))).unwrap()
+                .label("composite").legend(|(x, y)| PathElement::new(vec![(x, y), (x+20, y)], RED.stroke_width(2)));
+            chart.configure_series_labels()
+                .background_style(WHITE.mix(0.8)).border_style(BLACK)
+                .position(SeriesLabelPosition::UpperLeft).draw().unwrap();
+            root.present().unwrap();
+            println!("    Wrote {}", path);
+        }
+
+        // Plot 3: Error bar chart (all levels)
+        if let Some(ref b_fine_fft) = b_fine_fft_opt {
+            let path = format!("{}/error_comparison.png", diag_dir);
+            let root = BitMapBackend::new(&path, (900, 550)).into_drawing_area();
+            root.fill(&WHITE).unwrap();
+            let b_max_g = b_fine_fft.data.iter()
+                .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt()).fold(0.0f64, f64::max);
+
+            struct LvlErr { edge_cfft: f64, edge_comp: f64, bulk_cfft: f64, bulk_comp: f64, ne: usize, nb: usize }
+            let n_levels = 1 + h.patches_l2plus.len();
+            let mut lvl_errs: Vec<LvlErr> = (0..n_levels).map(|_| LvlErr { edge_cfft: 0.0, edge_comp: 0.0, bulk_cfft: 0.0, bulk_comp: 0.0, ne: 0, nb: 0 }).collect();
+
+            let measure_patch = |patch: &llg_sim::amr::patch::Patch2D, b_cfft_p: &[[f64; 3]], b_comp_p: &[[f64; 3]], lvl: &mut LvlErr| {
+                let pnx = patch.grid.nx;
+                let (gi0, gj0, gi1, gj1) = (patch.interior_i0(), patch.interior_j0(), patch.interior_i1(), patch.interior_j1());
+                for j in gj0..gj1 { for i in gi0..gi1 {
+                    let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                    if !shape.contains(x, y) { continue; }
+                    let dist = min_dist_to_boundary(x, y, &hole_centres, hole_radius);
+                    let is_edge = dist.abs() < edge_dist;
+                    let (xc, yc) = patch.cell_center_xy(i, j);
+                    let br = sample_bilinear(b_fine_fft, xc, yc);
+                    let idx = j * pnx + i;
+                    let ec = (b_cfft_p[idx][0]-br[0]).powi(2)+(b_cfft_p[idx][1]-br[1]).powi(2)+(b_cfft_p[idx][2]-br[2]).powi(2);
+                    let ev = (b_comp_p[idx][0]-br[0]).powi(2)+(b_comp_p[idx][1]-br[1]).powi(2)+(b_comp_p[idx][2]-br[2]).powi(2);
+                    if is_edge { lvl.edge_cfft += ec; lvl.edge_comp += ev; lvl.ne += 1; }
+                    else { lvl.bulk_cfft += ec; lvl.bulk_comp += ev; lvl.nb += 1; }
+                }}
+            };
+
+            // L1
+            for (pi, patch) in h.patches.iter().enumerate() {
+                if pi < b_l1_cfft.len() && pi < b_l1_comp.len() {
+                    measure_patch(patch, &b_l1_cfft[pi], &b_l1_comp[pi], &mut lvl_errs[0]);
+                }
+            }
+            // L2+
+            for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+                let bc_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+                let bv_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+                for (pi, patch) in lvl_patches.iter().enumerate() {
+                    if pi < bc_lvl.len() && pi < bv_lvl.len() {
+                        measure_patch(patch, &bc_lvl[pi], &bv_lvl[pi], &mut lvl_errs[lvl_idx + 1]);
+                    }
+                }
             }
 
-            if let (Some(fine_r), Some(cfft_r)) = (fft_fine_r, coarse_fft_r) {
-                let speedup_cfft = fine_r.eval_ms / cfft_r.eval_ms;
-                println!();
-                println!("  Coarse-FFT speedup: {:.1}× vs uniform-fine FFT", speedup_cfft);
+            let mut bars: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+            for (li, le) in lvl_errs.iter().enumerate() {
+                let lnum = if li == 0 { 1 } else { li + 1 };
+                let ep_c = if le.ne > 0 { (le.edge_cfft/le.ne as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                let ep_v = if le.ne > 0 { (le.edge_comp/le.ne as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                let bp_c = if le.nb > 0 { (le.bulk_cfft/le.nb as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                let bp_v = if le.nb > 0 { (le.bulk_comp/le.nb as f64).sqrt()/b_max_g*100.0 } else { 0.0 };
+                if le.ne > 0 || le.nb > 0 {
+                    bars.push((format!("L{}", lnum), ep_c, ep_v, bp_c, bp_v));
+                }
             }
 
-            // --- Crossover guidance ---
-            println!();
-            println!("  To find the crossover point, increase the grid size:");
-            println!("    LLG_AD_BASE_NX=1024  (fine-equiv: 2048²)");
-            println!("    LLG_AD_BASE_NX=2048  (fine-equiv: 4096²)");
-            println!("    LLG_AD_BASE_NX=4096  (fine-equiv: 8192²)");
-            println!("  To reduce patch coverage (earlier crossover):");
-            println!("    LLG_AD_HOLE_PITCH=800e-9   (sparse holes)");
-            println!("    LLG_AD_HOLE_PITCH=1000e-9  (very sparse)");
-            println!();
-            println!("  Quick crossover sweep:");
-            println!("    for NX in 256 512 1024 2048; do");
-            println!("      LLG_DEMAG_MG_HYBRID_ENABLE=1 LLG_DEMAG_MG_STENCIL=7 \\");
-            println!("        LLG_AD_BASE_NX=$NX LLG_AD_BASE_NY=$NX \\");
-            println!("        cargo run --release --bin bench_antidot -- --no-plots");
-            println!("    done");
-        }
-    }
+            let m = bars.iter().flat_map(|b| vec![b.1, b.2, b.3, b.4]).fold(0.0f64, f64::max) * 1.3;
+            let x_max = (bars.len() as f64) * 4.0 + 1.0;
 
-    // ---- CSV ----
-    {
-        let csv_path = format!("{out_dir}/results.csv");
-        let f = File::create(&csv_path).unwrap();
-        let mut w = BufWriter::new(f);
-        writeln!(w, "mode,setup_ms,eval_ms,rmse_global,rmse_edge,rmse_bulk,max_delta,n_holes,n_edge,n_bulk").unwrap();
-        for r in &results {
-            writeln!(w, "{},{:.1},{:.1},{:.6e},{:.6e},{:.6e},{:.6e},{},{},{}",
-                r.name, r.setup_ms, r.eval_ms,
-                r.rmse_global, r.rmse_edge, r.rmse_bulk,
-                r.max_delta, n_holes, r.n_edge, r.n_bulk).unwrap();
-        }
-        println!("CSV:        {csv_path}");
-    }
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("Per-Level RMSE (% of max|B|) vs Newell FFT — {}-Hole Antidot", n_holes), ("sans-serif", 18))
+                .margin(15).x_label_area_size(45).y_label_area_size(55)
+                .build_cartesian_2d(0.0f64..x_max, 0.0..m.max(1.0)).unwrap();
+            chart.configure_mesh().y_desc("RMSE (%)").disable_x_mesh().draw().unwrap();
 
-    // ---- Crossover CSV (for plotting across grid sizes) ----
-    {
-        let cross_csv = format!("{out_dir}/crossover.csv");
-        let f = File::create(&cross_csv).unwrap();
-        let mut w = BufWriter::new(f);
-        writeln!(w, "base_nx,fine_nx,n_fine_cells,n_l0_cells,n_patch_cells,n_holes,patch_coverage_pct").unwrap();
-        let n_patch = total_patch_fine_cells(&h);
-        let patch_cov = 100.0 * n_patch as f64 / (fine_nx * fine_ny) as f64;
-        writeln!(w, "{},{},{},{},{},{},{:.2}",
-            base_nx, fine_nx, fine_nx*fine_ny, base_nx*base_ny, n_patch, n_holes, patch_cov).unwrap();
-        // Append timing per mode
-        for r in &results {
-            writeln!(w, "# {}: setup={:.1}ms eval={:.1}ms rmse={:.6e}",
-                r.name, r.setup_ms, r.eval_ms, r.rmse_global).unwrap();
-        }
-        println!("Crossover:  {cross_csv}");
-    }
+            for (bi, (label, ep_c, ep_v, bp_c, bp_v)) in bars.iter().enumerate() {
+                let x0 = bi as f64 * 4.0 + 0.5;
+                chart.draw_series(std::iter::once(Rectangle::new([(x0, 0.0), (x0+0.7, *ep_c)], GREEN.filled()))).unwrap();
+                chart.draw_series(std::iter::once(Rectangle::new([(x0+0.8, 0.0), (x0+1.5, *ep_v)], RED.filled()))).unwrap();
+                chart.draw_series(std::iter::once(Rectangle::new([(x0+1.8, 0.0), (x0+2.5, *bp_c)], GREEN.mix(0.5).filled()))).unwrap();
+                chart.draw_series(std::iter::once(Rectangle::new([(x0+2.6, 0.0), (x0+3.3, *bp_v)], RED.mix(0.5).filled()))).unwrap();
+                chart.draw_series(std::iter::once(plotters::element::Text::new(
+                    format!("{} edge", label), (x0+0.3, -m*0.03), ("sans-serif", 11),
+                ))).ok();
+            }
 
-    // ---- Summary text ----
-    {
-        let sum_path = format!("{out_dir}/summary.txt");
-        let f = File::create(&sum_path).unwrap();
-        let mut w = BufWriter::new(f);
-        writeln!(w, "Anti-Dot Demag Benchmark — Phase 2").unwrap();
-        writeln!(w, "Domain: {:.1} um x {:.1} um, L0={} x {}, fine={}x{}",
-            lx*1e6, ly*1e6, base_nx, base_ny, fine_nx, fine_ny).unwrap();
-        writeln!(w, "Holes: {} (d={:.0} nm, pitch={:.0} nm hex)", n_holes, hole_diam*1e9, hole_pitch*1e9).unwrap();
-        writeln!(w, "Edge cells: {} (within {}), Bulk: {} (beyond {}), Transition: {}",
-            n_edge, edge_dist, n_bulk, bulk_dist, n_transition).unwrap();
-        writeln!(w, "AMR: {} level(s), ratio={}, {} patches, {} fine cells",
-            amr_max_level, ratio, n_patches_total, n_fine_cells).unwrap();
-        writeln!(w, "M restriction changed {} L0 cells (max delta={:.4e})", n_m_changed, max_m_delta).unwrap();
-        writeln!(w).unwrap();
-        for r in &results {
-            let grel = if bref_max > 0.0 { r.rmse_global / bref_max * 100.0 } else { 0.0 };
-            let erel = if bref_max > 0.0 { r.rmse_edge / bref_max * 100.0 } else { 0.0 };
-            let brel = if bref_max > 0.0 { r.rmse_bulk / bref_max * 100.0 } else { 0.0 };
-            writeln!(w, "{}: setup={:.0}ms eval={:.1}ms  global={:.4e} ({:.2}%), edge={:.4e} ({:.2}%), bulk={:.4e} ({:.2}%)",
-                r.name, r.setup_ms, r.eval_ms,
-                r.rmse_global, grel, r.rmse_edge, erel, r.rmse_bulk, brel).unwrap();
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], GREEN.filled()))).unwrap()
+                .label("coarse-FFT edge").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], GREEN.filled()));
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], RED.filled()))).unwrap()
+                .label("composite edge").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], RED.filled()));
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], GREEN.mix(0.5).filled()))).unwrap()
+                .label("coarse-FFT bulk").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], GREEN.mix(0.5).filled()));
+            chart.draw_series(std::iter::once(Rectangle::new([(0.0, 0.0), (0.0, 0.0)], RED.mix(0.5).filled()))).unwrap()
+                .label("composite bulk").legend(|(x, y)| Rectangle::new([(x, y-5), (x+15, y+5)], RED.mix(0.5).filled()));
+
+            chart.configure_series_labels().background_style(WHITE.mix(0.8)).border_style(BLACK)
+                .position(SeriesLabelPosition::UpperRight).draw().unwrap();
+            root.present().unwrap();
+            println!("    Wrote {}", path);
         }
-        println!("Summary:    {sum_path}");
+
+        println!("  Plots written to {}/", diag_dir);
+    } else if !do_sweep {
+        println!("  (Use `-- --plots` for PNGs, `-- --sweep` for crossover study)");
     }
 
     println!();
-    println!("Done.");
+    println!("  Total wall time: {:.1} s", wall);
+    println!();
 }
