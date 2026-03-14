@@ -5,18 +5,26 @@ scripts/plot_vortex_gyration.py
 Generate thesis-quality figures from bench_vortex_gyration output CSVs.
 
 Usage:
-    python scripts/plot_vortex_gyration.py --root out/bench_vortex_gyration
+    python scripts/plot_vortex_gyration.py --root out/bench_vortex_gyration --mode comp
+    python scripts/plot_vortex_gyration.py --root out/bench_vortex_gyration --mode cfft
+    python scripts/plot_vortex_gyration.py --root out/bench_vortex_gyration --mode both
+
+Mode controls which solver's data to plot:
+    comp  — composite MG only (comp_* files)
+    cfft  — coarse-FFT only (non-prefixed files)
+    both  — overlay both on trajectory/frequency plots; generate separate
+            snapshot/patch/mz plots for each solver
 
 Generates:
     fig_trajectory.pdf      — Core X/R vs Y/R spiral (Guslienko Fig 2 style)
     fig_core_xt.pdf         — Core x(t) damped oscillation with envelope + annotations
     fig_frequency.pdf       — Frequency comparison scatter vs Guslienko + Novosad
-    fig_patch_map_eq.pdf    — Patch map at equilibrium with core marker
-    fig_patch_map_gyr_*.pdf — Patch maps during gyration with core markers
-    fig_mz_eq.pdf           — mz colourmap at equilibrium with disk mask + colour wheel
-    fig_mz_gyr_*.pdf        — mz colourmaps during gyration
-    fig_mz_3d.pdf           — 3D mz surface (multi-view: perspective, side, bird's-eye)
-    fig_mesh_zoom.pdf       — Full-domain mesh showing multi-resolution grid + disk boundary
+    fig_patch_map_*.pdf     — Patch maps with core marker (per solver)
+    fig_mz_eq_*.pdf         — mz colourmap at equilibrium (per solver)
+    fig_mz_gyr_*.pdf        — mz colourmaps during gyration (per solver)
+    fig_mz_3d_*.pdf         — 3D mz surface (multi-view)
+    fig_mesh_full.pdf       — Full-domain mesh showing multi-resolution grid + disk boundary
+    fig_mz_xsec_*.pdf      — 1D mz cross-sections (Novosad Fig 4 style)
 """
 
 import argparse
@@ -315,19 +323,25 @@ def get_core_at_snap(root, info, snap_idx, method='amr_cfft'):
 # Figure 1: Core Trajectory X/R vs Y/R (centred on orbit)
 # ─────────────────────────────────────────────────────────────────
 
-def plot_trajectory(root, info):
+def plot_trajectory(root, info, methods, extra_core=None):
     """Guslienko Fig 2 style: damped spiral, centred on orbit, with time colouring."""
     R_nm = info['disk_r_m'] * 1e9
 
     fig, ax = plt.subplots(figsize=(6, 7))
 
-    for name, color, label in [
-        ('core_fine.csv', '#0000CC', 'Fine FFT'),
-        ('core_coarse.csv', '#CC0000', 'Coarse FFT'),
-        ('core_amr_cfft.csv', '#00AA00', 'AMR + cfft'),
-        ('core_amr_comp.csv', '#DD6600', 'AMR + composite'),
-    ]:
-        t, x, y, _, _ = load_core_csv(os.path.join(root, name))
+    # Plot extra core trajectories (fine/coarse) if provided
+    if extra_core:
+        for csv_name, color, label in extra_core:
+            t, x, y, _, _ = load_core_csv(os.path.join(root, csv_name))
+            if len(t) == 0:
+                continue
+            xn, yn = x / R_nm, y / R_nm
+            ax.plot(xn, yn, color=color, lw=0.8, alpha=0.5, label=label)
+
+    # Plot each method with time colouring
+    cmap_choices = {'AMR + cfft': 'Greens', 'AMR + composite': 'Oranges'}
+    for core_csv, prefix, label, color in methods:
+        t, x, y, _, _ = load_core_csv(os.path.join(root, core_csv))
         if len(t) == 0:
             continue
 
@@ -345,20 +359,20 @@ def plot_trajectory(root, info):
         points = np.column_stack([xs, ys]).reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
         norm = Normalize(t.min(), t.max())
-        # Use sequential green colormap for AMR
-        cmap_traj = matplotlib.colormaps['Greens'] if 'cfft' in name else matplotlib.colormaps['Blues']
+        cmap_name = cmap_choices.get(label, 'Blues')
+        cmap_traj = matplotlib.colormaps[cmap_name]
         lc = LineCollection(segments, cmap=cmap_traj, norm=norm, linewidths=1.8)  # type: ignore[arg-type]
         lc.set_array(t[:-1])
         ax.add_collection(lc)
 
         # Start and end markers with coordinate labels
-        ax.plot(xs[0], ys[0], 'o', color='darkgreen' if 'cfft' in name else color,
+        ax.plot(xs[0], ys[0], 'o', color=color,
                 ms=7, zorder=5, markeredgecolor='k', markeredgewidth=0.5)
-        ax.plot(xs[-1], ys[-1], 's', color='darkgreen' if 'cfft' in name else color,
+        ax.plot(xs[-1], ys[-1], 's', color=color,
                 ms=7, zorder=5, markeredgecolor='k', markeredgewidth=0.5)
 
-        # Label start/end with coordinates — push labels outward from orbit centre
-        ax.annotate(f'Start ({x[0]:.0f}, {y[0]:.0f}) nm',
+        # Label start/end with coordinates
+        ax.annotate(f'{label}\nStart ({x[0]:.0f}, {y[0]:.0f}) nm',
                      xy=(xs[0], ys[0]), xytext=(25, 15),
                      textcoords='offset points', fontsize=8.5,
                      arrowprops=dict(arrowstyle='->', color='0.3', lw=0.8),
@@ -372,13 +386,12 @@ def plot_trajectory(root, info):
                      bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.8))
 
         # Add colourbar for time
-        cbar = fig.colorbar(lc, ax=ax, shrink=0.6, pad=0.02, label='t (ns)')
+        cbar = fig.colorbar(lc, ax=ax, shrink=0.6, pad=0.02, label=f't (ns) — {label}')
 
     # Centre on orbit: compute bounding box of the trajectory data
-    # Use the last loaded trajectory
     all_x, all_y = [], []
-    for name in ['core_amr_cfft.csv', 'core_amr_comp.csv', 'core_fine.csv', 'core_coarse.csv']:
-        t, x, y, _, _ = load_core_csv(os.path.join(root, name))
+    for core_csv, prefix, label, colour in methods:
+        t, x, y, _, _ = load_core_csv(os.path.join(root, core_csv))
         if len(t) > 0:
             all_x.extend(x / R_nm)
             all_y.extend(y / R_nm)
@@ -406,16 +419,19 @@ def plot_trajectory(root, info):
 # Figure 2: Core x(t) — Damped Oscillation with envelope
 # ─────────────────────────────────────────────────────────────────
 
-def plot_core_xt(root, info):
+def plot_core_xt(root, info, methods, extra_core=None):
     """Core x(t) with Savitzky-Golay smooth, exponential envelope, and annotations."""
     fig, ax = plt.subplots(figsize=(9, 4))
 
-    for name, color, label in [
-        ('core_fine.csv', '#0000CC', 'Fine FFT'),
-        ('core_coarse.csv', '#CC0000', 'Coarse FFT'),
-        ('core_amr_cfft.csv', '#00AA00', 'AMR + cfft'),
-        ('core_amr_comp.csv', '#DD6600', 'AMR + composite'),
-    ]:
+    # Build combined list of (csv_name, color, label)
+    plot_list = []
+    if extra_core:
+        for csv_name, color, label in extra_core:
+            plot_list.append((csv_name, color, label))
+    for core_csv, prefix, label, color in methods:
+        plot_list.append((core_csv, color, label))
+
+    for name, color, label in plot_list:
         t, x, y, _, _ = load_core_csv(os.path.join(root, name))
         if len(t) == 0:
             continue
@@ -480,23 +496,27 @@ def plot_core_xt(root, info):
 # Figure 3: Frequency Comparison
 # ─────────────────────────────────────────────────────────────────
 
-def plot_frequency(root, info):
+def plot_frequency(root, info, methods, extra_core=None):
     """Frequency vs Guslienko analytic + Novosad experimental data."""
     beta = info['dz_m'] / info['disk_r_m']
 
-    # Our measured frequency
+    # Our measured frequencies
     f_methods = []
-    for name, label in [
-        ('core_amr_cfft.csv', 'AMR + cfft'),
-        ('core_amr_comp.csv', 'AMR + composite'),
-        ('core_fine.csv', 'Fine FFT'),
-        ('core_coarse.csv', 'Coarse FFT'),
-    ]:
-        t, x, _, _, _ = load_core_csv(os.path.join(root, name))
+    # Extra (fine/coarse)
+    if extra_core:
+        for csv_name, color, label in extra_core:
+            t, x, _, _, _ = load_core_csv(os.path.join(root, csv_name))
+            if len(t) > 0:
+                f_sim, nc = estimate_frequency(t, x)
+                if f_sim > 0:
+                    f_methods.append((label, f_sim, nc, color))
+    # Main methods
+    for core_csv, prefix, label, color in methods:
+        t, x, _, _, _ = load_core_csv(os.path.join(root, core_csv))
         if len(t) > 0:
             f_sim, nc = estimate_frequency(t, x)
             if f_sim > 0:
-                f_methods.append((label, f_sim, nc))
+                f_methods.append((label, f_sim, nc, color))
 
     # Novosad experimental data
     novosad_beta = np.array([0.020, 0.036, 0.073])
@@ -515,13 +535,12 @@ def plot_frequency(root, info):
                zorder=5, label='Novosad et al. (2005) expt')
 
     # Plot all available methods
-    markers = ['*', 'D', '^', 'v']
-    colors_m = ['red', 'orange', 'blue', 'grey']
-    for i, (lbl, f, nc) in enumerate(f_methods):
+    markers = ['*', 'D', '^', 'v', 'o', 's']
+    for i, (lbl, f, nc, col) in enumerate(f_methods):
         ax.scatter(np.array([beta]), np.array([f * 1000]),
-                   s=120, c=colors_m[i % len(colors_m)],
+                   s=120, c=col,
                    marker=markers[i % len(markers)],
-                   zorder=6, label=f'This work ({lbl}): {f:.3f} GHz ({nc} crossings)')
+                   zorder=6, label=f'This work ({lbl}): {f:.3f} GHz ({nc} cr.)')
 
     ax.set_xlabel('Aspect ratio β = L/R', fontsize=12)
     ax.set_ylabel('Frequency (MHz)', fontsize=12)
@@ -541,7 +560,7 @@ def plot_frequency(root, info):
 # Figure 4: Patch Map (with core position marker)
 # ─────────────────────────────────────────────────────────────────
 
-def plot_patch_map(root, info, patches_file, title, outname, snap_idx=None):
+def plot_patch_map(root, info, patches_file, title, outname, snap_idx=None, core_method='amr_cfft'):
     """Patch map with disk outline and core position cross marker."""
     patches = load_patches_csv(os.path.join(root, patches_file))
     if not patches:
@@ -580,7 +599,7 @@ def plot_patch_map(root, info, patches_file, title, outname, snap_idx=None):
     # Core position marker
     core_x_nm, core_y_nm = None, None
     if snap_idx is not None:
-        core_x_nm, core_y_nm = get_core_at_snap(root, info, snap_idx)
+        core_x_nm, core_y_nm = get_core_at_snap(root, info, snap_idx, method=core_method)
     else:
         # Equilibrium (B=0): vortex core sits at disk centre = (0, 0) nm
         core_x_nm, core_y_nm = 0.0, 0.0
@@ -615,7 +634,7 @@ def plot_patch_map(root, info, patches_file, title, outname, snap_idx=None):
 # Figure 5: mz Colourmap (with disk mask + colour wheel inset)
 # ─────────────────────────────────────────────────────────────────
 
-def plot_mz_colourmap(root, info, m_file, title, outname, snap_idx=None):
+def plot_mz_colourmap(root, info, m_file, title, outname, snap_idx=None, core_method='amr_cfft'):
     """mz colourmap with disk outline, white masking outside disk, and colour wheel."""
     m = load_m_csv(os.path.join(root, m_file))
     if m is None:
@@ -643,7 +662,7 @@ def plot_mz_colourmap(root, info, m_file, title, outname, snap_idx=None):
     # Core marker
     core_x_nm, core_y_nm = None, None
     if snap_idx is not None:
-        core_x_nm, core_y_nm = get_core_at_snap(root, info, snap_idx)
+        core_x_nm, core_y_nm = get_core_at_snap(root, info, snap_idx, method=core_method)
     if core_x_nm is not None and core_y_nm is not None:
         dx_nm = info['dx_m'] * 1e9
         core_i = core_x_nm / (dx_nm / scale) + nx / 2
@@ -972,108 +991,153 @@ def main():
     parser = argparse.ArgumentParser(description='Plot vortex gyration results')
     parser.add_argument('--root', default='out/bench_vortex_gyration',
                         help='Output directory from bench_vortex_gyration')
+    parser.add_argument('--mode', choices=['cfft', 'comp', 'both'], default='both',
+                        help='Which solver to plot: cfft, comp, or both (default: both)')
     args = parser.parse_args()
     root = args.root
+    mode = args.mode
 
     if not os.path.isdir(root):
         print(f"Error: {root} not found")
         sys.exit(1)
 
-    print(f"Plotting from {root}/")
+    print(f"Plotting from {root}/ (mode={mode})")
     info = load_grid_info(root)
     print(f"  Grid: {info.get('base_nx','?')}² base, "
           f"{info.get('fine_nx','?')}² fine, "
           f"disk R={info.get('disk_r_m',0)*1e9:.0f} nm")
 
-    # ── Core trajectory and frequency ──
-    plot_trajectory(root, info)
-    plot_core_xt(root, info)
-    plot_frequency(root, info)
+    # ── Build method list based on mode ──
+    # Each entry: (core_csv, snapshot_prefix, label, colour)
+    #   snapshot_prefix: '' for cfft files (patches_*.csv), 'comp_' for comp files
+    all_methods = []
+    if mode in ('cfft', 'both'):
+        if os.path.exists(os.path.join(root, 'core_amr_cfft.csv')):
+            all_methods.append(('core_amr_cfft.csv', '', 'AMR + cfft', '#00AA00'))
+    if mode in ('comp', 'both'):
+        if os.path.exists(os.path.join(root, 'core_amr_comp.csv')):
+            all_methods.append(('core_amr_comp.csv', 'comp_', 'AMR + composite', '#DD6600'))
 
-    # ── Patch maps (all snapshots, with core markers) ──
-    if os.path.exists(os.path.join(root, 'patches_eq.csv')):
-        plot_patch_map(root, info, 'patches_eq.csv',
-                       'AMR Patches — Equilibrium', 'fig_patch_map_eq.pdf',
-                       snap_idx=None)
+    # Also check for fine/coarse (always include if present and mode=both)
+    extra_core = []
+    if mode == 'both':
+        if os.path.exists(os.path.join(root, 'core_fine.csv')):
+            extra_core.append(('core_fine.csv', '#0000CC', 'Fine FFT'))
+        if os.path.exists(os.path.join(root, 'core_coarse.csv')):
+            extra_core.append(('core_coarse.csv', '#CC0000', 'Coarse FFT'))
 
-    for f in sorted(Path(root).glob('patches_0*.csv')):
-        idx_str = f.stem.split('_')[1]
-        idx = int(idx_str)
-        t_ns = get_snapshot_time(root, info, idx)
-        plot_patch_map(root, info, f.name,
-                       f'AMR Patches — Gyration t={t_ns:.1f} ns (snap {idx_str})',
-                       f'fig_patch_map_gyr_{idx_str}.pdf',
-                       snap_idx=idx)
+    if not all_methods:
+        print(f"  No data found for mode={mode}")
+        sys.exit(1)
 
-    # ── mz colourmaps (all available, with disk mask + colour wheel) ──
-    if os.path.exists(os.path.join(root, 'm_fine_eq.csv')):
-        plot_mz_colourmap(root, info, 'm_fine_eq.csv',
-                          'Magnetisation — Equilibrium', 'fig_mz_eq.pdf')
+    # ── Core trajectory and frequency (both solvers on same plot if available) ──
+    plot_trajectory(root, info, all_methods, extra_core)
+    plot_core_xt(root, info, all_methods, extra_core)
+    plot_frequency(root, info, all_methods, extra_core)
 
-    # Plot ALL available m_coarse files (not just first 4)
-    for f in sorted(Path(root).glob('m_coarse_0*.csv')):
-        idx_str = f.stem.split('_')[2]
-        idx = int(idx_str)
-        t_ns = get_snapshot_time(root, info, idx)
-        plot_mz_colourmap(root, info, f.name,
-                          f'Magnetisation — Gyration t={t_ns:.1f} ns (snap {idx_str})',
-                          f'fig_mz_gyr_{idx_str}.pdf',
-                          snap_idx=idx)
+    # ── Per-method snapshot plots ──
+    for core_csv, prefix, method_label, colour in all_methods:
+        method_tag = 'cfft' if prefix == '' else 'comp'
+        core_method = 'amr_cfft' if prefix == '' else 'amr_comp'
 
-    # Also plot m_fine snapshots if available
-    for f in sorted(Path(root).glob('m_fine_0*.csv')):
-        idx_str = f.stem.split('_')[2]
-        idx = int(idx_str)
-        t_ns = get_snapshot_time(root, info, idx)
-        plot_mz_colourmap(root, info, f.name,
-                          f'Magnetisation (fine) — t={t_ns:.1f} ns (snap {idx_str})',
-                          f'fig_mz_fine_{idx_str}.pdf',
-                          snap_idx=idx)
+        # Equilibrium patch map
+        eq_patches = f'{prefix}patches_eq.csv' if prefix else 'patches_eq.csv'
+        if not os.path.exists(os.path.join(root, eq_patches)):
+            eq_patches = 'patches_eq.csv'  # fall back to shared eq file
+        if os.path.exists(os.path.join(root, eq_patches)):
+            plot_patch_map(root, info, eq_patches,
+                           f'AMR Patches — Equilibrium ({method_label})',
+                           f'fig_patch_map_eq_{method_tag}.pdf',
+                           snap_idx=None, core_method=core_method)
 
-    # ── 3D mz surface (multi-view, for equilibrium + any available fine snaps) ──
-    if os.path.exists(os.path.join(root, 'm_fine_eq.csv')):
-        plot_mz_3d(root, info, 'm_fine_eq.csv', frame_label='Equilibrium')
+        # Gyration patch maps
+        for f in sorted(Path(root).glob(f'{prefix}patches_0*.csv')):
+            idx_str = f.stem.replace(f'{prefix}patches_', '')
+            idx = int(idx_str)
+            t_ns = get_snapshot_time(root, info, idx)
+            plot_patch_map(root, info, f.name,
+                           f'AMR Patches — {method_label} t={t_ns:.1f} ns',
+                           f'fig_patch_map_gyr_{method_tag}_{idx_str}.pdf',
+                           snap_idx=idx, core_method=core_method)
 
-    for f in sorted(Path(root).glob('m_fine_0*.csv')):
-        idx_str = f.stem.split('_')[2]
-        idx = int(idx_str)
-        t_ns = get_snapshot_time(root, info, idx)
-        plot_mz_3d(root, info, f.name,
-                   frame_label=f'Gyration t={t_ns:.1f} ns (snap {idx_str})')
+        # Equilibrium mz colourmap
+        eq_mfine = f'{prefix}m_fine_eq.csv'
+        if not os.path.exists(os.path.join(root, eq_mfine)):
+            eq_mfine = 'm_fine_eq.csv'
+        if os.path.exists(os.path.join(root, eq_mfine)):
+            plot_mz_colourmap(root, info, eq_mfine,
+                              f'Magnetisation — Equilibrium ({method_label})',
+                              f'fig_mz_eq_{method_tag}.pdf',
+                              snap_idx=None, core_method=core_method)
 
-    # ── Mesh — full domain with disk boundary ──
-    if (os.path.exists(os.path.join(root, 'm_fine_eq.csv')) and
-            os.path.exists(os.path.join(root, 'patches_eq.csv'))):
-        plot_mesh_full(root, info)
+        # Gyration mz colourmaps (coarse)
+        for f in sorted(Path(root).glob(f'{prefix}m_coarse_0*.csv')):
+            stem = f.stem
+            idx_str = stem.replace(f'{prefix}m_coarse_', '')
+            idx = int(idx_str)
+            t_ns = get_snapshot_time(root, info, idx)
+            plot_mz_colourmap(root, info, f.name,
+                              f'{method_label} — t={t_ns:.1f} ns',
+                              f'fig_mz_gyr_{method_tag}_{idx_str}.pdf',
+                              snap_idx=idx, core_method=core_method)
 
-    # ── 1D mz cross-sections (Novosad Fig 4 style) ──
-    # Equilibrium only
-    if os.path.exists(os.path.join(root, 'm_fine_eq.csv')):
-        plot_mz_cross_sections(root, info,
-                               ['m_fine_eq.csv'],
-                               ['Equilibrium'],
-                               outname='fig_mz_xsec_eq.pdf')
+        # Gyration mz colourmaps (fine, if available)
+        for f in sorted(Path(root).glob(f'{prefix}m_fine_0*.csv')):
+            stem = f.stem
+            idx_str = stem.replace(f'{prefix}m_fine_', '')
+            idx = int(idx_str)
+            t_ns = get_snapshot_time(root, info, idx)
+            plot_mz_colourmap(root, info, f.name,
+                              f'{method_label} (fine) — t={t_ns:.1f} ns',
+                              f'fig_mz_fine_{method_tag}_{idx_str}.pdf',
+                              snap_idx=idx, core_method=core_method)
 
-    # Equilibrium vs mid-run dynamic snapshot
-    fine_snaps = sorted(Path(root).glob('m_fine_0*.csv'))
-    if fine_snaps and os.path.exists(os.path.join(root, 'm_fine_eq.csv')):
-        # Pick the snapshot closest to halfway through the run
-        snap_indices = []
-        for f in fine_snaps:
-            idx_str = f.stem.split('_')[2]
-            snap_indices.append((int(idx_str), f.name))
-        if snap_indices:
-            # Pick the one closest to the middle
-            mid_target = max(si[0] for si in snap_indices) // 2
-            if mid_target == 0:
-                mid_target = max(si[0] for si in snap_indices)
-            best = min(snap_indices, key=lambda si: abs(si[0] - mid_target))
-            mid_idx, mid_file = best
-            t_mid = get_snapshot_time(root, info, mid_idx)
+        # 3D mz (equilibrium)
+        if os.path.exists(os.path.join(root, eq_mfine)):
+            plot_mz_3d(root, info, eq_mfine, frame_label=f'Equilibrium ({method_label})')
+
+        # 3D mz (fine snapshots)
+        for f in sorted(Path(root).glob(f'{prefix}m_fine_0*.csv')):
+            stem = f.stem
+            idx_str = stem.replace(f'{prefix}m_fine_', '')
+            idx = int(idx_str)
+            t_ns = get_snapshot_time(root, info, idx)
+            plot_mz_3d(root, info, f.name,
+                       frame_label=f'{method_label} t={t_ns:.1f} ns')
+
+        # Mesh full domain (first method only, using eq data)
+        eq_patches_path = os.path.join(root, eq_patches)
+        eq_mfine_path = os.path.join(root, eq_mfine)
+        if os.path.exists(eq_patches_path) and os.path.exists(eq_mfine_path):
+            plot_mesh_full(root, info, eq_patches, eq_mfine,
+                           frame_label=f'Equilibrium ({method_label})')
+
+        # 1D mz cross-sections
+        if os.path.exists(os.path.join(root, eq_mfine)):
             plot_mz_cross_sections(root, info,
-                                   ['m_fine_eq.csv', mid_file],
-                                   ['Equilibrium (static)', f'Gyration t={t_mid:.1f} ns'],
-                                   outname='fig_mz_xsec_compare.pdf')
+                                   [eq_mfine],
+                                   [f'Equilibrium ({method_label})'],
+                                   outname=f'fig_mz_xsec_eq_{method_tag}.pdf')
+
+        # Compare eq vs mid-run snapshot
+        fine_snaps = sorted(Path(root).glob(f'{prefix}m_fine_0*.csv'))
+        if fine_snaps and os.path.exists(os.path.join(root, eq_mfine)):
+            snap_indices = []
+            for f in fine_snaps:
+                stem = f.stem
+                idx_str = stem.replace(f'{prefix}m_fine_', '')
+                snap_indices.append((int(idx_str), f.name))
+            if snap_indices:
+                mid_target = max(si[0] for si in snap_indices) // 2
+                if mid_target == 0:
+                    mid_target = max(si[0] for si in snap_indices)
+                best = min(snap_indices, key=lambda si: abs(si[0] - mid_target))
+                mid_idx, mid_file = best
+                t_mid = get_snapshot_time(root, info, mid_idx)
+                plot_mz_cross_sections(root, info,
+                                       [eq_mfine, mid_file],
+                                       [f'Equilibrium', f'{method_label} t={t_mid:.1f} ns'],
+                                       outname=f'fig_mz_xsec_compare_{method_tag}.pdf')
 
     print("\nDone.")
 

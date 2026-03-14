@@ -41,7 +41,6 @@ use plotters::prelude::*;
 
 use llg_sim::effective_field::coarse_fft_demag;
 use llg_sim::effective_field::demag_fft_uniform;
-use llg_sim::effective_field::demag_poisson_mg;
 use llg_sim::effective_field::mg_composite;
 use llg_sim::grid::Grid2D;
 use llg_sim::params::{DemagMethod, Material};
@@ -919,28 +918,6 @@ fn main() {
     println!("  composite:   {:.1} ms", t_comp);
     println!();
 
-    // ---- Fine MG reference (same formulation as composite, uniform fine grid) ----
-    // Computed AFTER composite solve so that PPPM auto-enable (if any)
-    // is active — ensuring the fine-MG uses the same PPPM config as the composite L0.
-    let b_fine_mg_opt = if let Some(ref m_fine) = m_fine_opt {
-        println!("  Computing fine MG reference ({} × {}) ...", fine_nx, fine_ny);
-        let t1 = Instant::now();
-        let mut b_fine_mg = VectorField2D::new(fine_grid);
-        demag_poisson_mg::compute_demag_field_poisson_mg(
-            &fine_grid, m_fine, &mut b_fine_mg, &mat);
-        let t_mg = t1.elapsed().as_secs_f64();
-        println!("  Fine MG:     {:.2} s", t_mg);
-
-        let b_max_mg = b_fine_mg.data.iter()
-            .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
-            .fold(0.0f64, f64::max);
-        println!("  max|B|_MG:   {:.4e} T", b_max_mg);
-        println!();
-        Some(b_fine_mg)
-    } else {
-        None
-    };
-
     // ---- Patch-level accuracy comparison ----
     // Helper to compute errors against a reference B field.
     // Iterates ALL AMR levels (L1, L2, L3, ...) for comprehensive measurement.
@@ -1175,15 +1152,7 @@ fn main() {
         compute_patch_errors(b_fine_fft, "uniform fine FFT (Newell)");
     }
 
-    // ---- Compare against fine MG reference ----
-    // This is the KEY diagnostic: if composite vs fine-MG is small,
-    // the composite algorithm works correctly, and the gap vs Newell
-    // is a formulation difference (not a V-cycle bug).
-    if let Some(ref b_fine_mg) = b_fine_mg_opt {
-        compute_patch_errors(b_fine_mg, "uniform fine MG (same formulation)");
-    }
-
-    if b_fine_fft_opt.is_none() && b_fine_mg_opt.is_none() {
+    if b_fine_fft_opt.is_none() {
         println!("  (Accuracy comparison skipped — set LLG_CV_SKIP_FINE=0 to enable)");
         println!();
     }

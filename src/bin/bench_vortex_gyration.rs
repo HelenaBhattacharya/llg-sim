@@ -6,12 +6,16 @@
 // Reproduces the vortex core gyration from:
 //   Guslienko et al., J. Appl. Phys. 91, 8037 (2002), Fig. 2
 //
-// Setup (matching Guslienko exactly):
-//   - 200 nm diameter Permalloy disk, 20 nm thick (β = L/R = 0.2)
+// Setup:
+//   - 200 nm diameter Permalloy disk, dz = 3.75 nm (cubic cells → β = dz/R = 0.0375)
 //   - Ms = 8.0×10⁵ A/m, A = 1.3×10⁻¹¹ J/m, K_u = 0
-//   - Cell size: ~3.75 nm (64² base on 240 nm box)
-//   - α = 0.2 for dynamics (Guslienko Fig 2 left panel)
+//   - Cell size: dx = dy = dz = 3.75 nm (80² base on 300 nm box)
+//   - α = 0.01 for dynamics (physical Permalloy damping)
 //   - dt = 5 fs (CFL-safe for dx_fine = 0.47 nm at 3 AMR levels)
+//   - B_shift = 5 mT — scaled for β ≈ 0.04 to keep s = r/R < 0.1 (linear regime)
+//     At β = 0.04 the magnetostatic restoring force is ~5× weaker than β = 0.2,
+//     so 20 mT pushes the core to s > 0.3 (nonlinear → spirals outward).
+//     5 mT gives s ≈ 0.06 (cfft) to 0.10 (comp) — safely linear.
 //
 // CFL note: With 3 AMR levels (ratio=2), the finest dx = 3.75/8 = 0.47 nm.
 //   Exchange CFL requires dt < ~5 fs at this spacing. Previous dt=20 fs
@@ -20,11 +24,13 @@
 //
 // Protocol (Guslienko's method):
 //   Phase 1: Relax vortex to ground state (α = 0.5, B = 0)
-//   Phase 2: Apply 20 mT in-plane field, relax to shifted equilibrium (α = 0.5)
-//   Phase 3: Remove field, evolve with α = 0.01 — core oscillates ~3.5 periods
+//   Phase 2: Apply 5 mT in-plane field, relax to shifted equilibrium (α = 0.5)
+//   Phase 3: Remove field, evolve with α = 0.01 — core oscillates ~6 periods in 30ns
 //
-// Expected result: nearly-circular orbits with slow decay (~20% over 5ns),
-//   eigenfrequency ~0.7 GHz for β = 0.2 (Guslienko Fig 3, Novosad 2005).
+// Expected result: nearly-circular orbits with slow decay,
+//   eigenfrequency ~139 MHz for β ≈ 0.04 (Novosad 2005 scaling: f ≈ 3700×β MHz).
+//   At 5 mT the equilibrium displacement is ~6nm (cfft) to ~10nm (comp),
+//   safely in the linear regime s = r/R < 0.1.
 //
 // AMR features:
 //   - boundary_layer=4: ensures disk edge gets refinement patches
@@ -399,7 +405,7 @@ fn step_dyn(m: &mut VectorField2D, b: &mut VectorField2D,
 fn plot_trajectories(
     out: &str, disk_r: f64,
     cp_f: &str, cp_c: &str, cp_cf: &str, cp_co: &str,
-    skip_fine: bool, skip_coarse: bool, skip_comp: bool,
+    skip_fine: bool, skip_coarse: bool, skip_cfft: bool, skip_comp: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{out}/trajectory.png");
     let root = BitMapBackend::new(&path, (700, 700)).into_drawing_area();
@@ -432,7 +438,7 @@ fn plot_trajectories(
 
     if !skip_fine   { plot_csv(cp_f, RGBColor(0,0,200), "Fine FFT")?; }
     if !skip_coarse { plot_csv(cp_c, RGBColor(200,0,0), "Coarse FFT")?; }
-    plot_csv(cp_cf, RGBColor(0,160,0), "AMR+cfft")?;
+    if !skip_cfft   { plot_csv(cp_cf, RGBColor(0,160,0), "AMR+cfft")?; }
     if !skip_comp   { plot_csv(cp_co, RGBColor(200,100,0), "AMR+composite")?; }
 
     ch.configure_series_labels().border_style(BLACK).position(SeriesLabelPosition::UpperRight)
@@ -446,7 +452,7 @@ fn plot_trajectories(
 fn plot_core_vs_time(
     out: &str,
     cp_f: &str, cp_c: &str, cp_cf: &str, cp_co: &str,
-    skip_fine: bool, skip_coarse: bool, skip_comp: bool,
+    skip_fine: bool, skip_coarse: bool, skip_cfft: bool, skip_comp: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{out}/core_x_vs_t.png");
     let root = BitMapBackend::new(&path, (900, 400)).into_drawing_area();
@@ -481,7 +487,7 @@ fn plot_core_vs_time(
 
     if !skip_fine   { plot_csv(cp_f, RGBColor(0,0,200), "Fine FFT")?; }
     if !skip_coarse { plot_csv(cp_c, RGBColor(200,0,0), "Coarse FFT")?; }
-    plot_csv(cp_cf, RGBColor(0,160,0), "AMR+cfft")?;
+    if !skip_cfft   { plot_csv(cp_cf, RGBColor(0,160,0), "AMR+cfft")?; }
     if !skip_comp   { plot_csv(cp_co, RGBColor(200,100,0), "AMR+composite")?; }
 
     ch.configure_series_labels().border_style(BLACK).position(SeriesLabelPosition::UpperRight)
@@ -500,9 +506,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a=="--plots");
     let amr_only = args.iter().any(|a| a=="--amr-only");
-    let skip_fine = amr_only || args.iter().any(|a| a=="--skip-fine-ref");
-    let skip_coarse = amr_only;
-    let skip_comp = args.iter().any(|a| a=="--skip-composite");
+    let fine_only = args.iter().any(|a| a=="--fine-only" || a=="--fine");
+    let coarse_only = args.iter().any(|a| a=="--coarse-only" || a=="--coarse");
+    let uniform_only = fine_only || coarse_only; // skip all AMR paths
+    let skip_fine = (amr_only || coarse_only) && !fine_only
+        || args.iter().any(|a| a=="--skip-fine-ref");
+    let skip_coarse = (amr_only || fine_only) && !coarse_only;
+    let skip_comp = uniform_only || args.iter().any(|a| a=="--skip-composite");
+    let skip_cfft = uniform_only; // skip AMR+coarse-FFT path
 
     let amr_lvl: usize = std::env::var("LLG_AMR_MAX_LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
 
@@ -513,9 +524,10 @@ fn main() {
     // GUSLIENKO PARAMETERS (J. Appl. Phys. 91, 8037, 2002)
     // =====================================================================
 
-    // Geometry: 200 nm disk, 20 nm thick → β = 0.2 → f_gyr ≈ 0.7 GHz
+    // Geometry: 200 nm disk, dz = 3.75 nm (cubic cells) → β = dz/R = 0.0375
+    // At β ≈ 0.04, Guslienko eigenfrequency ≈ 139 MHz (Novosad empirical: 3.7×β GHz)
     let disk_r = 100.0e-9;   // R = 100 nm
-    let dz = 20.0e-9;        // L = 20 nm
+    let dz = 7.5e-9;        // cubic cells: dz = dx = dy = 3.75 nm
     let domain = 300.0e-9;   // 50% padding — 50nm vacuum gap = 13 cells at dx=3.75nm
                               // This ensures buffer_cells=4 dilation CANNOT bridge the gap,
                               // so confine_dilation=true produces clean arc patches at the
@@ -551,10 +563,13 @@ fn main() {
     // Relaxation needs ~1ns at α=0.5 for full equilibration.
     // At dt=5fs: 1ns = 200,000 main-loop steps (25,000 AMR coarse steps with scr=8).
     let relax_steps = 200_000;
-    let field_relax_steps = 400_000; // 2ns — ensures core reaches equilibrium under field
-    let b_shift = 20.0e-3;  // 20 mT in-plane field → ~25nm displacement (0.25R)
-                              // Larger than Guslienko's 10mT for clearer visual spiral
-    let gyr_time = 5.0e-9;   // 5 ns — ~3.5 periods at 0.7 GHz
+    let field_relax_steps = 800_000; // 2ns — ensures core reaches equilibrium under field
+    let b_shift = 5.0e-3;   // 5 mT in-plane field → ~6nm displacement (s ≈ 0.06)
+                              // At β ≈ 0.04 the restoring force is ~5× weaker than β = 0.2,
+                              // so 20 mT pushed s > 0.3 (nonlinear regime → expanding spiral).
+                              // 5 mT keeps both cfft and comp in the linear regime (s < 0.1).
+                              // Novosad 2005 used 50 Oe (5 mT) for their OOMMF simulations.
+    let gyr_time = 20.0e-9;  // 30 ns — ~4.2 periods at 139 MHz (β ≈ 0.04)
     let gyr_steps = (gyr_time/dt).ceil() as usize;
 
     // Output cadences (adjusted for dt=5fs: 200,000 steps/ns)
@@ -622,7 +637,7 @@ fn main() {
     initial_states::init_vortex(&mut m_fine, &fg, (0.0,0.0), 1.0, 1.0, 3.0*dx, Some(&mf));
     let mut m_coarse = mk_coarse();
 
-    // AMR hierarchies
+    // AMR hierarchies (skip if only running uniform fine/coarse)
     let mut h_cf = AmrHierarchy2D::new(bg, mk_coarse(), ratio, ghost);
     h_cf.set_geom_shape(disk.clone());
     let mut h_co = if !skip_comp {
@@ -631,8 +646,10 @@ fn main() {
     } else { None };
 
     // Steppers
-    unsafe { std::env::set_var("LLG_AMR_DEMAG_MODE", "coarse_fft"); }
-    let mut st_cf = AmrStepperRK4::new(&h_cf, true);
+    let mut st_cf = if !skip_cfft {
+        unsafe { std::env::set_var("LLG_AMR_DEMAG_MODE", "coarse_fft"); }
+        Some(AmrStepperRK4::new(&h_cf, true))
+    } else { None };
     let mut st_co = if let Some(hc) = h_co.as_ref() {
         unsafe { std::env::set_var("LLG_AMR_DEMAG_MODE", "composite"); }
         Some(AmrStepperRK4::new(hc, true))
@@ -642,7 +659,7 @@ fn main() {
     // Initial regrid
     let mut pr_cf: Vec<Rect2i> = Vec::new();
     let mut pr_co: Vec<Rect2i> = Vec::new();
-    if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf, &pr_cf, rp, cp) { pr_cf = r; }
+    if !skip_cfft { if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf, &pr_cf, rp, cp) { pr_cf = r; } }
     if let Some(hc) = h_co.as_mut() {
         if let Some((r,_)) = maybe_regrid_nested_levels(hc, &pr_co, rp, cp) { pr_co = r; }
     }
@@ -652,7 +669,9 @@ fn main() {
     // a fine-grid reference.  Overwriting it with the AMR's coarse-interpolated
     // state would degrade the fine reference to coarse-grid quality.
 
-    let scr: usize = if st_cf.is_subcycling() { (st_cf.coarse_dt(&llg,&h_cf)/llg.dt).round() as usize } else { 1 };
+    let scr: usize = if let Some(ref s) = st_cf {
+        if s.is_subcycling() { (s.coarse_dt(&llg,&h_cf)/llg.dt).round() as usize } else { 1 }
+    } else { 64 }; // default subcycle ratio when AMR is not running
 
     let mut sf = RK4Scratch::new(fg);
     let mut sc = RK4Scratch::new(bg);
@@ -666,9 +685,11 @@ fn main() {
     let cp_co = format!("{out}/core_amr_comp.csv");
     let rmse_p = format!("{out}/rmse_log.csv");
     let regrid_p = format!("{out}/regrid_log.csv");
+    let comp_regrid_p = format!("{out}/comp_regrid_log.csv");
     for p in [&cp_f,&cp_c,&cp_cf,&cp_co] { File::create(p).unwrap(); append(p,"step,t_ns,x_nm,y_nm,mz,core_level\n"); }
     File::create(&rmse_p).unwrap(); append(&rmse_p,"step,t_ns,rmse_coarse,rmse_cfft,rmse_comp\n");
     File::create(&regrid_p).unwrap(); append(&regrid_p,"step,t_ns,L1,L2,L3,L1_area,L2_area,L3_area\n");
+    if !skip_comp { File::create(&comp_regrid_p).unwrap(); append(&comp_regrid_p,"step,t_ns,L1,L2,L3,L1_area,L2_area,L3_area\n"); }
 
     let t0 = Instant::now();
     let (mut wf,mut wc,mut wcf,mut wco) = (0.0_f64,0.0_f64,0.0_f64,0.0_f64);
@@ -694,8 +715,9 @@ fn main() {
         cp.buffer_cells, cp.min_efficiency*100.0, ind.label());
     println!("  AMR: dyn_regrid={dyn_regrid} ({:.0}ps), snap_every={snap_every} ({:.0}ps)",
         dyn_regrid as f64 * dt * 1e12, snap_every as f64 * dt * 1e12);
-    println!("  Methods: fine={} coarse={} cfft comp={}",
+    println!("  Methods: fine={} coarse={} cfft={} comp={}",
         if skip_fine{"SKIP"}else{"ON"}, if skip_coarse{"SKIP"}else{"ON"},
+        if skip_cfft{"SKIP"}else{"ON"},
         if skip_comp{"SKIP"}else{"ON"});
     println!();
 
@@ -711,47 +733,42 @@ fn main() {
         if !skip_fine { let t1=Instant::now(); step_relax(&mut m_fine,&mut bf,&llg,&mat,&mut sf,&fg,&mf); wf+=t1.elapsed().as_secs_f64(); }
         if !skip_coarse { let t1=Instant::now(); step_relax(&mut m_coarse,&mut bc,&llg,&mat,&mut sc,&bg,&mc); wc+=t1.elapsed().as_secs_f64(); }
         if step%scr==0 {
-            let t1=Instant::now(); st_cf.step(&mut h_cf,&llg,&mat,lm); wcf+=t1.elapsed().as_secs_f64();
+            if let Some(ref mut s) = st_cf { let t1=Instant::now(); s.step(&mut h_cf,&llg,&mat,lm); wcf+=t1.elapsed().as_secs_f64(); }
             if let (Some(s),Some(h)) = (&mut st_co,&mut h_co) { let t2=Instant::now(); s.step(h,&llg,&mat,lm); wco+=t2.elapsed().as_secs_f64(); }
         }
         // Regrid during relaxation so patches adapt as vortex settles
         if step%scr==0 && step%(relax_out)==0 {
-            if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
+            if !skip_cfft { if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; } }
             if let Some(hc) = h_co.as_mut() { if let Some((r,_)) = maybe_regrid_nested_levels(hc,&pr_co,rp,cp) { pr_co=r; } }
         }
         if step%relax_out==0 {
-            let mfl = flatten_to(&h_cf, fg);
-            let (cx,cy,cmz) = find_core(&mfl, Some(&mf));
             let tps = step as f64 * dt * 1e12;
-            println!("  relax {step}/{relax_steps} ({tps:.0}ps) core=({:.1},{:.1})nm mz={cmz:.4}", cx*1e9, cy*1e9);
+            let fine_str = if !skip_fine {
+                let (fx,fy,fmz) = find_core(&m_fine, Some(&mf));
+                format!("fine=({:.1},{:.1})nm mz={fmz:.4}  ", fx*1e9, fy*1e9)
+            } else { String::new() };
+            let coarse_str = if !skip_coarse {
+                let (ccx,ccy,ccmz) = find_core(&m_coarse, Some(&mc));
+                format!("coarse=({:.1},{:.1})nm mz={ccmz:.4}  ", ccx*1e9, ccy*1e9)
+            } else { String::new() };
+            let cfft_str = if !skip_cfft {
+                let mfl = flatten_to(&h_cf, fg);
+                let (cx,cy,cmz) = find_core(&mfl, Some(&mf));
+                format!("core=({:.1},{:.1})nm mz={cmz:.4}", cx*1e9, cy*1e9)
+            } else { String::new() };
+            let comp_str = if let Some(hc) = h_co.as_ref() {
+                let mc2 = flatten_to(hc, fg);
+                let (ox,oy,omz) = find_core(&mc2, Some(&mf));
+                format!("  comp=({:.1},{:.1})nm mz={omz:.4}", ox*1e9, oy*1e9)
+            } else { String::new() };
+            println!("  relax {step}/{relax_steps} ({tps:.0}ps) {fine_str}{coarse_str}{cfft_str}{comp_str}");
         }
     }
     println!("  Vortex ground state reached.");
 
     // Save equilibrium snapshot (patch map + magnetisation at ground state)
     if do_plots {
-        if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
-        let l1 = pr_cf.clone(); let l2 = l2_rects(&h_cf); let l3 = l3_rects(&h_cf);
-        let ms = flatten_to(&h_cf, fg);
-        let _ = save_snap(&ms,&bg,&l1,&l2,&l3,&disk,
-            &format!("{out}/snap_equilibrium.png"), "Vortex ground state (B=0)");
-        let _ = save_mz_snap(&ms, &disk,
-            &format!("{out}/mz_equilibrium.png"), "mz — Equilibrium (B=0)", -0.2, 1.0);
-        // CSV for Python: patches, coarse M, fine M
-        { let mut f = File::create(format!("{out}/patches_eq.csv")).unwrap();
-          writeln!(f, "level,i0,j0,nx,ny").unwrap();
-          for r in &l1 { writeln!(f, "1,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
-          for r in &l2 { writeln!(f, "2,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
-          for r in &l3 { writeln!(f, "3,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
-        }
-        { let mut f = File::create(format!("{out}/m_fine_eq.csv")).unwrap();
-          writeln!(f, "i,j,mx,my,mz").unwrap();
-          for j in 0..fg.ny { for i in 0..fg.nx {
-              let v = ms.data[j*fg.nx+i];
-              writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
-          }}
-        }
-        // Grid metadata for Python
+        // Grid metadata for Python (always useful)
         { let mut f = File::create(format!("{out}/grid_info.csv")).unwrap();
           writeln!(f, "param,value").unwrap();
           writeln!(f, "base_nx,{}", bg.nx).unwrap();
@@ -766,14 +783,56 @@ fn main() {
           writeln!(f, "amr_levels,{}", amr_lvl).unwrap();
           writeln!(f, "ratio,{}", ratio).unwrap();
         }
-        let (l1n,l2n,l3n) = (l1.len(), l2.len(), l3.len());
-        let (cx,cy,_) = find_core(&ms, Some(&mf));
-        let cl = core_amr_level(&h_cf, cx, cy, &bg);
-        println!("  Saved snap_equilibrium.png (L1={l1n} L2={l2n} L3={l3n} core@L{cl})");
+        if !skip_cfft {
+            if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
+            let l1 = pr_cf.clone(); let l2 = l2_rects(&h_cf); let l3 = l3_rects(&h_cf);
+            let ms = flatten_to(&h_cf, fg);
+            let _ = save_snap(&ms,&bg,&l1,&l2,&l3,&disk,
+                &format!("{out}/snap_equilibrium.png"), "Vortex ground state (B=0)");
+            let _ = save_mz_snap(&ms, &disk,
+                &format!("{out}/mz_equilibrium.png"), "mz — Equilibrium (B=0)", -0.2, 1.0);
+            // CSV for Python: patches, coarse M, fine M
+            { let mut f = File::create(format!("{out}/patches_eq.csv")).unwrap();
+              writeln!(f, "level,i0,j0,nx,ny").unwrap();
+              for r in &l1 { writeln!(f, "1,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+              for r in &l2 { writeln!(f, "2,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+              for r in &l3 { writeln!(f, "3,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+            }
+            { let mut f = File::create(format!("{out}/m_fine_eq.csv")).unwrap();
+              writeln!(f, "i,j,mx,my,mz").unwrap();
+              for j in 0..fg.ny { for i in 0..fg.nx {
+                  let v = ms.data[j*fg.nx+i];
+                  writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+              }}
+            }
+            let (l1n,l2n,l3n) = (l1.len(), l2.len(), l3.len());
+            let (cx,cy,_) = find_core(&ms, Some(&mf));
+            let cl = core_amr_level(&h_cf, cx, cy, &bg);
+            println!("  Saved snap_equilibrium.png (L1={l1n} L2={l2n} L3={l3n} core@L{cl})");
+        }
+        if let Some(hc) = h_co.as_ref() {
+            let cl1: Vec<Rect2i> = hc.patches.iter().map(|p| p.coarse_rect).collect();
+            let cl2 = l2_rects(hc); let cl3 = l3_rects(hc);
+            let cms = flatten_to(hc, fg);
+            let _ = save_snap(&cms,&bg,&cl1,&cl2,&cl3,&disk,
+                &format!("{out}/comp_snap_equilibrium.png"), "COMP Vortex ground state (B=0)");
+            let _ = save_mz_snap(&cms, &disk,
+                &format!("{out}/comp_mz_equilibrium.png"), "COMP mz — Equilibrium (B=0)", -0.2, 1.0);
+            { let mut f = File::create(format!("{out}/comp_m_fine_eq.csv")).unwrap();
+              writeln!(f, "i,j,mx,my,mz").unwrap();
+              for j in 0..fg.ny { for i in 0..fg.nx {
+                  let v = cms.data[j*fg.nx+i];
+                  writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+              }}
+            }
+            let (ocx,ocy,_) = find_core(&cms, Some(&mf));
+            let ocl = core_amr_level(hc, ocx, ocy, &bg);
+            println!("  Saved comp_snap_equilibrium.png (core@L{ocl})");
+        }
     }
 
     // =====================================================================
-    // PHASE 2: Apply 20 mT field, relax to shifted equilibrium
+    // PHASE 2: Apply field, relax to shifted equilibrium
     // =====================================================================
 
     println!("\n── Phase 2: Apply {:.0}mT x-field, relax (α={alpha_relax}, {} steps = {:.0}ps) ──",
@@ -784,48 +843,99 @@ fn main() {
         if !skip_fine { let t1=Instant::now(); step_relax(&mut m_fine,&mut bf,&llg,&mat,&mut sf,&fg,&mf); wf+=t1.elapsed().as_secs_f64(); }
         if !skip_coarse { let t1=Instant::now(); step_relax(&mut m_coarse,&mut bc,&llg,&mat,&mut sc,&bg,&mc); wc+=t1.elapsed().as_secs_f64(); }
         if step%scr==0 {
-            let t1=Instant::now(); st_cf.step(&mut h_cf,&llg,&mat,lm); wcf+=t1.elapsed().as_secs_f64();
+            if let Some(ref mut s) = st_cf { let t1=Instant::now(); s.step(&mut h_cf,&llg,&mat,lm); wcf+=t1.elapsed().as_secs_f64(); }
             if let (Some(s),Some(h)) = (&mut st_co,&mut h_co) { let t2=Instant::now(); s.step(h,&llg,&mat,lm); wco+=t2.elapsed().as_secs_f64(); }
         }
         // Regrid during field relaxation so patches track the shifting core.
         // The new-region acceptance in regrid.rs detects the core patch appearing
         // inside the boundary-arc union and accepts it without force-refresh.
         if step%scr==0 && step%(relax_out)==0 {
-            if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
+            if !skip_cfft { if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; } }
             if let Some(hc) = h_co.as_mut() { if let Some((r,_)) = maybe_regrid_nested_levels(hc,&pr_co,rp,cp) { pr_co=r; } }
         }
         if step%relax_out==0 {
-            let mfl = flatten_to(&h_cf, fg);
-            let (cx,cy,cmz) = find_core(&mfl, Some(&mf));
             let tps = step as f64 * dt * 1e12;
-            println!("  field-relax {step}/{field_relax_steps} ({tps:.0}ps) core=({:.1},{:.1})nm mz={cmz:.4}", cx*1e9, cy*1e9);
+            let fine_str = if !skip_fine {
+                let (fx,fy,fmz) = find_core(&m_fine, Some(&mf));
+                let fr = (fx*fx+fy*fy).sqrt();
+                format!("fine=({:.1},{:.1})nm r={:.1}nm mz={fmz:.4}  ", fx*1e9, fy*1e9, fr*1e9)
+            } else { String::new() };
+            let coarse_str = if !skip_coarse {
+                let (ccx,ccy,ccmz) = find_core(&m_coarse, Some(&mc));
+                let cr = (ccx*ccx+ccy*ccy).sqrt();
+                format!("coarse=({:.1},{:.1})nm r={:.1}nm mz={ccmz:.4}  ", ccx*1e9, ccy*1e9, cr*1e9)
+            } else { String::new() };
+            let cfft_str = if !skip_cfft {
+                let mfl = flatten_to(&h_cf, fg);
+                let (cx,cy,cmz) = find_core(&mfl, Some(&mf));
+                let r_cfft = (cx*cx+cy*cy).sqrt();
+                format!("core=({:.1},{:.1})nm r={:.1}nm mz={cmz:.4}", cx*1e9, cy*1e9, r_cfft*1e9)
+            } else { String::new() };
+            let comp_str = if let Some(hc) = h_co.as_ref() {
+                let mc2 = flatten_to(hc, fg);
+                let (ox,oy,omz) = find_core(&mc2, Some(&mf));
+                let r_comp = (ox*ox+oy*oy).sqrt();
+                format!("  comp=({:.1},{:.1})nm r={:.1}nm mz={omz:.4}", ox*1e9, oy*1e9, r_comp*1e9)
+            } else { String::new() };
+            println!("  field-relax {step}/{field_relax_steps} ({tps:.0}ps) {fine_str}{coarse_str}{cfft_str}{comp_str}");
         }
     }
 
     // Regrid before dynamics
-    if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
+    if !skip_cfft { if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; } }
     if let Some(hc) = h_co.as_mut() { if let Some((r,_)) = maybe_regrid_nested_levels(hc,&pr_co,rp,cp) { pr_co=r; } }
 
     // Record shifted core positions
-    let mf_flat = flatten_to(&h_cf, fg);
-    let (cx,cy,_) = find_core(&mf_flat, Some(&mf));
-    let cl_shifted = core_amr_level(&h_cf, cx, cy, &bg);
-    let (l1s,l2s,l3s) = (h_cf.patches.len(),
-        h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
-        h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
-    let a3s: usize = h_cf.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
-    println!("  Core shifted to ({:.1}, {:.1}) nm  core@L{cl_shifted}", cx*1e9, cy*1e9);
-    println!("  Pre-dynamics: L1={l1s} L2={l2s} L3={l3s} (L3_area={a3s} base cells)");
+    if !skip_cfft {
+        let mf_flat = flatten_to(&h_cf, fg);
+        let (cx,cy,_) = find_core(&mf_flat, Some(&mf));
+        let cl_shifted = core_amr_level(&h_cf, cx, cy, &bg);
+        let (l1s,l2s,l3s) = (h_cf.patches.len(),
+            h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+            h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+        let a3s: usize = h_cf.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+        println!("  Core shifted to ({:.1}, {:.1}) nm  core@L{cl_shifted}", cx*1e9, cy*1e9);
+        println!("  Pre-dynamics: L1={l1s} L2={l2s} L3={l3s} (L3_area={a3s} base cells)");
+    }
+    if !skip_fine {
+        let (fx,fy,_) = find_core(&m_fine, Some(&mf));
+        let fr = (fx*fx+fy*fy).sqrt();
+        println!("  Fine core shifted to ({:.1}, {:.1}) nm  r={:.1}nm", fx*1e9, fy*1e9, fr*1e9);
+    }
+    if !skip_coarse {
+        let (ccx,ccy,_) = find_core(&m_coarse, Some(&mc));
+        let cr = (ccx*ccx+ccy*ccy).sqrt();
+        println!("  Coarse core shifted to ({:.1}, {:.1}) nm  r={:.1}nm", ccx*1e9, ccy*1e9, cr*1e9);
+    }
+    if let Some(hc) = h_co.as_ref() {
+        let mco_flat = flatten_to(hc, fg);
+        let (ocx,ocy,_) = find_core(&mco_flat, Some(&mf));
+        let ocl = core_amr_level(hc, ocx, ocy, &bg);
+        let (cl1,cl2,cl3) = (hc.patches.len(),
+            hc.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+            hc.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+        let r_comp = (ocx*ocx+ocy*ocy).sqrt();
+        println!("  Comp shifted to ({:.1}, {:.1}) nm  r={:.1}nm  core@L{ocl}  L1={cl1} L2={cl2} L3={cl3}",
+            ocx*1e9, ocy*1e9, r_comp*1e9);
+    }
 
     // Switch to dynamics
-    st_cf.relax = false;
+    if let Some(ref mut s) = st_cf { s.relax = false; }
     if let Some(s) = st_co.as_mut() { s.relax = false; }
 
-    if do_plots {
+    if do_plots && !skip_cfft {
         let l1 = pr_cf.clone(); let l2 = l2_rects(&h_cf); let l3 = l3_rects(&h_cf);
         let ms = flatten_to(&h_cf, fg);
         let _ = save_snap(&ms,&bg,&l1,&l2,&l3,&disk, &format!("{out}/snap_shifted.png"),
             &format!("Core shifted by {:.0}mT", b_shift*1e3));
+        if let Some(hc) = h_co.as_ref() {
+            let cl1: Vec<Rect2i> = hc.patches.iter().map(|p| p.coarse_rect).collect();
+            let cl2 = l2_rects(hc); let cl3 = l3_rects(hc);
+            let cms = flatten_to(hc, fg);
+            let _ = save_snap(&cms,&bg,&cl1,&cl2,&cl3,&disk,
+                &format!("{out}/comp_snap_shifted.png"),
+                &format!("COMP Core shifted by {:.0}mT", b_shift*1e3));
+        }
     }
 
     // =====================================================================
@@ -840,7 +950,7 @@ fn main() {
     llg.b_ext = [0.0; 3]; // field OFF — core spirals back
 
     // Log initial patch state before dynamics begin
-    {
+    if !skip_cfft {
         let (l1,l2,l3) = (h_cf.patches.len(),
             h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
             h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
@@ -848,6 +958,16 @@ fn main() {
         let a2: usize = h_cf.patches_l2plus.get(0).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
         let a3: usize = h_cf.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
         append(&regrid_p, &format!("0,0.000000,{l1},{l2},{l3},{a1},{a2},{a3}\n"));
+
+        if let Some(hc) = h_co.as_ref() {
+            let (cl1,cl2,cl3) = (hc.patches.len(),
+                hc.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+                hc.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+            let ca1: usize = pr_co.iter().map(|r|r.nx*r.ny).sum();
+            let ca2: usize = hc.patches_l2plus.get(0).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+            let ca3: usize = hc.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+            append(&comp_regrid_p, &format!("0,0.000000,{cl1},{cl2},{cl3},{ca1},{ca2},{ca3}\n"));
+        }
     }
 
     let mut sn = 0_usize;
@@ -859,7 +979,7 @@ fn main() {
         if !skip_fine { let t1=Instant::now(); step_dyn(&mut m_fine,&mut bf,&llg,&mat,&mut sf,&fg,&mf); wf+=t1.elapsed().as_secs_f64(); }
         if !skip_coarse { let t1=Instant::now(); step_dyn(&mut m_coarse,&mut bc,&llg,&mat,&mut sc,&bg,&mc); wc+=t1.elapsed().as_secs_f64(); }
         if step%scr==0 {
-            let t1=Instant::now(); st_cf.step(&mut h_cf,&llg,&mat,lm); wcf+=t1.elapsed().as_secs_f64();
+            if let Some(ref mut s) = st_cf { let t1=Instant::now(); s.step(&mut h_cf,&llg,&mat,lm); wcf+=t1.elapsed().as_secs_f64(); }
             if let (Some(s),Some(h)) = (&mut st_co,&mut h_co) { let t2=Instant::now(); s.step(h,&llg,&mat,lm); wco+=t2.elapsed().as_secs_f64(); }
         }
 
@@ -868,17 +988,30 @@ fn main() {
         // (e.g. core patch at a new location) that doesn't overlap existing patches.
         // L2+ boundary_layer=0 keeps deeper levels indicator-focused on the core.
         if step%scr==0 && step%dyn_regrid==0 {
-            if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
+            if !skip_cfft { if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; } }
             if let Some(hc) = h_co.as_mut() { if let Some((r,_)) = maybe_regrid_nested_levels(hc,&pr_co,rp,cp) { pr_co=r; } }
 
             // Log patch counts and areas after each regrid
-            let (l1,l2,l3) = (h_cf.patches.len(),
-                h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
-                h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
-            let a1: usize = pr_cf.iter().map(|r|r.nx*r.ny).sum();
-            let a2: usize = h_cf.patches_l2plus.get(0).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
-            let a3: usize = h_cf.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
-            append(&regrid_p, &format!("{step},{tns:.6},{l1},{l2},{l3},{a1},{a2},{a3}\n"));
+            if !skip_cfft {
+                let (l1,l2,l3) = (h_cf.patches.len(),
+                    h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+                    h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+                let a1: usize = pr_cf.iter().map(|r|r.nx*r.ny).sum();
+                let a2: usize = h_cf.patches_l2plus.get(0).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+                let a3: usize = h_cf.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+                append(&regrid_p, &format!("{step},{tns:.6},{l1},{l2},{l3},{a1},{a2},{a3}\n"));
+            }
+
+            // Comp regrid log
+            if let Some(hc) = h_co.as_ref() {
+                let (cl1,cl2,cl3) = (hc.patches.len(),
+                    hc.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+                    hc.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+                let ca1: usize = pr_co.iter().map(|r|r.nx*r.ny).sum();
+                let ca2: usize = hc.patches_l2plus.get(0).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+                let ca3: usize = hc.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
+                append(&comp_regrid_p, &format!("{step},{tns:.6},{cl1},{cl2},{cl3},{ca1},{ca2},{ca3}\n"));
+            }
         }
 
         // Core tracking
@@ -887,7 +1020,7 @@ fn main() {
                 append(&cp_f,&format!("{step},{tns:.6},{:.2},{:.2},{mz:.6},0\n",x*1e9,y*1e9)); }
             if !skip_coarse { let (x,y,mz)=find_core(&m_coarse,Some(&mc));
                 append(&cp_c,&format!("{step},{tns:.6},{:.2},{:.2},{mz:.6},0\n",x*1e9,y*1e9)); }
-            { let mfl=flatten_to(&h_cf,fg); let(x,y,mz)=find_core(&mfl,Some(&mf));
+            if !skip_cfft { let mfl=flatten_to(&h_cf,fg); let(x,y,mz)=find_core(&mfl,Some(&mf));
                 let cl = core_amr_level(&h_cf, x, y, &bg);
                 append(&cp_cf,&format!("{step},{tns:.6},{:.2},{:.2},{mz:.6},{cl}\n",x*1e9,y*1e9)); }
             if let Some(hc) = h_co.as_ref() { let mfl=flatten_to(hc,fg); let(x,y,mz)=find_core(&mfl,Some(&mf));
@@ -897,7 +1030,7 @@ fn main() {
             // RMSE every 500 output steps
             if !skip_fine && step%(dyn_out*10)==0 {
                 let rc = if !skip_coarse { format!("{:.6e}",rmse_fields(&m_coarse.resample_to_grid(fg),&m_fine).0) } else { "NaN".into() };
-                let rcf = format!("{:.6e}",rmse_fields(&flatten_to(&h_cf,fg),&m_fine).0);
+                let rcf = if !skip_cfft { format!("{:.6e}",rmse_fields(&flatten_to(&h_cf,fg),&m_fine).0) } else { "NaN".into() };
                 let rco = if let Some(hc)=h_co.as_ref() { format!("{:.6e}",rmse_fields(&flatten_to(hc,fg),&m_fine).0) } else { "NaN".into() };
                 append(&rmse_p,&format!("{step},{tns:.4},{rc},{rcf},{rco}\n"));
             }
@@ -905,47 +1038,136 @@ fn main() {
 
         // Console — include core_level so we can see immediately if L3 covers the core
         if step%(dyn_out*20)==0 || step==gyr_steps {
-            let mfl=flatten_to(&h_cf,fg); let(x,y,_)=find_core(&mfl,Some(&mf));
-            let cl = core_amr_level(&h_cf, x, y, &bg);
-            let (l1,l2,l3) = (h_cf.patches.len(), h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
-                h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
-            println!("  gyr {step}/{gyr_steps} t={tns:.2}ns core=({:.1},{:.1})nm L1={l1} L2={l2} L3={l3} core@L{cl}", x*1e9, y*1e9);
+            let mut parts: Vec<String> = Vec::new();
+            if !skip_fine {
+                let (x,y,_) = find_core(&m_fine, Some(&mf));
+                let r = (x*x+y*y).sqrt();
+                parts.push(format!("fine=({:.1},{:.1})nm r={:.1}nm", x*1e9, y*1e9, r*1e9));
+            }
+            if !skip_coarse {
+                let (x,y,_) = find_core(&m_coarse, Some(&mc));
+                let r = (x*x+y*y).sqrt();
+                parts.push(format!("coarse=({:.1},{:.1})nm r={:.1}nm", x*1e9, y*1e9, r*1e9));
+            }
+            if !skip_cfft {
+                let mfl=flatten_to(&h_cf,fg); let(x,y,_)=find_core(&mfl,Some(&mf));
+                let cl = core_amr_level(&h_cf, x, y, &bg);
+                let (l1,l2,l3) = (h_cf.patches.len(), h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+                    h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+                let r_cfft = (x*x+y*y).sqrt();
+                parts.push(format!("core=({:.1},{:.1})nm r={:.1}nm L1={l1} L2={l2} L3={l3} core@L{cl}",
+                    x*1e9, y*1e9, r_cfft*1e9));
+            }
+            if let Some(hc) = h_co.as_ref() {
+                let mc2 = flatten_to(hc, fg);
+                let (ox,oy,_) = find_core(&mc2, Some(&mf));
+                let ocl = core_amr_level(hc, ox, oy, &bg);
+                let (cl1,cl2,cl3) = (hc.patches.len(),
+                    hc.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0),
+                    hc.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0));
+                let r_comp = (ox*ox+oy*oy).sqrt();
+                parts.push(format!("comp=({:.1},{:.1})nm r={:.1}nm L1={cl1} L2={cl2} L3={cl3} core@L{ocl}",
+                    ox*1e9, oy*1e9, r_comp*1e9));
+            }
+            println!("  gyr {step}/{gyr_steps} t={tns:.2}ns {}", parts.join("  "));
         }
 
         // Snapshots
         if do_plots && (step%snap_every==0 || step==gyr_steps) {
-            let l1=pr_cf.clone(); let l2=l2_rects(&h_cf); let l3=l3_rects(&h_cf);
-            let ms=flatten_to(&h_cf,fg);
-            let _ = save_snap(&ms,&bg,&l1,&l2,&l3,&disk, &format!("{out}/snap_gyr_{sn:03}.png"),
-                &format!("t={tns:.2}ns (α={alpha_dyn})"));
-            let _ = save_mz_snap(&ms, &disk,
-                &format!("{out}/mz_gyr_{sn:03}.png"),
-                &format!("mz — t={tns:.2}ns"), -0.2, 1.0);
+            // ── Fine-FFT snapshot ──
+            if !skip_fine {
+                // CSV: fine magnetisation
+                if sn % 5 == 0 || step == gyr_steps {
+                    let mut f = File::create(format!("{out}/fine_m_{sn:03}.csv")).unwrap();
+                    writeln!(f, "i,j,mx,my,mz").unwrap();
+                    for j in 0..fg.ny { for i in 0..fg.nx {
+                        let v = m_fine.data[j*fg.nx+i];
+                        writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+                    }}
+                }
+            }
 
-            // ── CSV outputs for Python post-processing ──
-            // 1. Patch rectangles (small file, every snapshot)
-            { let mut f = File::create(format!("{out}/patches_{sn:03}.csv")).unwrap();
-              writeln!(f, "level,i0,j0,nx,ny").unwrap();
-              for r in &l1 { writeln!(f, "1,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
-              for r in &l2 { writeln!(f, "2,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
-              for r in &l3 { writeln!(f, "3,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+            // ── Coarse-FFT snapshot ──
+            if !skip_coarse {
+                if sn % 5 == 0 || step == gyr_steps {
+                    let mut f = File::create(format!("{out}/coarse_m_{sn:03}.csv")).unwrap();
+                    writeln!(f, "i,j,mx,my,mz").unwrap();
+                    for j in 0..bg.ny { for i in 0..bg.nx {
+                        let v = m_coarse.data[j*bg.nx+i];
+                        writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+                    }}
+                }
             }
-            // 2. Coarse (L0) magnetisation — 80×80, good for patch map overlays
-            { let mut f = File::create(format!("{out}/m_coarse_{sn:03}.csv")).unwrap();
-              writeln!(f, "i,j,mx,my,mz").unwrap();
-              for j in 0..bg.ny { for i in 0..bg.nx {
-                  let v = h_cf.coarse.data[j*bg.nx+i];
-                  writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
-              }}
+
+            // ── AMR+cfft snapshots ──
+            if !skip_cfft {
+                let l1=pr_cf.clone(); let l2=l2_rects(&h_cf); let l3=l3_rects(&h_cf);
+                let ms=flatten_to(&h_cf,fg);
+                let _ = save_snap(&ms,&bg,&l1,&l2,&l3,&disk, &format!("{out}/snap_gyr_{sn:03}.png"),
+                    &format!("t={tns:.2}ns (α={alpha_dyn})"));
+                let _ = save_mz_snap(&ms, &disk,
+                    &format!("{out}/mz_gyr_{sn:03}.png"),
+                    &format!("mz — t={tns:.2}ns"), -0.2, 1.0);
+
+                // ── CSV outputs for Python post-processing ──
+                // 1. Patch rectangles (small file, every snapshot)
+                { let mut f = File::create(format!("{out}/patches_{sn:03}.csv")).unwrap();
+                  writeln!(f, "level,i0,j0,nx,ny").unwrap();
+                  for r in &l1 { writeln!(f, "1,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+                  for r in &l2 { writeln!(f, "2,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+                  for r in &l3 { writeln!(f, "3,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+                }
+                // 2. Coarse (L0) magnetisation — 80×80, good for patch map overlays
+                { let mut f = File::create(format!("{out}/m_coarse_{sn:03}.csv")).unwrap();
+                  writeln!(f, "i,j,mx,my,mz").unwrap();
+                  for j in 0..bg.ny { for i in 0..bg.nx {
+                      let v = h_cf.coarse.data[j*bg.nx+i];
+                      writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+                  }}
+                }
+                // 3. Fine (flattened) magnetisation — every 5th snapshot + final
+                if sn % 5 == 0 || step == gyr_steps {
+                    let mut f = File::create(format!("{out}/m_fine_{sn:03}.csv")).unwrap();
+                    writeln!(f, "i,j,mx,my,mz").unwrap();
+                    for j in 0..fg.ny { for i in 0..fg.nx {
+                        let v = ms.data[j*fg.nx+i];
+                        writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+                    }}
+                }
             }
-            // 3. Fine (flattened) magnetisation — every 5th snapshot + final
-            if sn % 5 == 0 || step == gyr_steps {
-                let mut f = File::create(format!("{out}/m_fine_{sn:03}.csv")).unwrap();
-                writeln!(f, "i,j,mx,my,mz").unwrap();
-                for j in 0..fg.ny { for i in 0..fg.nx {
-                    let v = ms.data[j*fg.nx+i];
-                    writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
-                }}
+
+            // ── Composite outputs (equivalent to cfft above) ──
+            if let Some(hc) = h_co.as_ref() {
+                let cl1: Vec<Rect2i> = hc.patches.iter().map(|p| p.coarse_rect).collect();
+                let cl2 = l2_rects(hc); let cl3 = l3_rects(hc);
+                let cms = flatten_to(hc, fg);
+                let _ = save_snap(&cms,&bg,&cl1,&cl2,&cl3,&disk,
+                    &format!("{out}/comp_snap_gyr_{sn:03}.png"),
+                    &format!("COMP t={tns:.2}ns (α={alpha_dyn})"));
+                let _ = save_mz_snap(&cms, &disk,
+                    &format!("{out}/comp_mz_gyr_{sn:03}.png"),
+                    &format!("COMP mz — t={tns:.2}ns"), -0.2, 1.0);
+                { let mut f = File::create(format!("{out}/comp_patches_{sn:03}.csv")).unwrap();
+                  writeln!(f, "level,i0,j0,nx,ny").unwrap();
+                  for r in &cl1 { writeln!(f, "1,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+                  for r in &cl2 { writeln!(f, "2,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+                  for r in &cl3 { writeln!(f, "3,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+                }
+                { let mut f = File::create(format!("{out}/comp_m_coarse_{sn:03}.csv")).unwrap();
+                  writeln!(f, "i,j,mx,my,mz").unwrap();
+                  for j in 0..bg.ny { for i in 0..bg.nx {
+                      let v = hc.coarse.data[j*bg.nx+i];
+                      writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+                  }}
+                }
+                if sn % 5 == 0 || step == gyr_steps {
+                    let mut f = File::create(format!("{out}/comp_m_fine_{sn:03}.csv")).unwrap();
+                    writeln!(f, "i,j,mx,my,mz").unwrap();
+                    for j in 0..fg.ny { for i in 0..fg.nx {
+                        let v = cms.data[j*fg.nx+i];
+                        writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+                    }}
+                }
             }
 
             sn += 1;
@@ -960,14 +1182,14 @@ fn main() {
 
     let cf = if !skip_fine { Some(find_core(&m_fine,Some(&mf))) } else { None };
     let cc = if !skip_coarse { Some(find_core(&m_coarse,Some(&mc))) } else { None };
-    let mfl = flatten_to(&h_cf,fg); let ccf = find_core(&mfl,Some(&mf));
+    let ccf = if !skip_cfft { let mfl = flatten_to(&h_cf,fg); Some(find_core(&mfl,Some(&mf))) } else { None };
     let cco = h_co.as_ref().map(|h| { let m=flatten_to(h,fg); find_core(&m,Some(&mf)) });
 
     let rf_c = if !skip_fine&&!skip_coarse { Some(rmse_fields(&m_coarse.resample_to_grid(fg),&m_fine).0) } else { None };
-    let rf_cf = if !skip_fine { Some(rmse_fields(&mfl,&m_fine).0) } else { None };
+    let rf_cf = if !skip_fine&&!skip_cfft { let mfl = flatten_to(&h_cf,fg); Some(rmse_fields(&mfl,&m_fine).0) } else { None };
     let rf_co = if !skip_fine { h_co.as_ref().map(|h| rmse_fields(&flatten_to(h,fg),&m_fine).0) } else { None };
 
-    let cov = patches_fine(&pr_cf,rrt).iter().map(|r|r.nx*r.ny).sum::<usize>() as f64 / (fnx*fny) as f64;
+    let cov = if !skip_cfft { patches_fine(&pr_cf,rrt).iter().map(|r|r.nx*r.ny).sum::<usize>() as f64 / (fnx*fny) as f64 } else { 0.0 };
 
     // Guslienko gyration frequency:
     // The "two-vortices" rigid-model leading-order result is ω₀ = (20/9) γ μ₀ Ms β
@@ -1024,7 +1246,7 @@ fn main() {
     println!("  {thin}");
     if let Some((x,y,mz))=cf  { println!("  Fine FFT      ({:>6.1},{:>6.1}) nm  mz={mz:.4}",x*1e9,y*1e9); }
     if let Some((x,y,mz))=cc  { println!("  Coarse FFT    ({:>6.1},{:>6.1}) nm  mz={mz:.4}",x*1e9,y*1e9); }
-    println!("  AMR+cfft      ({:>6.1},{:>6.1}) nm  mz={:.4}",ccf.0*1e9,ccf.1*1e9,ccf.2);
+    if let Some((x,y,mz))=ccf { println!("  AMR+cfft      ({:>6.1},{:>6.1}) nm  mz={mz:.4}",x*1e9,y*1e9); }
     if let Some((x,y,mz))=cco { println!("  AMR+composite ({:>6.1},{:>6.1}) nm  mz={mz:.4}",x*1e9,y*1e9); }
 
     println!("\n  RMSE vs FINE FFT");
@@ -1034,33 +1256,36 @@ fn main() {
     if let Some(r)=rf_co { println!("  AMR+composite  {r:.4e}"); }
     if skip_fine { println!("  (fine ref skipped)"); }
 
-    let l1n = h_cf.patches.len();
-    let l2n = h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0);
-    let l3n = h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0);
-    println!("\n  AMR: L1={l1n} L2={l2n} L3={l3n} cov={:.1}%", cov*100.0);
+    if !skip_cfft {
+        let l1n = h_cf.patches.len();
+        let l2n = h_cf.patches_l2plus.get(0).map(|v|v.len()).unwrap_or(0);
+        let l3n = h_cf.patches_l2plus.get(1).map(|v|v.len()).unwrap_or(0);
+        println!("\n  AMR: L1={l1n} L2={l2n} L3={l3n} cov={:.1}%", cov*100.0);
+    }
 
     println!("\n  WALL TIME");
     println!("  {thin}");
     println!("  Total            {:>8.1}s", total);
     if !skip_fine   { println!("  Fine FFT         {:>8.1}s", wf); }
     if !skip_coarse { println!("  Coarse FFT       {:>8.1}s", wc); }
-    println!("  AMR+cfft         {:>8.1}s", wcf);
+    if !skip_cfft   { println!("  AMR+cfft         {:>8.1}s", wcf); }
     if !skip_comp   { println!("  AMR+composite    {:>8.1}s", wco); }
-    if !skip_fine && wcf>0.0 { println!("\n  SPEEDUP: AMR+cfft = {:.1}× vs fine FFT", wf/wcf); }
+    if !skip_fine && wcf>0.0 && !skip_cfft { println!("\n  SPEEDUP: AMR+cfft = {:.1}× vs fine FFT", wf/wcf); }
 
     // ── Trajectory plot (core X/R vs Y/R) ──
     if do_plots {
         let _ = plot_trajectories(out, disk_r,
             &cp_f, &cp_c, &cp_cf, &cp_co,
-            skip_fine, skip_coarse, skip_comp);
+            skip_fine, skip_coarse, skip_cfft, skip_comp);
         let _ = plot_core_vs_time(out, &cp_f, &cp_c, &cp_cf, &cp_co,
-            skip_fine, skip_coarse, skip_comp);
+            skip_fine, skip_coarse, skip_cfft, skip_comp);
     }
 
     println!("\n  OUTPUT: {out}/");
     println!("  core_*.csv         ← core position time series");
     println!("  rmse_log.csv       ← RMSE vs time (requires fine ref)");
-    println!("  regrid_log.csv     ← patch counts + areas at each regrid");
+    println!("  regrid_log.csv     ← cfft patch counts + areas at each regrid");
+    println!("  comp_regrid_log.csv← comp patch counts + areas at each regrid");
     println!("  grid_info.csv      ← grid metadata for Python scripts");
     if do_plots {
         println!("  snap_*.png         ← Rust-rendered snapshots (quick preview)");
@@ -1083,7 +1308,7 @@ fn main() {
       writeln!(f,"Method           | f_gyr(GHz) | Wall(s)  | RMSE vs fine  | Speedup").unwrap();
       if !skip_fine { writeln!(f,"Fine FFT         | {:>10.3} | {:>7.1} | (reference)   | 1.0×",f_fine_ghz,wf).unwrap(); }
       if !skip_coarse { writeln!(f,"Coarse FFT       | {:>10.3} | {:>7.1} | {:.4e}    | {:.1}×",f_coarse_ghz,wc,rf_c.unwrap_or(f64::NAN),if wc>0.0&&!skip_fine{wf/wc}else{f64::NAN}).unwrap(); }
-      writeln!(f,"AMR+cfft         | {:>10.3} | {:>7.1} | {:.4e}    | {:.1}×",f_amr_ghz,wcf,rf_cf.unwrap_or(f64::NAN),if wcf>0.0&&!skip_fine{wf/wcf}else{f64::NAN}).unwrap();
+      if !skip_cfft { writeln!(f,"AMR+cfft         | {:>10.3} | {:>7.1} | {:.4e}    | {:.1}×",f_amr_ghz,wcf,rf_cf.unwrap_or(f64::NAN),if wcf>0.0&&!skip_fine{wf/wcf}else{f64::NAN}).unwrap(); }
       if !skip_comp { writeln!(f,"AMR+composite    | {:>10.3} | {:>7.1} | {:.4e}    | {:.1}×",f_comp_ghz,wco,rf_co.unwrap_or(f64::NAN),if wco>0.0&&!skip_fine{wf/wco}else{f64::NAN}).unwrap(); }
       writeln!(f,"\nGuslienko/Novosad empirical: {fgus:.3} GHz").unwrap();
     }

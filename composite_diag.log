@@ -1,4 +1,5 @@
-    Finished `release` profile [optimized] target(s) in 0.21s
+   Compiling llg-sim v0.1.0 (/Users/helena/RustProjects/llg-sim)
+    Finished `release` profile [optimized] target(s) in 8.71s
      Running `target/release/bench_vortex_gyration --amr-only --plots`
 [composite] V-cycle: auto-enabling PPPM hybrid (radius=14)
 [demag_mg] WARNING: extreme cell aspect ratio 5.3 (dx=3.75e-9, dy=3.75e-9, dz=2.00e-8). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.

@@ -1,0 +1,5 @@
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running `target/release/bench_vortex_gyration --amr-only --plots`
+[demag_mg] WARNING: extreme cell aspect ratio 5.3 (dx=3.75e-9, dy=3.75e-9, dz=2.00e-8). Consider using 7-point stencil (LLG_DEMAG_MG_STENCIL=7) or adjusting n_vac_z for better conditioning.
+[composite] enhanced-RHS mode (default) — set LLG_DEMAG_COMPOSITE_VCYCLE=1 for true composite V-cycle
+[demag_mg] hybrid ΔK DISABLED (pure MG). To enable: set LLG_DEMAG_MG_HYBRID_ENABLE=1 and LLG_DEMAG_MG_HYBRID_RADIUS>0

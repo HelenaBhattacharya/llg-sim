@@ -57,6 +57,7 @@ pub(crate) struct PatchPoissonData {
     /// Cell spacings at this level.
     pub dx: f64,
     pub dy: f64,
+    pub dz: f64,
 }
 
 impl PatchPoissonData {
@@ -74,6 +75,7 @@ impl PatchPoissonData {
             ghost: patch.ghost,
             dx: patch.grid.dx,
             dy: patch.grid.dy,
+            dz: patch.grid.dz,
         }
     }
 
@@ -228,15 +230,22 @@ pub(crate) fn fill_phi_ghosts_from_coarse(
     }
 }
 
-/// Apply the 5-point 2D Laplacian on interior cells of a patch.
+/// Apply the screened 2D Laplacian on interior cells of a patch.
 ///
-/// Writes L(φ)_{i,j} into `out` for all interior cells (ghost..nx-ghost, ghost..ny-ghost).
+/// Computes L(φ) = ∂²φ/∂x² + ∂²φ/∂y² − (2/dz²)φ for all interior cells.
+///
+/// The −(2/dz²)φ screening term is the effective z-coupling at the magnet
+/// layer of a single-layer thin film: the 3D Laplacian at z=offz includes
+/// (φ(k+1) − 2φ(k) + φ(k−1))/dz², and for vacuum neighbors φ(k±1)≈0
+/// this reduces to −2φ/dz².  This makes the 2D patch operator consistent
+/// with the L0 3D MG solver's effective operator at the magnet layer.
+///
 /// Ghost cells in `out` are set to zero.
 /// Ghost values in `phi` are used as boundary data by the stencil.
 #[allow(dead_code)]
 pub(crate) fn laplacian_2d_interior(
     phi: &[f64], nx: usize, ny: usize, ghost: usize,
-    dx: f64, dy: f64,
+    dx: f64, dy: f64, dz: f64,
     out: &mut [f64],
 ) {
     debug_assert_eq!(phi.len(), nx * ny);
@@ -244,6 +253,7 @@ pub(crate) fn laplacian_2d_interior(
 
     let inv_dx2 = 1.0 / (dx * dx);
     let inv_dy2 = 1.0 / (dy * dy);
+    let inv_dz2 = 1.0 / (dz * dz);
 
     out.fill(0.0);
 
@@ -257,12 +267,19 @@ pub(crate) fn laplacian_2d_interior(
             let phi_ym = phi[(j - 1) * nx + i]; // same i, j-1
 
             out[idx] = (phi_xp - 2.0 * phi_c + phi_xm) * inv_dx2
-                     + (phi_yp - 2.0 * phi_c + phi_ym) * inv_dy2;
+                     + (phi_yp - 2.0 * phi_c + phi_ym) * inv_dy2
+                     - 2.0 * inv_dz2 * phi_c;
         }
     }
 }
 
 /// Compute residual r = rhs - L(φ) on interior cells.
+///
+/// Uses the UNSCREENED 2D Laplacian (no z-screening term).
+/// This is correct for the V-cycle path where patch ghost values
+/// from L0 implicitly carry z-information. The screened operator
+/// is used only in the defect correction path (smooth_jacobi_2d
+/// with real dz).
 
 #[allow(dead_code)]
 pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
@@ -285,7 +302,7 @@ pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
     }
 }
 
-/// Weighted Jacobi smoothing on a 2D patch grid.
+/// Weighted Jacobi smoothing on a 2D patch grid (screened Poisson).
 ///
 /// Updates `phi` in place. Ghost cells are NOT modified (they are boundary data
 /// from the coarse level). Only interior cells [ghost..nx-ghost, ghost..ny-ghost]
@@ -295,12 +312,18 @@ pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
 ///
 /// Standard Jacobi update:
 ///   phi_new = phi + ω/diag * (rhs - L(phi))
-/// where diag = -2/dx² - 2/dy² (the centre coefficient of the 5-point stencil).
+/// where diag = -2/dx² - 2/dy² - 2/dz² (screened Poisson diagonal).
+///
+/// The z-screening term −(2/dz²)φ approximates the effective z-coupling
+/// at the magnet layer: the 3D operator at z=offz couples to vacuum
+/// neighbors where φ≈0, giving an effective diagonal contribution of
+/// −2/dz².  This makes the 2D patch operator consistent with the L0 3D
+/// MG solver, improving convergence and robustness at all dz/dx ratios.
 
 pub(crate) fn smooth_jacobi_2d(
     phi: &mut [f64], rhs: &[f64], tmp: &mut [f64],
     nx: usize, ny: usize, ghost: usize,
-    dx: f64, dy: f64, omega: f64, n_iters: usize,
+    dx: f64, dy: f64, dz: f64, omega: f64, n_iters: usize,
 ) {
     debug_assert_eq!(phi.len(), nx * ny);
     debug_assert_eq!(rhs.len(), nx * ny);
@@ -308,7 +331,8 @@ pub(crate) fn smooth_jacobi_2d(
 
     let inv_dx2 = 1.0 / (dx * dx);
     let inv_dy2 = 1.0 / (dy * dy);
-    let diag = -2.0 * inv_dx2 - 2.0 * inv_dy2;
+    let inv_dz2 = 1.0 / (dz * dz);
+    let diag = -2.0 * inv_dx2 - 2.0 * inv_dy2 - 2.0 * inv_dz2;
     let inv_diag = 1.0 / diag;
 
     for _iter in 0..n_iters {
@@ -322,7 +346,8 @@ pub(crate) fn smooth_jacobi_2d(
                 let phi_c = tmp[idx];
                 let lap = (tmp[idx + 1] - 2.0 * phi_c + tmp[idx - 1]) * inv_dx2
                         + (tmp[(j + 1) * nx + i] - 2.0 * phi_c + tmp[(j - 1) * nx + i]) * inv_dy2;
-                let residual = rhs[idx] - lap;
+                // Screened Poisson: L(φ) = ∇²_xy(φ) − (2/dz²)φ
+                let residual = rhs[idx] - (lap - 2.0 * inv_dz2 * phi_c);
                 phi[idx] = phi_c + omega * inv_diag * residual;
             }
         }
@@ -1043,7 +1068,7 @@ fn compute_defect_correction_on_patch(
 
             smooth_jacobi_2d(
                 &mut pd.phi, &defect_rhs, &mut tmp,
-                pnx, pny, ghost, pd.dx, pd.dy,
+                pnx, pny, ghost, pd.dx, pd.dy, pd.dz,
                 omega, this_batch,
             );
 
@@ -1289,7 +1314,7 @@ impl CompositeGridPoisson {
 
                 smooth_jacobi_2d(
                     &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
                     self.vcfg.omega, self.vcfg.n_pre);
 
                 compute_residual_2d(pd);
@@ -1303,7 +1328,7 @@ impl CompositeGridPoisson {
 
             smooth_jacobi_2d(
                 &mut pd.phi, &pd.rhs, &mut pd.residual,
-                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
+                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
                 self.vcfg.omega, self.vcfg.n_pre);
 
             compute_residual_2d(pd);
@@ -1414,7 +1439,7 @@ impl CompositeGridPoisson {
 
             smooth_jacobi_2d(
                 &mut pd.phi, &pd.rhs, &mut pd.residual,
-                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
+                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
                 self.vcfg.omega, self.vcfg.n_post);
         }
 
@@ -1468,7 +1493,7 @@ impl CompositeGridPoisson {
 
                 smooth_jacobi_2d(
                     &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
                     self.vcfg.omega, self.vcfg.n_post);
             }
 
@@ -2062,6 +2087,7 @@ mod phase1_tests {
             ghost: 0,
             dx,
             dy,
+            dz: dx,
         };
 
         // Compute via PatchPoissonData method.
@@ -2107,6 +2133,7 @@ mod phase1_tests {
             ghost,
             dx: 5e-9,
             dy: 5e-9,
+            dz: 5e-9,
         };
 
         // Fill RHS with a known pattern: rhs[j*nx+i] = (i+1) * (j+1)
@@ -2197,6 +2224,7 @@ mod phase1_tests {
             ghost: 0,
             dx,
             dy,
+            dz: dx,
         };
 
         pd.compute_rhs_from_m(&m_data, ms);
@@ -2260,10 +2288,10 @@ mod phase2_tests {
     use super::*;
     use std::f64::consts::PI;
 
-    /// Manufactured solution test: verify the 5-point Laplacian is correct.
+    /// Manufactured solution test: verify the screened 2D Laplacian is correct.
     ///
     /// φ(x,y) = sin(πx/Lx) · sin(πy/Ly)
-    /// L(φ) = -(π²/Lx² + π²/Ly²) · φ
+    /// L(φ) = -(π²/Lx² + π²/Ly² + 2/dz²) · φ
     ///
     /// We set up a grid, fill φ with the exact function, apply the Laplacian,
     /// and check that L(φ) matches the analytical value to O(dx²).
@@ -2274,6 +2302,7 @@ mod phase2_tests {
         let ghost = 2usize;
         let dx = 5e-9;
         let dy = 5e-9;
+        let dz = 5e-9; // isotropic for test
         let lx = (nx - 2 * ghost) as f64 * dx; // physical domain size
         let ly = (ny - 2 * ghost) as f64 * dy;
 
@@ -2288,12 +2317,12 @@ mod phase2_tests {
             }
         }
 
-        // Apply Laplacian
+        // Apply screened Laplacian
         let mut lap = vec![0.0f64; nx * ny];
-        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, &mut lap);
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap);
 
-        // Expected: L(φ) = -(π²/Lx² + π²/Ly²) · φ
-        let expected_factor = -(PI * PI / (lx * lx) + PI * PI / (ly * ly));
+        // Expected: L(φ) = -(π²/Lx² + π²/Ly² + 2/dz²) · φ
+        let expected_factor = -(PI * PI / (lx * lx) + PI * PI / (ly * ly) + 2.0 / (dz * dz));
 
         let mut max_err = 0.0f64;
         let mut max_rel_err = 0.0f64;
@@ -2340,12 +2369,14 @@ mod phase2_tests {
         let ghost = 2usize;
         let dx = 1.0;
         let dy = 1.0;
+        let dz = 1.0; // isotropic for test; screening adds -2/dz² to diagonal
         let n_int_x = nx - 2 * ghost;
         let n_int_y = ny - 2 * ghost;
         let lx = n_int_x as f64;
         let ly = n_int_y as f64;
 
-        let expected_factor = -(PI * PI / (lx * lx) + PI * PI / (ly * ly));
+        // Screened Poisson: L(φ) = -(π²/lx² + π²/ly² + 2/dz²) × φ
+        let expected_factor = -(PI * PI / (lx * lx) + PI * PI / (ly * ly) + 2.0 / (dz * dz));
         let mut rhs = vec![0.0f64; nx * ny];
         let mut phi_exact = vec![0.0f64; nx * ny];
         for j in 0..ny {
@@ -2374,7 +2405,7 @@ mod phase2_tests {
 
         // Measure residual BEFORE any smoothing (should be large).
         let mut lap_before = vec![0.0f64; nx * ny];
-        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, &mut lap_before);
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap_before);
         let mut res_before = 0.0f64;
         for j in ghost..(ny - ghost) {
             for i in ghost..(nx - ghost) {
@@ -2384,11 +2415,11 @@ mod phase2_tests {
         }
 
         // Run 50 iterations (typical: 2-4 per V-cycle level, but 50 to see clear reduction).
-        smooth_jacobi_2d(&mut phi, &rhs, &mut tmp, nx, ny, ghost, dx, dy, omega, 50);
+        smooth_jacobi_2d(&mut phi, &rhs, &mut tmp, nx, ny, ghost, dx, dy, dz, omega, 50);
 
         // Measure residual AFTER.
         let mut lap_after = vec![0.0f64; nx * ny];
-        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, &mut lap_after);
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap_after);
         let mut res_after = 0.0f64;
         for j in ghost..(ny - ghost) {
             for i in ghost..(nx - ghost) {
@@ -2404,10 +2435,8 @@ mod phase2_tests {
             res_before, res_after, reduction, 1.0 / reduction
         );
 
-        // The residual must decrease. For 50 Jacobi iterations on a 30×30 grid,
-        // even the slowest mode (k=1) reduces by 0.9966^50 ≈ 0.84.
-        // High-frequency modes reduce by (1/3)^50 ≈ 0 (effectively eliminated).
-        // Overall max-norm residual should drop by at least 2× in 50 iters.
+        // The residual must decrease. With z-screening the diagonal is larger,
+        // so Jacobi converges faster than the unscreened case.
         assert!(
             reduction < 0.95,
             "Jacobi should reduce residual: before={:.3e}, after={:.3e}, ratio={:.4}",
@@ -2415,9 +2444,9 @@ mod phase2_tests {
         );
 
         // Run 500 more iterations and check further reduction.
-        smooth_jacobi_2d(&mut phi, &rhs, &mut tmp, nx, ny, ghost, dx, dy, omega, 500);
+        smooth_jacobi_2d(&mut phi, &rhs, &mut tmp, nx, ny, ghost, dx, dy, dz, omega, 500);
         let mut lap_final = vec![0.0f64; nx * ny];
-        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, &mut lap_final);
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap_final);
         let mut res_final = 0.0f64;
         for j in ghost..(ny - ghost) {
             for i in ghost..(nx - ghost) {
@@ -2541,6 +2570,7 @@ mod phase2_tests {
         let ghost = 2usize;
         let dx = 1.0;
         let dy = 1.0;
+        let dz = 1e30; // dz stored in struct but compute_residual_2d is unscreened
 
         let mut pd = PatchPoissonData {
             phi: vec![0.0; nx * ny],
@@ -2551,6 +2581,7 @@ mod phase2_tests {
             ghost,
             dx,
             dy,
+            dz,
         };
 
         // Set phi and rhs to known values.
@@ -2568,8 +2599,8 @@ mod phase2_tests {
         // phi = i*j, so:
         //   d²phi/dx² = 0 (phi is linear in i at fixed j)
         //   d²phi/dy² = 0 (phi is linear in j at fixed i)
-        //   L(phi) = 0 everywhere in the interior
-        //   residual = rhs - L(phi) = 1.0 - 0.0 = 1.0
+        //   L(phi) = 0 everywhere in the interior (unscreened 2D Laplacian)
+        //   residual = rhs - L(phi) = 1.0
         for j in ghost..(ny - ghost) {
             for i in ghost..(nx - ghost) {
                 let idx = j * nx + i;
