@@ -281,13 +281,16 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
     writeln!(w, "t_s,mx,my,mz")?;
 
     // Write t=0 AFTER relax (this matches MuMax: table starts at start of Run)
+    let mut prev_mx: f64;
     {
         let [mx, my, mz] = avg_vec(&m);
         writeln!(w, "{:.16e},{:.16e},{:.16e},{:.16e}", 0.0, mx, my, mz)?;
+        prev_mx = mx;
     }
 
     let tol_time = 1e-18_f64;
     let mut t: f64 = 0.0;
+    let mut crossover_saved = false;
 
     // MuMax AutoSave(m, 100e-12) equivalent: write m0000000.ovf .. m0000010.ovf
     // at t = 0, 0.1ns, 0.2ns, ..., 1.0ns (11 snapshots total).
@@ -331,6 +334,19 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
         let [mx, my, mz] = avg_vec(&m);
         writeln!(w, "{:.16e},{:.16e},{:.16e},{:.16e}", t, mx, my, mz)?;
 
+        // Detect <mx>=0 crossover and save a one-off OVF (does NOT affect regular m0000xxx sequence)
+        if !crossover_saved && prev_mx > 0.0 && mx <= 0.0 {
+            let cross_path = out_dir.join("m_mx_zero.ovf");
+            let meta = OvfMeta::magnetization().with_total_sim_time(t);
+            write_ovf2_rectangular_text(&cross_path, &grid, &m, &meta)?;
+            println!(
+                "SP4{} wrote mx=0 crossover OVF at t={:.6e} s (prev_mx={:.6e}, mx={:.6e})",
+                case.to_ascii_uppercase(), t, prev_mx, mx
+            );
+            crossover_saved = true;
+        }
+        prev_mx = mx;
+
         // Write OVF snapshot every 100 ps (i.e. every 10 table samples)
         if k % ovf_stride == 0 {
             write_sp4_ovf_snapshot(&out_dir, ovf_idx, t, &grid, &m)?;
@@ -344,5 +360,11 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
         out_dir.join("table.csv"),
         ovf_idx
     );
+    if !crossover_saved {
+        println!(
+            "SP4{} WARNING: <mx>=0 crossover was NOT detected during the 1 ns run",
+            case.to_ascii_uppercase()
+        );
+    }
     Ok(())
 }

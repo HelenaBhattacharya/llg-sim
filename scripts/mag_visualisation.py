@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 
 import discretisedfield as df
@@ -633,9 +634,14 @@ def plot_abd_triptych(
     cbar_ab = fig.colorbar(im0, cax=cax_ab, orientation="horizontal")
     cbar_ab.set_label(cbar_label_ab)
 
-    # Colorbar for Δ (separate scale)
+    # Colorbar for Δ (separate scale) — explicit ticks for clean labels
     cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
     cbar_d.set_label(cbar_label_d)
+    if d_clim:
+        d_abs = max(abs(d_clim[0]), abs(d_clim[1]))
+        ticks = [-d_abs, -d_abs / 2, 0.0, d_abs / 2, d_abs]
+        cbar_d.set_ticks(ticks)
+        cbar_d.ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.3f}"))
 
     # Manual spacing (avoid tight_layout warnings with colorbar axes)
     fig.subplots_adjust(top=0.88, bottom=0.14)
@@ -815,6 +821,11 @@ def plot_abd_triptych_arrays(
 
     cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
     cbar_d.set_label(cbar_label_d)
+    if d_clim:
+        d_abs2 = max(abs(d_clim[0]), abs(d_clim[1]))
+        ticks2 = [-d_abs2, -d_abs2 / 2, 0.0, d_abs2 / 2, d_abs2]
+        cbar_d.set_ticks(ticks2)
+        cbar_d.ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.3f}"))
 
     fig.subplots_adjust(top=0.88, bottom=0.14)
 
@@ -970,6 +981,27 @@ def _frame_label_sp4(series: ovf_utils.OvfSeries, idx: int) -> str:
     if t_s is not None:
         return f"t={t_s * 1e9:.3f} ns"
     return p.stem
+
+
+def _find_crossover_ovf(root: Path, case: str) -> Optional[Path]:
+    """Search for m_mx_zero.ovf under an SP4 input tree.
+
+    Tries several common layouts:
+      root/sp4a_rust/m_mx_zero.ovf
+      root/sp4a_out/m_mx_zero.ovf
+      root/sp4a/m_mx_zero.ovf
+      root/m_mx_zero.ovf   (if root IS the case dir)
+    """
+    candidates = [
+        root / f"{case}_rust" / "m_mx_zero.ovf",
+        root / f"{case}_out" / "m_mx_zero.ovf",
+        root / case / "m_mx_zero.ovf",
+        root / "m_mx_zero.ovf",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
 
 
 def export_series_frames(
@@ -1618,6 +1650,29 @@ def main() -> int:
         ),
     )
 
+    p.add_argument(
+        "--crossover",
+        action="store_true",
+        help=(
+            "Export a single A/B/Δ triptych at the <mx>=0 crossover point. "
+            "Looks for m_mx_zero.ovf in both --input (A) and --input-b (B). "
+            "Requires --input-b. Output uses --components and --clim as usual."
+        ),
+    )
+
+    p.add_argument(
+        "--delta-clim",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("VMIN", "VMAX"),
+        help=(
+            "Fixed colour limits for the Δ panel in triptych/crossover plots. "
+            "Example: --delta-clim -0.01 0.01. "
+            "If omitted, Δ is autoscaled (--clim auto) or shares A/B limits (--clim -1 1)."
+        ),
+    )
+
     args = p.parse_args()
 
     input_a = Path(args.input)
@@ -1645,6 +1700,76 @@ def main() -> int:
     problem = ovf_utils.detect_problem(input_a) if args.problem == "auto" else args.problem
 
     do_compare = bool(args.compare) or bool(args.compare_abd)
+
+    # Parse --delta-clim into a tuple (used by crossover and compare-abd)
+    delta_clim_arg: Optional[Tuple[float, float]] = None
+    if args.delta_clim is not None:
+        delta_clim_arg = (float(args.delta_clim[0]), float(args.delta_clim[1]))
+
+    # ------------------------------------------------------------------
+    # Crossover triptych (one-shot: compare m_mx_zero.ovf from A vs B)
+    # ------------------------------------------------------------------
+    if args.crossover:
+        if not args.input_b:
+            raise SystemExit("--crossover requires --input-b")
+        input_b_cross = Path(args.input_b)
+        if not input_b_cross.exists():
+            raise SystemExit(f"Input-B path does not exist: {input_b_cross}")
+
+        comps = _normalise_components(args.components)
+
+        if args.case == "both":
+            cases = ["sp4a", "sp4b"]
+        else:
+            cases = [args.case]
+
+        source_a_str = ovf_utils.infer_source(input_a) if args.source == "auto" else args.source
+        source_b_str = ovf_utils.infer_source(input_b_cross) if args.source == "auto" else args.source
+
+        for case_name in cases:
+            ovf_a = _find_crossover_ovf(input_a, case_name)
+            ovf_b = _find_crossover_ovf(input_b_cross, case_name)
+            if ovf_a is None:
+                print(f"[crossover] m_mx_zero.ovf not found under {input_a} for {case_name}")
+                continue
+            if ovf_b is None:
+                print(f"[crossover] m_mx_zero.ovf not found under {input_b_cross} for {case_name}")
+                continue
+
+            print(f"[crossover] Loading A: {ovf_a}")
+            print(f"[crossover] Loading B: {ovf_b}")
+            a_field = ovf_utils.load_slice_field(ovf_a)
+            b_field = ovf_utils.load_slice_field(ovf_b)
+
+            t_a = ovf_utils.try_parse_time_seconds_from_ovf(ovf_a)
+            t_b = ovf_utils.try_parse_time_seconds_from_ovf(ovf_b)
+            t_label_a = f"t={t_a * 1e9:.3f}ns" if t_a is not None else "t=?"
+            t_label_b = f"t={t_b * 1e9:.3f}ns" if t_b is not None else "t=?"
+
+            for comp in comps:
+                title = (
+                    f"SP4 {case_name} {source_a_str} vs {source_b_str}  "
+                    f"mx=0 crossover  (A:{t_label_a}, B:{t_label_b})  ({comp})"
+                )
+                out_png = (
+                    out_root / "compare_abd" / "sp4"
+                    / f"{source_a_str}_vs_{source_b_str}"
+                    / case_name / "crossover" / f"mx_zero_{comp}.png"
+                )
+                plot_abd_triptych(
+                    a_field, b_field,
+                    comp=comp, out_path=out_png, title=title,
+                    clim=clim,
+                    delta_clim=delta_clim_arg,
+                    show_arrows=bool(args.vectors),
+                    units=args.units,
+                )
+                print(f"  wrote {out_png}")
+
+        print("Done (crossover).")
+        if not do_compare:
+            return 0
+
     if do_compare:
         if not args.input_b:
             raise SystemExit("--compare/--compare-abd requires --input-b")
@@ -1809,5 +1934,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

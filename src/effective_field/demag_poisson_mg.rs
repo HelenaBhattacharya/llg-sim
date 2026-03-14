@@ -166,10 +166,10 @@ impl Default for DemagPoissonMGConfig {
         Self {
             pad_xy: 6,
             n_vac_z: 16,
-            v_cycles: 16,
-            v_cycles_max: 80,
+            v_cycles: 4,        // minimum cycles (warm-start usually converges in 4-6)
+            v_cycles_max: 64,   // maximum for hard solves (first timestep, post-regrid)
             tol_abs: None,
-            tol_rel: None,
+            tol_rel: Some(1e-6), // relative residual tolerance
             pre_smooth: 2,
             post_smooth: 2,
             smoother: MGSmoother::WeightedJacobi,
@@ -1948,7 +1948,7 @@ impl DemagPoissonMG {
 
         let solve_ns = t_solve.elapsed().as_nanos() as u64;
 
-        if use_tol {
+        if use_tol && mg_timing_enabled() {
             let max_r = Self::compute_residual(&mut self.levels[0]);
             eprintln!(
                 "[demag_mg] max_residual={:.3e}  rhs_max={:.3e}  tol_target={:.3e}  (min_cycles={}, max_cycles={})",

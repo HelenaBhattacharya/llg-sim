@@ -16,4 +16,29 @@ TableAutoSave(10e-12)
 AutoSave(m, 100e-12)
 
 B_ext = Vector(-24.6e-3, 4.3e-3, 0)
-Run(1e-9)
+
+// Run 1 ns in 10 ps steps, saving an extra OVF at the <mx>=0 crossover.
+// AutoSave(m, 100e-12) still fires at regular 0.1 ns intervals as usual.
+// The crossover OVF is saved separately as m_mx_zero.ovf via SaveAs,
+// so it does NOT disturb the regular m0000000..m0000010 numbering.
+
+prev_mx := m.Average()[0]
+crossover_saved := false
+
+for i := 0; i < 100; i++ {
+	Run(10e-12)
+	curr_mx := m.Average()[0]
+	if !crossover_saved && prev_mx > 0 && curr_mx <= 0 {
+		SaveAs(m, "m_mx_zero")
+		print(">>> mx=0 crossover detected at step ", i+1,
+		      ", t = ", (i+1)*10e-12*1e9, " ns",
+		      ", prev_mx = ", prev_mx,
+		      ", curr_mx = ", curr_mx)
+		crossover_saved = true
+	}
+	prev_mx = curr_mx
+}
+
+if !crossover_saved {
+	print("WARNING: <mx>=0 crossover was NOT detected during the 1 ns run")
+}

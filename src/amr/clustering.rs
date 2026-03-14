@@ -1506,8 +1506,12 @@ mod tests {
         // coverage exceeds 50%.  This verifies the cap checks the correct
         // (post-dilation) metric.
         //
-        // Sparse features on a 64×64 grid with buffer_cells=6 → dilation
-        // roughly doubles the flagged area.
+        // Features on a 64×64 grid with buffer_cells=6 and step_by(16)
+        // spacing → 13-cell gaps between 3×3 features, wider than 2×buffer=12,
+        // so dilation does NOT bridge gaps.  Feature strengths vary with
+        // distance from grid centre, giving the cap threshold discrimination:
+        // raising the threshold eliminates weak edge features while keeping
+        // strong centre features.
         let nx = 64;
         let ny = 64;
         let mut f = make_field(nx, ny);
@@ -1515,14 +1519,20 @@ mod tests {
         for v in f.data.iter_mut() {
             *v = [0.0, 0.0, 1.0];
         }
-        // Scatter many small features so pre-dilation coverage is ~30%
-        // but post-dilation (buffer=6) expands to ~60%.
-        for j in (4..ny - 4).step_by(8) {
-            for i in (4..nx - 4).step_by(8) {
-                // 3×3 patch of +x at each grid point.
+        // Scatter features with varying gradient strength.
+        let cx = nx as f64 / 2.0;
+        let cy = ny as f64 / 2.0;
+        let max_dist = cx.hypot(cy);
+        for j in (4..ny - 4).step_by(16) {
+            for i in (4..nx - 4).step_by(16) {
+                // Strength varies: 1.0 at centre, 0.2 at corners.
+                let dist = ((i as f64 + 1.5 - cx).powi(2)
+                          + (j as f64 + 1.5 - cy).powi(2)).sqrt();
+                let strength = (1.0 - 0.8 * (dist / max_dist)).max(0.2);
+                let mz = (1.0 - strength * strength).sqrt().max(0.0);
                 for dj in 0..3 {
                     for di in 0..3 {
-                        set_cell(&mut f, i + di, j + dj, [1.0, 0.0, 0.0]);
+                        set_cell(&mut f, i + di, j + dj, [strength, 0.0, mz]);
                     }
                 }
             }
