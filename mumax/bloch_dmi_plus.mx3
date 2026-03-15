@@ -1,0 +1,34 @@
+// mumax/bloch_dmi_plus.mx3
+//
+// Bloch wall with interfacial DMI: D = +1e-4 J/m²
+// Matches src/bin/bloch_dmi.rs parameters exactly.
+//
+// Run on SCARF:
+//   mumax3 -http "" -o Dplus_out bloch_dmi_plus.mx3
+
+SetGridSize(256, 64, 1)
+SetCellSize(5e-9, 5e-9, 5e-9)
+
+Msat  = 8e5
+Aex   = 13e-12
+Ku1   = 500
+anisU = vector(0, 0, 1)
+Dind  = 1e-4          // interfacial DMI (J/m²)
+
+// Disable demag to match Rust benchmark
+NoDemagSpins.Set(1)
+
+// No external field
+B_ext = vector(0, 0, 0)
+
+// High damping for relaxation
+alpha = 0.5
+
+// Initial condition: Bloch-like domain wall at centre
+m = TwoDomain(0, 0, -1,   0, 1, 0,   0, 0, 1)
+
+// Relax to equilibrium
+Relax()
+
+// Save full magnetisation
+SaveAs(m, "m_final_Dplus")

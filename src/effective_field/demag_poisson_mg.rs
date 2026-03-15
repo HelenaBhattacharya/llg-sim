@@ -2380,7 +2380,10 @@ impl DemagPoissonMGHybrid {
             }
             let rhs_ns = t_rhs.elapsed().as_nanos() as u64;
 
-            if self.hyb.enabled() && self.mg.cfg.warm_start {
+            // Cold start: clear phi on ALL levels when warm_start is OFF.
+            // When warm_start is ON (default), keep previous phi as initial guess —
+            // this gives 5–10× fewer V-cycles per solve during dynamics.
+            if self.hyb.enabled() && !self.mg.cfg.warm_start {
                 for lev in &mut self.mg.levels {
                     lev.phi.fill(0.0);
                 }
@@ -2416,7 +2419,7 @@ impl DemagPoissonMGHybrid {
         if self.hyb.sigma_cells > 0.0 {
             screen_rhs_gaussian_xy(&mut self.mg.levels[0], self.hyb.sigma_cells);
         }
-        if self.mg.cfg.warm_start {
+        if !self.mg.cfg.warm_start {
             for lev in &mut self.mg.levels {
                 lev.phi.fill(0.0);
             }
@@ -2474,7 +2477,9 @@ impl DemagPoissonMGHybrid {
         if self.hyb.enabled() && self.hyb.sigma_cells > 0.0 {
             screen_rhs_gaussian_xy(&mut self.mg.levels[0], self.hyb.sigma_cells);
         }
-        if self.hyb.enabled() && self.mg.cfg.warm_start {
+        // Cold start: clear phi when warm_start is OFF.
+        // When warm_start is ON, keep previous phi for fast convergence.
+        if self.hyb.enabled() && !self.mg.cfg.warm_start {
             for lev in &mut self.mg.levels {
                 lev.phi.fill(0.0);
             }
@@ -2495,6 +2500,62 @@ impl DemagPoissonMGHybrid {
                 dk.add_correction(coarse_m, b_out, mat.ms);
             }
         }
+    }
+
+    /// Solve 3D Poisson from coarse M WITHOUT PPPM correction.
+    ///
+    /// Used by the composite solver when patches provide near-field
+    /// accuracy through defect correction. L0 MG gives the smooth
+    /// far-field; PPPM is not needed because patches handle near-field.
+    pub(crate) fn solve_plain(
+        &mut self,
+        coarse_m: &VectorField2D,
+        b_out: &mut VectorField2D,
+        mat: &Material,
+    ) {
+        self.mg.build_rhs_from_m(coarse_m, mat.ms);
+        self.mg.update_finest_boundary_bc();
+        self.mg.levels[0].enforce_dirichlet();
+        self.mg.solve();
+        b_out.set_uniform(0.0, 0.0, 0.0);
+        self.mg.add_b_from_phi_on_magnet_layer(coarse_m, mat.ms, b_out);
+    }
+
+    /// Solve with injected corrections but WITHOUT PPPM.
+    ///
+    /// Used by the composite V-cycle: restricted patch residuals are
+    /// injected into L0 RHS. No screening, no ΔK.
+    pub(crate) fn solve_plain_with_corrections(
+        &mut self,
+        coarse_m: &VectorField2D,
+        corrections: &[(usize, f64)],
+        b_out: &mut VectorField2D,
+        mat: &Material,
+    ) {
+        self.mg.build_rhs_from_m(coarse_m, mat.ms);
+
+        if !corrections.is_empty() {
+            let nx_m = self.mg.grid.nx;
+            let offx = self.mg.offx;
+            let offy = self.mg.offy;
+            let offz = self.mg.offz;
+            let px = self.mg.px;
+            let py = self.mg.py;
+            let rhs = &mut self.mg.levels[0].rhs;
+            for &(cell_idx, delta) in corrections {
+                let ci = cell_idx % nx_m;
+                let cj = cell_idx / nx_m;
+                let pi = offx + ci;
+                let pj = offy + cj;
+                rhs[idx3(pi, pj, offz, px, py)] += delta;
+            }
+        }
+
+        self.mg.update_finest_boundary_bc();
+        self.mg.levels[0].enforce_dirichlet();
+        self.mg.solve();
+        b_out.set_uniform(0.0, 0.0, 0.0);
+        self.mg.add_b_from_phi_on_magnet_layer(coarse_m, mat.ms, b_out);
     }
 }
 
