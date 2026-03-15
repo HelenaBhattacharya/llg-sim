@@ -1,6 +1,6 @@
 // mumax/bloch_dmi_minus.mx3
 //
-// Bloch wall with interfacial DMI: D = -1e-4 J/m²
+// Domain wall with interfacial DMI: D = -1e-4 J/m²
 // Matches src/bin/bloch_dmi.rs parameters exactly.
 //
 // Run on SCARF:
@@ -16,7 +16,7 @@ anisU = vector(0, 0, 1)
 Dind  = -1e-4         // interfacial DMI (J/m²), opposite sign
 
 // Disable demag to match Rust benchmark
-NoDemagSpins.Set(1)
+EnableDemag = false
 
 // No external field
 B_ext = vector(0, 0, 0)
@@ -24,8 +24,9 @@ B_ext = vector(0, 0, 0)
 // High damping for relaxation
 alpha = 0.5
 
-// Initial condition: same as +D case
-m = TwoDomain(0, 0, -1,   0, 1, 0,   0, 0, 1)
+// Initial condition: Néel-like domain wall at centre.
+// For -D: chirality flips, so mx < 0 at wall centre.
+m = TwoDomain(0, 0, -1,   -1, 0, 0,   0, 0, 1)
 
 // Relax to equilibrium
 Relax()

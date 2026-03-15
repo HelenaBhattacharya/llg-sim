@@ -1,8 +1,8 @@
 // -----------------------------------------------------------------------------
-// Bloch wall with interfacial DMI (chirality benchmark)
+// Domain wall with interfacial DMI (chirality benchmark)
 //
 // Tests:
-//   - Chirality selection by DMI
+//   - Chirality selection by DMI sign
 //   - Chirality flip for D -> -D
 //
 // Run:
@@ -13,9 +13,20 @@
 // python3 scripts/bloch_dmi_analysis.py \
 //   --dplus  out/bloch_dmi/Dplus \
 //   --dminus out/bloch_dmi/Dminus
+//
 // Physics:
 //   Exchange + uniaxial anisotropy + interfacial DMI
 //   Demag: OFF
+//
+//   Interfacial DMI favours Néel walls (mx rotation in x–z plane).
+//   The initial condition seeds a Néel wall with chirality matching the
+//   DMI sign, so both Rust (full LLG) and MuMax3 (Relax, no precession)
+//   converge to the same equilibrium.
+//
+//   Note: a Bloch (my) seed would also converge under full LLG dynamics,
+//   but MuMax3's Relax() disables precession, making the Bloch state a
+//   fixed point of the damping-only torque.  Using a Néel seed avoids
+//   this subtlety and produces a clean code-to-code comparison.
 //
 // Output:
 //   out/bloch_dmi/Dplus/
@@ -78,21 +89,24 @@ fn main() -> std::io::Result<()> {
     let grid = Grid2D::new(nx, ny, dx, dy, dz);
 
     // Material
+    let dmi = dmi_value_for_sign(&sign);
     let material = Material {
         ms: 8.0e5,
         a_ex: 13e-12,
         k_u: 500.0,
         easy_axis: [0.0, 0.0, 1.0],
-        dmi: Some(dmi_value_for_sign(&sign)),
+        dmi: Some(dmi),
         demag: false,
         demag_method: DemagMethod::FftUniform,
     };
 
-    // Initial Bloch wall (y–z rotation)
+    // Initial Néel wall (x–z rotation), chirality matches DMI sign.
+    // +D → mx > 0 at wall centre;  -D → mx < 0.
     let mut m = VectorField2D::new(grid);
     let x0 = 0.5 * nx as f64 * dx;
     let width = 40.0 * dx;
-    m.init_bloch_wall_y(x0, width, 1.0);
+    let chirality = if dmi >= 0.0 { 1.0 } else { -1.0 };
+    m.init_neel_wall_x(x0, width, chirality);
 
     // Relaxation parameters
     let params = LLGParams {
@@ -107,6 +121,17 @@ fn main() -> std::io::Result<()> {
 
     let out_dir = out_dir_for_sign(&sign);
     create_dir_all(&out_dir)?;
+
+    // Write config.json so analysis scripts can label plots
+    {
+        let cfg_path = out_dir.join("config.json");
+        let mut f = BufWriter::new(File::create(cfg_path)?);
+        write!(
+            f,
+            "{{\"fields\": {{\"dmi\": {:.6e}}}, \"sign\": \"{}\"}}",
+            dmi, sign
+        )?;
+    }
 
     // Relax
     for _ in 0..n_steps {
@@ -123,6 +148,6 @@ fn main() -> std::io::Result<()> {
     // Save slice
     write_midrow_slice(&m, &grid, &out_dir.join("rust_slice_final.csv"))?;
 
-    println!("Wrote Bloch–DMI slice to {:?}", out_dir);
+    println!("Wrote DMI wall slice to {:?}", out_dir);
     Ok(())
 }

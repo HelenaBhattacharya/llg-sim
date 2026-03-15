@@ -1,6 +1,6 @@
 // mumax/bloch_dmi_plus.mx3
 //
-// Bloch wall with interfacial DMI: D = +1e-4 J/m²
+// Domain wall with interfacial DMI: D = +1e-4 J/m²
 // Matches src/bin/bloch_dmi.rs parameters exactly.
 //
 // Run on SCARF:
@@ -16,7 +16,7 @@ anisU = vector(0, 0, 1)
 Dind  = 1e-4          // interfacial DMI (J/m²)
 
 // Disable demag to match Rust benchmark
-NoDemagSpins.Set(1)
+EnableDemag = false
 
 // No external field
 B_ext = vector(0, 0, 0)
@@ -24,8 +24,12 @@ B_ext = vector(0, 0, 0)
 // High damping for relaxation
 alpha = 0.5
 
-// Initial condition: Bloch-like domain wall at centre
-m = TwoDomain(0, 0, -1,   0, 1, 0,   0, 0, 1)
+// Initial condition: Néel-like domain wall at centre.
+// Interfacial DMI favours Néel walls (mx rotation) over Bloch (my).
+// MuMax3's Relax() disables precession, so it cannot rotate a
+// Bloch seed towards Néel.  Seed with the correct wall type.
+// For +D: mx > 0 at the wall centre.
+m = TwoDomain(0, 0, -1,   1, 0, 0,   0, 0, 1)
 
 // Relax to equilibrium
 Relax()

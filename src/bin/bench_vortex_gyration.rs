@@ -201,6 +201,30 @@ fn find_core(m: &VectorField2D, mask: Option<&[bool]>) -> (f64, f64, f64) {
 }
 
 // =========================================================================
+// Vacuum contamination check (Fix 0 diagnostic)
+// =========================================================================
+
+/// Check that L0 coarse grid has no non-zero M in vacuum cells.
+/// Returns the count of contaminated cells.
+fn check_vacuum_contamination(label: &str, h: &AmrHierarchy2D) -> usize {
+    let (n_cont, n_vac) = h.count_coarse_vacuum_contamination();
+    let n_total = h.base_grid.n_cells();
+    let n_mat = n_total - n_vac;
+    if n_cont > 0 {
+        eprintln!(
+            "  [WARN] {}: {} contaminated vacuum cells on L0 ({} material / {} vacuum / {} total)",
+            label, n_cont, n_mat, n_vac, n_total
+        );
+    } else {
+        println!(
+            "  [geom OK] {}: L0 clean ({} material / {} vacuum / {} total)",
+            label, n_mat, n_vac, n_total
+        );
+    }
+    n_cont
+}
+
+// =========================================================================
 // Frequency extraction from core trajectory
 // =========================================================================
 
@@ -524,17 +548,19 @@ fn main() {
     // GUSLIENKO PARAMETERS (J. Appl. Phys. 91, 8037, 2002)
     // =====================================================================
 
-    // Geometry: 200 nm disk, dz = 3.75 nm (cubic cells) → β = dz/R = 0.0375
-    // At β ≈ 0.04, Guslienko eigenfrequency ≈ 139 MHz (Novosad empirical: 3.7×β GHz)
-    let disk_r = 100.0e-9;   // R = 100 nm
-    let dz = 7.5e-9;        // cubic cells: dz = dx = dy = 3.75 nm
-    let domain = 300.0e-9;   // 50% padding — 50nm vacuum gap = 13 cells at dx=3.75nm
-                              // This ensures buffer_cells=4 dilation CANNOT bridge the gap,
-                              // so confine_dilation=true produces clean arc patches at the
-                              // boundary without strangling core tracking.
+    // LEE et al. REPLICA (Phys. Rev. B 76, 174410, 2007)
+    // 300 nm diameter Py disk, L = 10 nm, β = L/R = 0.067
+    // Lee measured ν₀ = 330 MHz with OOMMF (cells 2×2×10 nm)
+    // We use dx = dy = 3.75 nm (close to Lee's 2nm) with AMR refinement
+    // If we get ~330 MHz → code is correct, 200nm/7.5nm setup has a problem
+    // If we get ~660 MHz → systematic 2× error in demag
+    let disk_r = 150.0e-9;   // R = 150 nm (2R = 300 nm, same as Lee)
+    let dz = 10.0e-9;        // L = 10 nm (same as Lee)
+    let domain = 450.0e-9;   // 50% padding — 75nm vacuum gap = 20 cells at dx=3.75nm
 
-    // Grid: 64² base → dx ≈ 3.75 nm (< l_ex ≈ 5.7 nm ✓)
-    let bnx = 80_usize; let bny = 80;  // 80² base → dx = 3.75 nm (same as 64² on 240nm)
+    // Grid: 120² base → dx = 3.75 nm (< l_ex ≈ 5.7 nm ✓)
+    // Vacuum gap = 75nm = 20 cells per side — safe for boundary_layer=4
+    let bnx = 120_usize; let bny = 120;
     let dx = domain / bnx as f64;
     let dy = dx;
     let ratio = 2_usize; let ghost = 2;
@@ -644,6 +670,16 @@ fn main() {
         let mut h = AmrHierarchy2D::new(bg, mk_coarse(), ratio, ghost);
         h.set_geom_shape(disk.clone()); Some(h)
     } else { None };
+
+    // --- Checkpoint 1: verify geometry mask zeroed vacuum on L0 after init ---
+    {
+        let nc = check_vacuum_contamination("cfft after set_geom_shape", &h_cf);
+        assert!(nc == 0, "FATAL: cfft L0 has {} non-zero vacuum cells after set_geom_shape", nc);
+    }
+    if let Some(ref hc) = h_co {
+        let nc = check_vacuum_contamination("comp after set_geom_shape", hc);
+        assert!(nc == 0, "FATAL: comp L0 has {} non-zero vacuum cells after set_geom_shape", nc);
+    }
 
     // Steppers
     let mut st_cf = if !skip_cfft {
@@ -766,6 +802,16 @@ fn main() {
     }
     println!("  Vortex ground state reached.");
 
+    // --- Checkpoint 2: verify no vacuum contamination after Phase 1 ---
+    {
+        let nc = check_vacuum_contamination("cfft post-Phase1-relax", &h_cf);
+        if nc > 0 { eprintln!("  WARNING: vacuum contamination re-appeared after Phase 1!"); }
+    }
+    if let Some(ref hc) = h_co {
+        let nc = check_vacuum_contamination("comp post-Phase1-relax", hc);
+        if nc > 0 { eprintln!("  WARNING: vacuum contamination re-appeared after Phase 1!"); }
+    }
+
     // Save equilibrium snapshot (patch map + magnetisation at ground state)
     if do_plots {
         // Grid metadata for Python (always useful)
@@ -879,6 +925,16 @@ fn main() {
             } else { String::new() };
             println!("  field-relax {step}/{field_relax_steps} ({tps:.0}ps) {fine_str}{coarse_str}{cfft_str}{comp_str}");
         }
+    }
+
+    // --- Checkpoint 3: verify no vacuum contamination after Phase 2 ---
+    {
+        let nc = check_vacuum_contamination("cfft post-Phase2-field-relax", &h_cf);
+        if nc > 0 { eprintln!("  WARNING: vacuum contamination after Phase 2!"); }
+    }
+    if let Some(ref hc) = h_co {
+        let nc = check_vacuum_contamination("comp post-Phase2-field-relax", hc);
+        if nc > 0 { eprintln!("  WARNING: vacuum contamination after Phase 2!"); }
     }
 
     // Regrid before dynamics

@@ -106,6 +106,11 @@ impl AmrHierarchy2D {
                 p.rebuild_active_from_shape(&self.base_grid, shape_ref);
             }
         }
+
+        // Zero vacuum cells on L0 — critical for correct demag.
+        // The coarse field may have been initialised with a full-domain pattern
+        // (e.g. init_vortex) before the geometry was set.
+        self.apply_geom_mask_to_coarse();
     }
 
     /// Set (or replace) the geometry mask on the base grid (boolean, coarse-resolution).
@@ -130,6 +135,9 @@ impl AmrHierarchy2D {
                 p.rebuild_active_from_coarse_mask(&self.base_grid, gm);
             }
         }
+
+        // Zero vacuum cells on L0 (same rationale as in set_geom_shape).
+        self.apply_geom_mask_to_coarse();
     }
 
     /// Clear any geometry mask / shape.
@@ -164,6 +172,71 @@ impl AmrHierarchy2D {
     #[inline]
     pub fn has_geom_mask(&self) -> bool {
         self.geom_mask.is_some()
+    }
+
+    /// Zero magnetisation at vacuum cells on the coarse (L0) grid.
+    ///
+    /// **This must be called after any operation that can leave non-zero M in
+    /// vacuum cells on the coarse grid**, including:
+    ///   - Initial vortex/uniform state setup (fills the whole box)
+    ///   - Restriction from patches (only overwrites cells under patches)
+    ///
+    /// Without this, cells outside patch coverage but outside the disk geometry
+    /// retain whatever value they had — typically the initial vortex pattern —
+    /// creating a spurious magnetised region that corrupts the demag field.
+    ///
+    /// The mask is the boolean `geom_mask` stored by `set_geom_shape` or
+    /// `set_geom_mask`.  Cells where `mask[idx] == false` get `m = (0,0,0)`.
+    pub fn apply_geom_mask_to_coarse(&mut self) {
+        if let Some(ref mask) = self.geom_mask {
+            let n = self.coarse.data.len();
+            debug_assert_eq!(mask.len(), n,
+                "geom_mask length {} != coarse field length {}", mask.len(), n);
+            let mut n_zeroed = 0usize;
+            for (idx, m) in self.coarse.data.iter_mut().enumerate() {
+                if !mask[idx] {
+                    if m[0] != 0.0 || m[1] != 0.0 || m[2] != 0.0 {
+                        n_zeroed += 1;
+                    }
+                    *m = [0.0, 0.0, 0.0];
+                }
+            }
+            // One-shot diagnostic: report how many cells were contaminated.
+            // Only prints on the first call where cells are actually zeroed.
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if n_zeroed > 0 && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let n_vac = mask.iter().filter(|&&v| !v).count();
+                eprintln!(
+                    "[geom_mask] zeroed {} contaminated vacuum cells on L0 \
+                     ({} total vacuum / {} total cells)",
+                    n_zeroed, n_vac, n
+                );
+            }
+        }
+    }
+
+    /// Report how many L0 coarse cells have non-zero M in vacuum.
+    ///
+    /// Returns (n_contaminated, n_vacuum_total). Useful as a diagnostic check.
+    pub fn count_coarse_vacuum_contamination(&self) -> (usize, usize) {
+        match self.geom_mask {
+            Some(ref mask) => {
+                let mut n_cont = 0usize;
+                let mut n_vac = 0usize;
+                for (idx, &is_mat) in mask.iter().enumerate() {
+                    if !is_mat {
+                        n_vac += 1;
+                        let m = self.coarse.data[idx];
+                        if m[0] != 0.0 || m[1] != 0.0 || m[2] != 0.0 {
+                            n_cont += 1;
+                        }
+                    }
+                }
+                (n_cont, n_vac)
+            }
+            None => (0, 0),
+        }
     }
 
     /// Apply geometry (shape or coarse mask) to a single patch.
@@ -489,6 +562,10 @@ impl AmrHierarchy2D {
                 p.restrict_to_coarse(&mut self.coarse);
             }
         }
+
+        // Enforce geometry: zero vacuum cells that may have been left non-zero
+        // by restriction (patches only cover a subset of the domain).
+        self.apply_geom_mask_to_coarse();
     }
 
     /// Restrict a single child level to its parent level (Berger–Colella intermediate restriction).
@@ -509,6 +586,8 @@ impl AmrHierarchy2D {
             for p in &self.patches {
                 p.restrict_to_coarse(&mut self.coarse);
             }
+            // Enforce geometry mask on coarse after restriction.
+            self.apply_geom_mask_to_coarse();
             return;
         }
 
@@ -527,6 +606,7 @@ impl AmrHierarchy2D {
             // Restrict from patches_l2plus[child_idx] into self.patches
             if let Some(child_patches) = self.patches_l2plus.get(child_idx) {
                 if child_patches.is_empty() {
+                    self.apply_geom_mask_to_coarse();
                     return;
                 }
                 // We need to restrict child patches into L1 parent patches.
@@ -583,6 +663,9 @@ impl AmrHierarchy2D {
                 }
             }
         }
+
+        // Enforce geometry mask on coarse after any restriction path.
+        self.apply_geom_mask_to_coarse();
     }
 
     /// Fill ghost cells for patches at `child_level` using temporally interpolated

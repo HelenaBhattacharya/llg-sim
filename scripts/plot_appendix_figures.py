@@ -345,16 +345,17 @@ def rust_midrow_slice(path):
     return d[:, 0], d[:, 1], d[:, 2], d[:, 3]
 
 
-# ── Figure A3: Bloch DMI chirality ───────────────────────────
+# ── Figure A3: DMI chirality ──────────────────────────────────
 
 def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
     """
     Single-panel figure showing all 3 magnetisation components for ±D:
       mz: wall profile (solid) — identical for ±D
       mx: chirality component (dashed) — flips sign with D
-      my: small in-plane (dotted) — nearly D-independent
-    Rust = lines, MuMax3 = dots. Colour = ±D sign.
+      my: small residual (dotted) — nearly zero
+    Rust = lines, MuMax3 = dots.  Blue = +D, red = −D.
     """
+    from matplotlib.lines import Line2D
 
     # Load Rust slices
     xrp, mxrp, myrp, mzrp = rust_midrow_slice(rust_dplus)
@@ -377,57 +378,73 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
     # Colours: blue = +D, red = -D
     c_p, c_m = "#1f77b4", "#d62728"
 
-    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    fig, ax = plt.subplots(figsize=(6.8, 4.4))
 
-    stride = max(1, len(xmp_c) // 100)
+    stride = max(1, len(xmp_c) // 120)
 
     # ── MuMax dots (behind, all components) ──
     # +D MuMax
     ax.plot(xmp_c[::stride], mzmp[::stride], "o", color=c_p,
-            markersize=3.5, alpha=0.3, markeredgewidth=0, zorder=2)
+            markersize=3.2, alpha=0.35, markeredgewidth=0, zorder=2)
     ax.plot(xmp_c[::stride], mxmp[::stride], "o", color=c_p,
-            markersize=3.5, alpha=0.3, markeredgewidth=0, zorder=2)
+            markersize=3.2, alpha=0.35, markeredgewidth=0, zorder=2)
     ax.plot(xmp_c[::stride], mymp[::stride], "o", color=c_p,
-            markersize=3.5, alpha=0.3, markeredgewidth=0, zorder=2,
-            label="MuMax3 (dots)")
+            markersize=3.2, alpha=0.35, markeredgewidth=0, zorder=2)
 
     # -D MuMax
     ax.plot(xmm_c[::stride], mzmm[::stride], "s", color=c_m,
-            markersize=3.0, alpha=0.3, markeredgewidth=0, zorder=2)
+            markersize=2.8, alpha=0.35, markeredgewidth=0, zorder=2)
     ax.plot(xmm_c[::stride], mxmm[::stride], "s", color=c_m,
-            markersize=3.0, alpha=0.3, markeredgewidth=0, zorder=2)
+            markersize=2.8, alpha=0.35, markeredgewidth=0, zorder=2)
     ax.plot(xmm_c[::stride], mymm[::stride], "s", color=c_m,
-            markersize=3.0, alpha=0.3, markeredgewidth=0, zorder=2)
+            markersize=2.8, alpha=0.35, markeredgewidth=0, zorder=2)
 
-    # ── Rust lines (on top) ──
-    # +D Rust
-    ax.plot(xrp_c, mzrp, "-",  color=c_p, linewidth=1.2, zorder=3,
+    # ── Rust lines (on top), ordered by component for clean legend pairing ──
+    # mz pair
+    ax.plot(xrp_c, mzrp, "-",  color=c_p, linewidth=1.4, zorder=3,
             label=r"$+D\;m_z$")
-    ax.plot(xrp_c, mxrp, "--", color=c_p, linewidth=1.0, zorder=3,
+    ax.plot(xrm_c, mzrm, "-",  color=c_m, linewidth=1.4, zorder=3,
+            label=r"$-D\;m_z$")
+
+    # mx pair
+    ax.plot(xrp_c, mxrp, "--", color=c_p, linewidth=1.1, zorder=3,
             label=r"$+D\;m_x$")
+    ax.plot(xrm_c, mxrm, "--", color=c_m, linewidth=1.1, zorder=3,
+            label=r"$-D\;m_x$")
+
+    # my pair
     ax.plot(xrp_c, myrp, ":",  color=c_p, linewidth=1.0, zorder=3,
             label=r"$+D\;m_y$")
-
-    # -D Rust
-    ax.plot(xrm_c, mzrm, "-",  color=c_m, linewidth=1.2, zorder=3,
-            label=r"$-D\;m_z$")
-    ax.plot(xrm_c, mxrm, "--", color=c_m, linewidth=1.0, zorder=3,
-            label=r"$-D\;m_x$")
     ax.plot(xrm_c, myrm, ":",  color=c_m, linewidth=1.0, zorder=3,
             label=r"$-D\;m_y$")
 
     ax.axhline(0, color="0.5", linewidth=0.4, zorder=1)
     ax.set_xlabel(r"$x - x_0$ (nm)")
     ax.set_ylabel("Magnetisation")
-    ax.set_xlim(-200, 200)
+    ax.set_xlim(-500, 500)
+    ax.set_ylim(-1.08, 1.08)
 
-    # Legend above plot
-    fig.legend(*ax.get_legend_handles_labels(),
-               loc="upper center", ncol=4, frameon=True, framealpha=0.95,
-               fontsize=7, handletextpad=0.4, columnspacing=0.8,
-               bbox_to_anchor=(0.5, 1.02))
+    # ── Legend: MuMax indicator + component pairs, inside upper-left ──
+    mumax_handle = Line2D([], [], marker="o", color="0.55", markersize=4,
+                          linestyle="None", alpha=0.5, markeredgewidth=0)
 
-    # RMSE box
+    handles, labels = ax.get_legend_handles_labels()
+    all_handles = [mumax_handle] + handles
+    all_labels  = ["MuMax3 (dots)"] + labels
+
+    # ncol=2 fills column-first: entries read down col 1 then col 2
+    # With 7 entries and ncol=2: col1 gets 4, col2 gets 3
+    # Order in list →  col1: MuMax3, +D mz, +D mx, +D my
+    #                  col2: -D mz, -D mx, -D my
+    # This pairs +D and -D of each component on the same row ✓
+    legend = ax.legend(all_handles, all_labels,
+                       loc="upper left", ncol=2, frameon=True, framealpha=0.92,
+                       fontsize=7.5, handletextpad=0.4, columnspacing=1.2,
+                       handlelength=2.2, borderpad=0.5,
+                       bbox_to_anchor=(0.01, 0.99))
+    legend.set_zorder(10)
+
+    # ── RMSE annotation below plot ──
     rmse_strs = []
     for comp_label, rust_p, rust_m, mu_p, mu_m in [
         ("m_z", mzrp, mzrm, mzmp, mzmm),
@@ -440,8 +457,8 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
         rmse_m = np.sqrt(np.mean((rust_m - mu_m_i)**2))
         rmse_strs.append(f"RMSE(${comp_label}$): +D={rmse_p:.1e}, −D={rmse_m:.1e}")
 
-    fig.text(0.5, -0.03, "    ".join(rmse_strs),
-             ha="center", fontsize=6,
+    fig.text(0.5, -0.01, "    ".join(rmse_strs),
+             ha="center", fontsize=6.5,
              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
 
     fig.tight_layout()

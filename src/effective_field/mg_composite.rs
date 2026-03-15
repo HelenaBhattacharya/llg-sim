@@ -281,11 +281,14 @@ pub(crate) fn laplacian_2d_interior(
 
 /// Compute residual r = rhs - L(φ) on interior cells.
 ///
-/// Uses the UNSCREENED 2D Laplacian (no z-screening term).
-/// This is correct for the V-cycle path where patch ghost values
-/// from L0 implicitly carry z-information. The screened operator
-/// is used only in the defect correction path (smooth_jacobi_2d
-/// with real dz).
+/// Uses the SCREENED 2D Laplacian:
+///   L(φ) = ∇²_xy(φ) − (2/dz²)φ
+///
+/// The z-screening term makes this consistent with smooth_jacobi_2d
+/// (which uses the same screened operator) and with the L0 3D MG
+/// solver's effective operator at the magnet layer. Without screening,
+/// the residual and smoother would use different operators, causing
+/// the V-cycle restriction to inject biased corrections into L0.
 
 #[allow(dead_code)]
 pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
@@ -294,6 +297,7 @@ pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
     let ghost = pd.ghost;
     let inv_dx2 = 1.0 / (pd.dx * pd.dx);
     let inv_dy2 = 1.0 / (pd.dy * pd.dy);
+    let inv_dz2 = 1.0 / (pd.dz * pd.dz);
 
     pd.residual.fill(0.0);
 
@@ -303,7 +307,8 @@ pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
             let phi_c = pd.phi[idx];
             let lap = (pd.phi[idx + 1] - 2.0 * phi_c + pd.phi[idx - 1]) * inv_dx2
                     + (pd.phi[(j + 1) * nx + i] - 2.0 * phi_c + pd.phi[(j - 1) * nx + i]) * inv_dy2;
-            pd.residual[idx] = pd.rhs[idx] - lap;
+            // Screened Poisson: L(φ) = ∇²_xy(φ) − (2/dz²)φ
+            pd.residual[idx] = pd.rhs[idx] - (lap - 2.0 * inv_dz2 * phi_c);
         }
     }
 }
@@ -1365,7 +1370,7 @@ impl CompositeGridPoisson {
 
                 smooth_jacobi_2d(
                     &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
                     self.vcfg.omega, self.vcfg.n_pre);
 
                 compute_residual_2d(pd);
@@ -1379,7 +1384,7 @@ impl CompositeGridPoisson {
 
             smooth_jacobi_2d(
                 &mut pd.phi, &pd.rhs, &mut pd.residual,
-                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
+                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
                 self.vcfg.omega, self.vcfg.n_pre);
 
             compute_residual_2d(pd);
@@ -1423,7 +1428,7 @@ impl CompositeGridPoisson {
 
             smooth_jacobi_2d(
                 &mut pd.phi, &pd.rhs, &mut pd.residual,
-                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
+                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
                 self.vcfg.omega, self.vcfg.n_post);
         }
 
@@ -1477,7 +1482,7 @@ impl CompositeGridPoisson {
 
                 smooth_jacobi_2d(
                     &mut pd.phi, &pd.rhs, &mut pd.residual,
-                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, f64::INFINITY,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
                     self.vcfg.omega, self.vcfg.n_post);
             }
 
@@ -2580,7 +2585,7 @@ mod phase2_tests {
         let ghost = 2usize;
         let dx = 1.0;
         let dy = 1.0;
-        let dz = 1e30; // dz stored in struct but compute_residual_2d is unscreened
+        let dz = 1e30; // large dz makes screening term negligible (2/dz² ≈ 0)
 
         let mut pd = PatchPoissonData {
             phi: vec![0.0; nx * ny],
@@ -2609,8 +2614,9 @@ mod phase2_tests {
         // phi = i*j, so:
         //   d²phi/dx² = 0 (phi is linear in i at fixed j)
         //   d²phi/dy² = 0 (phi is linear in j at fixed i)
-        //   L(phi) = 0 everywhere in the interior (unscreened 2D Laplacian)
-        //   residual = rhs - L(phi) = 1.0
+        //   screening: -2/dz² * phi ≈ 0 (dz=1e30)
+        //   L(phi) ≈ 0 everywhere in the interior
+        //   residual = rhs - L(phi) ≈ 1.0
         for j in ghost..(ny - ghost) {
             for i in ghost..(nx - ghost) {
                 let idx = j * nx + i;
