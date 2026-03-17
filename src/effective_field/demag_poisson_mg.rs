@@ -411,15 +411,102 @@ impl DeltaKernel2D {
         let ny = m.grid.ny;
         debug_assert_eq!(nx, b_eff.grid.nx);
         debug_assert_eq!(ny, b_eff.grid.ny);
-
+ 
         let r = self.radius as isize;
+        let r_u = self.radius;
         let stride = self.stride;
         let dkxx = &self.dkxx;
         let dkxy = &self.dkxy;
         let dkyy = &self.dkyy;
         let dkzz = &self.dkzz;
         let mdata = &m.data;
-
+ 
+        // --- Boundary-aware PPPM scaling ---
+        //
+        // When BSCALE > 0, the ΔK correction is reduced at cells near
+        // the material–vacuum boundary by a factor f^α, where:
+        //   f = (material cells within stencil radius) / (total cells within radius)
+        //   α = BSCALE exponent (env var)
+        //
+        // Motivation: the ΔK over-corrects at boundary cells because it was
+        // calibrated with isolated impulses, while the runtime MG sees a
+        // distributed surface charge whose collective error differs.
+        // Scaling by f^α compensates, reducing the demag over-estimate at
+        // the disk edge that causes the gyration frequency to be too high.
+        let alpha = pppm_boundary_scale();
+ 
+        let scale_factors: Vec<f64> = if alpha > 0.0 {
+            let margin = pppm_boundary_margin();
+ 
+            // Step 1: identify vacuum cells (|m|² < 0.25)
+            let is_vac: Vec<bool> = mdata
+                .iter()
+                .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) < 0.25)
+                .collect();
+ 
+            // Step 2: flag material cells within `margin` of any vacuum cell
+            let mut near_bnd = vec![false; nx * ny];
+            for j in 0..ny {
+                for i in 0..nx {
+                    if is_vac[j * nx + i] {
+                        continue; // skip vacuum cells
+                    }
+                    let mut found = false;
+                    'outer: for dj in -(margin as isize)..=(margin as isize) {
+                        for di in -(margin as isize)..=(margin as isize) {
+                            let ni = i as isize + di;
+                            let nj = j as isize + dj;
+                            if ni < 0 || ni >= nx as isize || nj < 0 || nj >= ny as isize {
+                                continue;
+                            }
+                            if is_vac[nj as usize * nx + ni as usize] {
+                                found = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    near_bnd[j * nx + i] = found;
+                }
+            }
+ 
+            // Step 3: compute material fraction for boundary cells only
+            // Interior cells get scale = 1.0 (no change).
+            (0..nx * ny)
+                .map(|idx| {
+                    // Interior cells and vacuum cells: no scaling
+                    if !near_bnd[idx] || is_vac[idx] {
+                        return 1.0;
+                    }
+                    let ci = idx % nx;
+                    let cj = idx / nx;
+                    let mut n_mat = 0u32;
+                    let mut n_total = 0u32;
+                    for dy in -(r_u as isize)..=(r_u as isize) {
+                        let sj = cj as isize + dy;
+                        if sj < 0 || sj >= ny as isize {
+                            continue;
+                        }
+                        for dx in -(r_u as isize)..=(r_u as isize) {
+                            let si = ci as isize + dx;
+                            if si < 0 || si >= nx as isize {
+                                continue;
+                            }
+                            n_total += 1;
+                            if !is_vac[sj as usize * nx + si as usize] {
+                                n_mat += 1;
+                            }
+                        }
+                    }
+                    let f = n_mat as f64 / n_total.max(1) as f64;
+                    f.powf(alpha)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+ 
+        let has_scaling = !scale_factors.is_empty();
+ 
         b_eff
             .data
             .par_chunks_mut(nx)
@@ -428,11 +515,11 @@ impl DeltaKernel2D {
                 let j_is = j as isize;
                 for i in 0..nx {
                     let i_is = i as isize;
-
+ 
                     let mut bx = 0.0f64;
                     let mut by = 0.0f64;
                     let mut bz = 0.0f64;
-
+ 
                     for dy in -r..=r {
                         let sj = j_is - dy;
                         if sj < 0 || sj >= ny as isize {
@@ -453,13 +540,22 @@ impl DeltaKernel2D {
                             bz += dkzz[k] * mz;
                         }
                     }
-
+ 
+                    // Apply boundary scaling
+                    if has_scaling {
+                        let s = scale_factors[j * nx + i];
+                        bx *= s;
+                        by *= s;
+                        bz *= s;
+                    }
+ 
                     row[i][0] += bx;
                     row[i][1] += by;
                     row[i][2] += bz;
                 }
             });
     }
+ 
 
     /// Apply the PPPM-φ correction to a 2D scalar potential field.
     ///
@@ -2580,6 +2676,14 @@ fn mg_hybrid_notice_once(hyb: &HybridConfig) {
                 "[demag_mg] hybrid ΔK DISABLED (pure MG). To enable: set LLG_DEMAG_MG_HYBRID_ENABLE=1 and LLG_DEMAG_MG_HYBRID_RADIUS>0"
             );
         }
+        let bscale = pppm_boundary_scale();
+        if bscale > 0.0 {
+            let bmargin = pppm_boundary_margin();
+            eprintln!(
+                "[demag_mg] hybrid boundary scaling ENABLED (alpha={:.3}, margin={})",
+                bscale, bmargin
+            );
+        }
     });
 }
 
@@ -2631,6 +2735,27 @@ fn mg_timing_stride() -> usize {
             .max(1)
     })
 }
+
+fn pppm_boundary_scale() -> f64 {
+    static VAL: OnceLock<f64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("LLG_DEMAG_MG_HYBRID_BSCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+ 
+fn pppm_boundary_margin() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("LLG_DEMAG_MG_HYBRID_BMARGIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2)
+    })
+}
+ 
 
 static MG_TIMING_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MG_TIMING_RHS_NS: AtomicU64 = AtomicU64::new(0);

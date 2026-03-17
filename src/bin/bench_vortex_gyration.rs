@@ -4,33 +4,38 @@
 // =======================================================
 //
 // Reproduces the vortex core gyration from:
-//   Guslienko et al., J. Appl. Phys. 91, 8037 (2002), Fig. 2
+//   Guslienko et al., J. Appl. Phys. 91, 8037 (2002), Fig. 3
+//   Novosad et al., Phys. Rev. B 72, 024455 (2005) — experimental + OOMMF
 //
 // Setup:
-//   - 200 nm diameter Permalloy disk, dz = 3.75 nm (cubic cells → β = dz/R = 0.0375)
+//   - 200 nm diameter Permalloy disk, dz = 20 nm → β = L/R = 0.2
 //   - Ms = 8.0×10⁵ A/m, A = 1.3×10⁻¹¹ J/m, K_u = 0
-//   - Cell size: dx = dy = dz = 3.75 nm (80² base on 300 nm box)
+//   - Cell size: dx = dy = 3.125 nm (96² base on 300 nm box)
 //   - α = 0.01 for dynamics (physical Permalloy damping)
-//   - dt = 5 fs (CFL-safe for dx_fine = 0.47 nm at 3 AMR levels)
-//   - B_shift = 5 mT — scaled for β ≈ 0.04 to keep s = r/R < 0.1 (linear regime)
-//     At β = 0.04 the magnetostatic restoring force is ~5× weaker than β = 0.2,
-//     so 20 mT pushes the core to s > 0.3 (nonlinear → spirals outward).
-//     5 mT gives s ≈ 0.06 (cfft) to 0.10 (comp) — safely linear.
+//   - dt = 10 fs with 2 AMR levels; 3 fs with 3 AMR levels (auto-selected)
+//   - B_shift = 10 mT → s_eq ≈ 0.12 (safely in the linear regime)
+//     At β = 0.2 the restoring force is strong: old cfft run showed
+//     r_eq ≈ 11.5nm at 10mT (s = 0.115), well within linear regime.
 //
-// CFL note: With 3 AMR levels (ratio=2), the finest dx = 3.75/8 = 0.47 nm.
-//   Exchange CFL requires dt < ~5 fs at this spacing. Previous dt=20 fs
-//   caused short-wavelength instability (checkerboard pattern, mz polarity
-//   flips). The subcycling scheme uses dt as the L3 timestep.
+// CFL note: With 3 AMR levels (ratio=2), the finest dx = 3.125/8 = 0.39 nm.
+//   Exchange CFL requires dt < ~3.5 fs at this spacing.  dt=3 fs gives
+//   good margin.  With 2 levels, dx_fine=0.78nm, dt=10fs.
+//   The code auto-selects dt based on AMR level count.
 //
 // Protocol (Guslienko's method):
-//   Phase 1: Relax vortex to ground state (α = 0.5, B = 0)
-//   Phase 2: Apply 5 mT in-plane field, relax to shifted equilibrium (α = 0.5)
-//   Phase 3: Remove field, evolve with α = 0.01 — core oscillates ~6 periods in 30ns
+//   Phase 1: Relax vortex to ground state (α = 0.5, B = 0, 1.5ns)
+//   Phase 2: Apply 10 mT in-plane field, relax to shifted equilibrium (α = 0.5, 3ns)
+//   Phase 3: Remove field, evolve with α = 0.01 — core oscillates ~6 periods in 8ns
 //
 // Expected result: nearly-circular orbits with slow decay,
-//   eigenfrequency ~139 MHz for β ≈ 0.04 (Novosad 2005 scaling: f ≈ 3700×β MHz).
-//   At 5 mT the equilibrium displacement is ~6nm (cfft) to ~10nm (comp),
-//   safely in the linear regime s = r/R < 0.1.
+//   eigenfrequency ~740 MHz for β = 0.2 (Guslienko 2002 Fig 3 curve b;
+//   Novosad 2005 empirical scaling: f ≈ 3700×β MHz = 740 MHz).
+//   Old cfft run (80² base) gave 816 MHz — 10% overestimate from coarser grid.
+//   At 10 mT the equilibrium displacement is ~12nm (s ≈ 0.12), safely linear.
+//
+// AMR: 3 levels (L1 boundary arcs, L2 intermediate, L3 vortex core tracking).
+//   dx_fine = 0.39 nm — 14.6 cells per exchange length.
+//   dt = 3 fs (auto-selected for CFL safety at L3).
 //
 // AMR features:
 //   - boundary_layer=4: ensures disk edge gets refinement patches
@@ -548,19 +553,22 @@ fn main() {
     // GUSLIENKO PARAMETERS (J. Appl. Phys. 91, 8037, 2002)
     // =====================================================================
 
-    // LEE et al. REPLICA (Phys. Rev. B 76, 174410, 2007)
-    // 300 nm diameter Py disk, L = 10 nm, β = L/R = 0.067
-    // Lee measured ν₀ = 330 MHz with OOMMF (cells 2×2×10 nm)
-    // We use dx = dy = 3.75 nm (close to Lee's 2nm) with AMR refinement
-    // If we get ~330 MHz → code is correct, 200nm/7.5nm setup has a problem
-    // If we get ~660 MHz → systematic 2× error in demag
-    let disk_r = 150.0e-9;   // R = 150 nm (2R = 300 nm, same as Lee)
-    let dz = 10.0e-9;        // L = 10 nm (same as Lee)
-    let domain = 450.0e-9;   // 50% padding — 75nm vacuum gap = 20 cells at dx=3.75nm
+    // GUSLIENKO / NOVOSAD VALIDATION (β = 0.2)
+    // 200 nm diameter Py disk, L = 20 nm, β = L/R = 0.2
+    // Guslienko Fig 3 curve b: f ≈ 700-740 MHz
+    // Novosad 2005 empirical: f = 3700×0.2 = 740 MHz
+    // Novosad OOMMF (5nm cells): agrees with experiment to ~10%
+    // Old cfft (80×80, dx=3.75nm, 53 cells/diam): 816 MHz (10% high)
+    // This run: 96×96, dx=3.125nm, 64 cells/diam — should reduce the
+    // staircase-boundary frequency overestimate.
+    let disk_r = 100.0e-9;   // R = 100 nm (2R = 200 nm)
+    let dz = 20.0e-9;        // L = 20 nm → β = 0.2
+    let domain = 300.0e-9;   // 50% padding — 50nm vacuum gap = 16 cells at dx=3.125nm
 
-    // Grid: 120² base → dx = 3.75 nm (< l_ex ≈ 5.7 nm ✓)
-    // Vacuum gap = 75nm = 20 cells per side — safe for boundary_layer=4
-    let bnx = 120_usize; let bny = 120;
+    // Grid: 96² base → dx = 3.125 nm (< l_ex ≈ 5.7 nm ✓)
+    // Disk spans 64 cells in diameter (21% more than old 80² setup's 53)
+    // Vacuum gap = 50nm = 16 cells per side — safe for boundary_layer=4
+    let bnx = 96_usize; let bny = 96;
     let dx = domain / bnx as f64;
     let dy = dx;
     let ratio = 2_usize; let ghost = 2;
@@ -578,35 +586,36 @@ fn main() {
     let lex = (2.0*mat.a_ex/(mu0*mat.ms*mat.ms)).sqrt();
 
     // Timing
-    // CRITICAL: dt must satisfy CFL for exchange at finest dx.
-    // With 3 AMR levels, dx_fine = dx_coarse/8 = 0.47 nm.
-    // CFL limit at L3: dt_max ≈ 2.78 × dx² × μ₀Ms / (4γA) ≈ 5 fs.
-    // At dt=20fs (previous), L3 violates CFL by 4× → checkerboard instability.
-    let dt: f64 = 5.0e-15;  // 5 fs — CFL-safe for dx_fine = 0.47 nm at 3 AMR levels
+    // With 2 AMR levels (default), dx_fine = dx_coarse/4 = 0.78 nm.
+    // CFL limit at L2: dt_max ≈ 14 fs.  Using dt=10 fs for margin.
+    // With 3 AMR levels (LLG_AMR_MAX_LEVEL=3), dx_fine = 0.39 nm → use dt=3fs.
+    let dt: f64 = if amr_lvl >= 3 { 3.0e-15 } else { 10.0e-15 };
     let alpha_relax = 0.5;
-    let alpha_dyn = 0.01;    // Physical Permalloy damping — gives ~3.5 clean oscillation
-                              // periods in 5ns (vs α=0.2 which overdamps after ~1 loop)
-    // Relaxation needs ~1ns at α=0.5 for full equilibration.
-    // At dt=5fs: 1ns = 200,000 main-loop steps (25,000 AMR coarse steps with scr=8).
-    let relax_steps = 200_000;
-    let field_relax_steps = 800_000; // 2ns — ensures core reaches equilibrium under field
-    let b_shift = 5.0e-3;   // 5 mT in-plane field → ~6nm displacement (s ≈ 0.06)
-                              // At β ≈ 0.04 the restoring force is ~5× weaker than β = 0.2,
-                              // so 20 mT pushed s > 0.3 (nonlinear regime → expanding spiral).
-                              // 5 mT keeps both cfft and comp in the linear regime (s < 0.1).
-                              // Novosad 2005 used 50 Oe (5 mT) for their OOMMF simulations.
-    let gyr_time = 20.0e-9;  // 30 ns — ~4.2 periods at 139 MHz (β ≈ 0.04)
+    let alpha_dyn = 0.01;    // Physical Permalloy damping — gives ~6 clean oscillation
+                              // periods in 8ns at 740 MHz.
+    // Phase timing:
+    //   τ_relax = 1/(α×ω₀) ≈ 1/(0.5 × 2π × 740MHz) ≈ 0.43ns
+    //   Phase 1: 1.5ns = 3.5τ → adequate relaxation
+    //   Phase 2: 3.0ns = 7.0τ → well equilibrated under field
+    //   Phase 3: 8.0ns → ~5.9 periods at 740 MHz
+    let relax_steps = (1.5e-9 / dt).ceil() as usize;
+    let field_relax_steps = (3.0e-9 / dt).ceil() as usize;
+    let b_shift = 10.0e-3;   // 10 mT in-plane field → s_eq ≈ 0.12 (from old cfft data)
+                              // Safely in the linear regime (s < 0.15).
+                              // Old cfft run showed core at (0.2, 11.5)nm under 10mT.
+    let gyr_time = 8.0e-9;   // 8 ns — ~5.9 periods at 740 MHz
     let gyr_steps = (gyr_time/dt).ceil() as usize;
 
-    // Output cadences (adjusted for dt=5fs: 200,000 steps/ns)
-    // relax_out: print every 200ps during relaxation (5 prints per phase)
-    // dyn_out: record core position every 5ps (200 data points per ns)
-    // snap_every: snapshot every 200ps (25 over 5ns)
-    // dyn_regrid: regrid every 40ps — core moves ~4.5nm per regrid at 0.7GHz,
-    //   which is ~1 base cell.  Normal hysteresis-based regrid with the new-region
-    //   acceptance ensures the core patch tracks the moving vortex core while
-    //   boundary arcs remain stable.
-    let (relax_out, dyn_out, snap_every, dyn_regrid) = (40_000, 1_000, 40_000, 8_000);
+    // Output cadences
+    // relax_out: print every 200ps during relaxation
+    // dyn_out: record core position every 5ps
+    // snap_every: snapshot every 200ps
+    // dyn_regrid: regrid every 40ps
+    let _steps_per_ns = (1.0e-9 / dt).round() as usize;
+    let relax_out  = (200e-12 / dt).round() as usize;  // every 200ps
+    let dyn_out    = (5e-12 / dt).round() as usize;     // every 5ps
+    let snap_every = (200e-12 / dt).round() as usize;   // every 200ps
+    let dyn_regrid = (40e-12 / dt).round() as usize;    // every 40ps
 
     // =====================================================================
     // Grids and masks
@@ -645,7 +654,7 @@ fn main() {
         indicator: ind, buffer_cells: 4, boundary_layer: bl,
         min_patch_area: 16, merge_distance: 1, max_patches: 0,
         connectivity: Connectivity::Eight, min_efficiency: 0.65, max_flagged_fraction: 0.50,
-        confine_dilation: true,  // Safe with 300nm domain: 50nm vacuum gap = 13 cells >> buffer=4
+        confine_dilation: true,  // Safe with 300nm domain: 50nm vacuum gap = 16 cells >> buffer=4
     };
 
     // =====================================================================
@@ -798,6 +807,23 @@ fn main() {
                 format!("  comp=({:.1},{:.1})nm mz={omz:.4}", ox*1e9, oy*1e9)
             } else { String::new() };
             println!("  relax {step}/{relax_steps} ({tps:.0}ps) {fine_str}{coarse_str}{cfft_str}{comp_str}");
+
+            // CSV logging during Phase 1 (for thesis plots showing relaxation trajectory)
+            {
+                let tns_log = step as f64 * dt * 1e9;
+                if !skip_cfft {
+                    let mfl = flatten_to(&h_cf, fg);
+                    let (cx, cy, cmz) = find_core(&mfl, Some(&mf));
+                    let cl = core_amr_level(&h_cf, cx, cy, &bg);
+                    append(&cp_cf, &format!("{step},{tns_log:.6},{:.2},{:.2},{cmz:.6},{cl}\n", cx*1e9, cy*1e9));
+                }
+                if let Some(hc) = h_co.as_ref() {
+                    let mfl = flatten_to(hc, fg);
+                    let (ox, oy, omz) = find_core(&mfl, Some(&mf));
+                    let cl = core_amr_level(hc, ox, oy, &bg);
+                    append(&cp_co, &format!("{step},{tns_log:.6},{:.2},{:.2},{omz:.6},{cl}\n", ox*1e9, oy*1e9));
+                }
+            }
         }
     }
     println!("  Vortex ground state reached.");
@@ -924,6 +950,23 @@ fn main() {
                 format!("  comp=({:.1},{:.1})nm r={:.1}nm mz={omz:.4}", ox*1e9, oy*1e9, r_comp*1e9)
             } else { String::new() };
             println!("  field-relax {step}/{field_relax_steps} ({tps:.0}ps) {fine_str}{coarse_str}{cfft_str}{comp_str}");
+
+            // CSV logging during Phase 2 (for thesis plots showing field-displacement trajectory)
+            {
+                let tns_log = step as f64 * dt * 1e9;
+                if !skip_cfft {
+                    let mfl = flatten_to(&h_cf, fg);
+                    let (cx, cy, cmz) = find_core(&mfl, Some(&mf));
+                    let cl = core_amr_level(&h_cf, cx, cy, &bg);
+                    append(&cp_cf, &format!("{step},{tns_log:.6},{:.2},{:.2},{cmz:.6},{cl}\n", cx*1e9, cy*1e9));
+                }
+                if let Some(hc) = h_co.as_ref() {
+                    let mfl = flatten_to(hc, fg);
+                    let (ox, oy, omz) = find_core(&mfl, Some(&mf));
+                    let cl = core_amr_level(hc, ox, oy, &bg);
+                    append(&cp_co, &format!("{step},{tns_log:.6},{:.2},{:.2},{omz:.6},{cl}\n", ox*1e9, oy*1e9));
+                }
+            }
         }
     }
 
@@ -1005,6 +1048,19 @@ fn main() {
     llg.alpha = alpha_dyn;
     llg.b_ext = [0.0; 3]; // field OFF — core spirals back
 
+    // --- Checkpoint 4: verify geometry before dynamics ---
+    {
+        let nc = check_vacuum_contamination("cfft pre-Phase3-dynamics", &h_cf);
+        if nc > 0 { eprintln!("  WARNING: vacuum contamination before Phase 3!"); }
+    }
+    if let Some(ref hc) = h_co {
+        let nc = check_vacuum_contamination("comp pre-Phase3-dynamics", hc);
+        if nc > 0 { eprintln!("  WARNING: vacuum contamination before Phase 3!"); }
+    }
+    // Enforce clean L0 before first dynamics step
+    h_cf.apply_geom_mask_to_coarse();
+    if let Some(hc) = h_co.as_mut() { hc.apply_geom_mask_to_coarse(); }
+
     // Log initial patch state before dynamics begin
     if !skip_cfft {
         let (l1,l2,l3) = (h_cf.patches.len(),
@@ -1068,6 +1124,10 @@ fn main() {
                 let ca3: usize = hc.patches_l2plus.get(1).map(|v| v.iter().map(|p| p.coarse_rect.nx*p.coarse_rect.ny).sum()).unwrap_or(0);
                 append(&comp_regrid_p, &format!("{step},{tns:.6},{cl1},{cl2},{cl3},{ca1},{ca2},{ca3}\n"));
             }
+
+            // Enforce geometry mask after regrid+restriction (prevents vacuum contamination drift)
+            h_cf.apply_geom_mask_to_coarse();
+            if let Some(hc) = h_co.as_mut() { hc.apply_geom_mask_to_coarse(); }
         }
 
         // Core tracking

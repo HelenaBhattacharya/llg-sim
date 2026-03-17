@@ -15,10 +15,10 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, NullFormatter
 
 plt.rcParams.update({
-    "font.family": "serif", "font.size": 9,
-    "axes.labelsize": 10, "axes.titlesize": 10,
-    "legend.fontsize": 7.5,
-    "xtick.labelsize": 8, "ytick.labelsize": 8,
+    "font.family": "serif", "font.size": 11,
+    "axes.labelsize": 12, "axes.titlesize": 12,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 10, "ytick.labelsize": 10,
     "lines.linewidth": 1.2,
     "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
 })
@@ -98,8 +98,8 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
     fft_m = np.abs(np.fft.rfft((my_m_uniform - my_m_uniform.mean()) * win))
 
     # ── Layout ──
-    fig = plt.figure(figsize=(7.2, 7.4))
-    gs = fig.add_gridspec(2, 2, hspace=0.38, wspace=0.32, height_ratios=[1, 1.25])
+    fig = plt.figure(figsize=(7.2, 8.2))
+    gs = fig.add_gridspec(2, 2, hspace=0.52, wspace=0.32, height_ratios=[1, 1.25])
 
     # ═══ (a) Trajectory ═══
     ax = fig.add_subplot(gs[0, 0])
@@ -115,13 +115,9 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
     ax.set_ylabel(r"$m_y$")
     ax.set_xlim(0, t_max * 1e9)
 
-    # Legend + stats in top-right (away from oscillations)
-    ax.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=7)
-    ax.text(0.97, 0.72,
-            f"RMSE(Rust–MuMax3) = {rmse_mumax:.1e}\n"
-            f"max|$\\Delta m_y$| = {max_err_mumax:.1e}",
-            transform=ax.transAxes, fontsize=5.5, va="top", ha="right",
-            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9))
+    # Legend tight in upper-right corner
+    ax.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=10,
+              borderaxespad=0.3, borderpad=0.3, handlelength=1.2)
 
     ax.set_title("(a)", loc="left", fontweight="bold")
 
@@ -141,16 +137,13 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
     ax.set_xlabel("Frequency (GHz)")
     ax.set_ylabel("Normalised amplitude")
 
-    # Compact legend top-right
-    ax.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=7)
-    # Frequency values in small box below legend
-    ax.text(0.97, 0.65,
-            rf"$\gamma_0 B/2\pi$ = {f_pred*1e-9:.2f} GHz"
-            f"\nFFT peak = {f_peak*1e-9:.2f} GHz",
-            transform=ax.transAxes, fontsize=5.5, va="top", ha="right",
-            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9))
+    # Legend tight in upper-right corner (peak is narrow, corner is clear)
+    ax.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=10,
+              borderaxespad=0.3, borderpad=0.3, handlelength=1.2)
 
     ax.set_title("(b)", loc="left", fontweight="bold")
+
+    # Stats will be placed after tight_layout — see below
 
     # ═══ (c) Convergence (full bottom row) ═══
     ax = fig.add_subplot(gs[1, :])
@@ -195,7 +188,7 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
             y_nudge = {"Euler": -12, "RK23": -10, "RK4": 0, "RK45": 0}.get(name, 0)
             ri = min(len(dc) - 1, int(len(dc) * 0.85))
             ax.annotate(f"$\\Delta t^{{{order}}}$",
-                        xy=(dc[ri], ec[ri]), fontsize=8, color=color,
+                        xy=(dc[ri], ec[ri]), fontsize=10, color=color,
                         fontweight="bold",
                         xytext=(10, y_nudge), textcoords="offset points", va="center")
 
@@ -203,9 +196,29 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
     ax.set_ylabel("Absolute error after 1 period")
     ax.set_title("(c)", loc="left", fontweight="bold")
     ax.legend(loc="upper left", frameon=True, framealpha=0.95,
-              fontsize=8, ncol=4, columnspacing=1.0)
+              fontsize=10, ncol=4, columnspacing=1.0)
     ax.yaxis.set_minor_locator(LogLocator(subs="auto", numticks=20))
     ax.yaxis.set_minor_formatter(NullFormatter())
+
+    # ═══ Place stat boxes after layout so they align properly ═══
+    fig.tight_layout()
+
+    # Read actual panel positions (data window, excludes labels)
+    bb_a = fig.axes[0].get_position()  # panel (a)
+    bb_b = fig.axes[1].get_position()  # panel (b)
+    stat_y = min(bb_a.y0, bb_b.y0) - 0.04  # use lower of the two so both align
+
+    stat_style = dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9)
+
+    fig.text(bb_a.x0 + bb_a.width / 2, stat_y,
+             f"RMSE(Rust–MuMax3) = {rmse_mumax:.1e}\n"
+             f"max|$\\Delta m_y$| = {max_err_mumax:.1e}",
+             fontsize=9, va="top", ha="center", bbox=stat_style)
+
+    fig.text(bb_b.x0 + bb_b.width / 2, stat_y,
+             rf"$\gamma_0 B/2\pi$ = {f_pred*1e-9:.2f} GHz"
+             f"\nFFT peak = {f_peak*1e-9:.2f} GHz",
+             fontsize=9, va="top", ha="center", bbox=stat_style)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -235,9 +248,9 @@ def make_fig_a2(rust_path, mumax_path, out_path):
 
     # MuMax dots
     ax_l.plot(t_m[::stride]*1e9, _get(mumax,"mx")[mm][::stride], ".",
-              color=c_mx, markersize=3.5, alpha=0.3, markeredgewidth=0, zorder=2)
+              color=c_mx, markersize=6.0, alpha=0.4, markeredgewidth=0, zorder=2)
     ax_l.plot(t_m[::stride]*1e9, _get(mumax,"my")[mm][::stride], ".",
-              color=c_my, markersize=3.5, alpha=0.3, markeredgewidth=0, zorder=2,
+              color=c_my, markersize=6.0, alpha=0.4, markeredgewidth=0, zorder=2,
               label="MuMax3 (dots)")
 
     # Rust lines
@@ -255,19 +268,19 @@ def make_fig_a2(rust_path, mumax_path, out_path):
     c_mz = "#2ca02c"
 
     ax_r.plot(t_m[::stride]*1e9, _get(mumax,"mz")[mm][::stride], ".",
-              color=c_mz, markersize=3.5, alpha=0.35, markeredgewidth=0, zorder=2)
+              color=c_mz, markersize=6.0, alpha=0.45, markeredgewidth=0, zorder=2)
     ax_r.plot(t_r*1e9, rust["mz"][mr], "-", color=c_mz, linewidth=1.0,
               zorder=3, label=r"$m_z$")
 
     ax_r.set_ylabel(r"$m_z$", color=c_mz)
     ax_r.tick_params(axis="y", labelcolor=c_mz)
 
-    # Combine legends — place ABOVE the plot as a horizontal strip
+    # Combine legends — place ABOVE the plot as a horizontal strip, centred
     lines_l, labels_l = ax_l.get_legend_handles_labels()
     lines_r, labels_r = ax_r.get_legend_handles_labels()
     fig.legend(lines_l + lines_r, labels_l + labels_r,
                loc="upper center", ncol=4, frameon=True, framealpha=0.95,
-               fontsize=7.5, handletextpad=0.4, columnspacing=1.0,
+               fontsize=10, handletextpad=0.4, columnspacing=1.0,
                bbox_to_anchor=(0.5, 0.98))
 
     # RMSE below the plot
@@ -278,7 +291,7 @@ def make_fig_a2(rust_path, mumax_path, out_path):
         rmse_strs.append(f"RMSE({lbl}) = {rmse_c:.1e}")
 
     fig.text(0.5, -0.02, "    ".join(rmse_strs),
-             ha="center", fontsize=7,
+             ha="center", fontsize=9,
              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
 
     fig.tight_layout()
@@ -385,19 +398,19 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
     # ── MuMax dots (behind, all components) ──
     # +D MuMax
     ax.plot(xmp_c[::stride], mzmp[::stride], "o", color=c_p,
-            markersize=3.2, alpha=0.35, markeredgewidth=0, zorder=2)
+            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmp_c[::stride], mxmp[::stride], "o", color=c_p,
-            markersize=3.2, alpha=0.35, markeredgewidth=0, zorder=2)
+            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmp_c[::stride], mymp[::stride], "o", color=c_p,
-            markersize=3.2, alpha=0.35, markeredgewidth=0, zorder=2)
+            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
 
     # -D MuMax
     ax.plot(xmm_c[::stride], mzmm[::stride], "s", color=c_m,
-            markersize=2.8, alpha=0.35, markeredgewidth=0, zorder=2)
+            markersize=4.5, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmm_c[::stride], mxmm[::stride], "s", color=c_m,
-            markersize=2.8, alpha=0.35, markeredgewidth=0, zorder=2)
+            markersize=4.5, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmm_c[::stride], mymm[::stride], "s", color=c_m,
-            markersize=2.8, alpha=0.35, markeredgewidth=0, zorder=2)
+            markersize=4.5, alpha=0.45, markeredgewidth=0, zorder=2)
 
     # ── Rust lines (on top), ordered by component for clean legend pairing ──
     # mz pair
@@ -424,28 +437,16 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
     ax.set_xlim(-500, 500)
     ax.set_ylim(-1.08, 1.08)
 
-    # ── Legend: MuMax indicator + component pairs, inside upper-left ──
-    mumax_handle = Line2D([], [], marker="o", color="0.55", markersize=4,
+    # ── Collect legend handles (placement deferred to after tight_layout) ──
+    mumax_handle = Line2D([], [], marker="o", color="0.55", markersize=6,
                           linestyle="None", alpha=0.5, markeredgewidth=0)
 
     handles, labels = ax.get_legend_handles_labels()
     all_handles = [mumax_handle] + handles
     all_labels  = ["MuMax3 (dots)"] + labels
 
-    # ncol=2 fills column-first: entries read down col 1 then col 2
-    # With 7 entries and ncol=2: col1 gets 4, col2 gets 3
-    # Order in list →  col1: MuMax3, +D mz, +D mx, +D my
-    #                  col2: -D mz, -D mx, -D my
-    # This pairs +D and -D of each component on the same row ✓
-    legend = ax.legend(all_handles, all_labels,
-                       loc="upper left", ncol=2, frameon=True, framealpha=0.92,
-                       fontsize=7.5, handletextpad=0.4, columnspacing=1.2,
-                       handlelength=2.2, borderpad=0.5,
-                       bbox_to_anchor=(0.01, 0.99))
-    legend.set_zorder(10)
-
-    # ── RMSE annotation below plot ──
-    rmse_strs = []
+    # ── RMSE: compute and simplify (±D values match by symmetry) ──
+    rmse_vals = {}
     for comp_label, rust_p, rust_m, mu_p, mu_m in [
         ("m_z", mzrp, mzrm, mzmp, mzmm),
         ("m_x", mxrp, mxrm, mxmp, mxmm),
@@ -455,20 +456,36 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
         mu_m_i = np.interp(xrm_c, xmm_c, mu_m)
         rmse_p = np.sqrt(np.mean((rust_p - mu_p_i)**2))
         rmse_m = np.sqrt(np.mean((rust_m - mu_m_i)**2))
-        rmse_strs.append(f"RMSE(${comp_label}$): +D={rmse_p:.1e}, −D={rmse_m:.1e}")
+        # ±D values match by symmetry — report average
+        rmse_vals[comp_label] = 0.5 * (rmse_p + rmse_m)
 
-    fig.text(0.5, -0.01, "    ".join(rmse_strs),
-             ha="center", fontsize=6.5,
+    rmse_text = (f"RMSE(${list(rmse_vals.keys())[0]}$) = {list(rmse_vals.values())[0]:.1e}    "
+                 f"RMSE(${list(rmse_vals.keys())[1]}$) = {list(rmse_vals.values())[1]:.1e}    "
+                 f"RMSE(${list(rmse_vals.keys())[2]}$) = {list(rmse_vals.values())[2]:.1e}")
+
+    fig.tight_layout(rect=(0, 0.05, 1, 0.92))  # leave room top (legend) and bottom (RMSE)
+
+    # Now place legend and RMSE centred on the plot data window
+    bb = ax.get_position()
+    plot_centre_x = bb.x0 + bb.width / 2
+
+    fig.legend(all_handles, all_labels,
+               loc="upper center", ncol=4, frameon=True, framealpha=0.92,
+               fontsize=9, handletextpad=0.4, columnspacing=0.8,
+               handlelength=2.0, borderpad=0.5,
+               bbox_to_anchor=(plot_centre_x, 1.0))
+
+    fig.text(plot_centre_x, 0.01, rmse_text,
+             ha="center", fontsize=9,
              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
 
-    fig.tight_layout()
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
 
     print(f"Wrote Figure A3 → {out_path}")
-    for s in rmse_strs:
-        print(f"  {s}")
+    for k, v in rmse_vals.items():
+        print(f"  RMSE(${k}$) = {v:.1e}")
 
 
 # ── CLI ──────────────────────────────────────────────────────
