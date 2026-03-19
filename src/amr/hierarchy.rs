@@ -3,7 +3,7 @@
 use crate::amr::interp::sample_bilinear;
 use crate::amr::patch::Patch2D;
 use crate::amr::rect::Rect2i;
-use crate::geometry_mask::{Mask2D, MaskShape, assert_mask_len};
+use crate::geometry_mask::{Mask2D, MaskShape, assert_mask_len, edge_smooth_n};
 use crate::grid::Grid2D;
 use crate::vector_field::VectorField2D;
 
@@ -88,8 +88,17 @@ impl AmrHierarchy2D {
     ///
     /// Also builds a coarse boolean mask for the base-grid stepper and indicator.
     pub fn set_geom_shape(&mut self, shape: MaskShape) {
-        // Build coarse mask from the shape (needed by coarse stepper + indicator).
-        let mask = shape.to_mask(&self.base_grid);
+        // Build coarse mask using EdgeSmooth fill fractions: any cell with
+        // nonzero material overlap (fill > 0) is classified as "material".
+        //
+        // This is consistent with apply_fill_fractions() which gives boundary
+        // cells M_eff = fill × Ms × m̂.  The previous shape.to_mask() used a
+        // cell-centre containment test, which excluded ~96 partial-fill cells
+        // whose centre was just outside the disk but whose area overlapped it.
+        // Zeroing those cells removed the EdgeSmooth surface charge smoothing
+        // and artificially stiffened the demagnetising restoring potential.
+        let n_smooth = edge_smooth_n();
+        let (mask, _fill_fractions) = shape.to_mask_and_fill(&self.base_grid, n_smooth);
         self.geom_mask = Some(mask);
         self.geom_shape = Some(shape);
 

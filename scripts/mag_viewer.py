@@ -109,7 +109,7 @@ if _SRC_DIR.exists() and str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 try:
-    import ovf_utils
+    import scripts.ovf_utils as ovf_utils
 except Exception as e:  # pragma: no cover
     raise SystemExit(
         "Could not import ovf_utils. Expected at src/ovf_utils.py.\n"

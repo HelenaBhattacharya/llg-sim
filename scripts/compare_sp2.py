@@ -451,42 +451,42 @@ def main() -> None:
     if args.pub:
         plt.rcParams.update({
             "font.family": "serif",
-            "font.size": 9,
-            "axes.labelsize": 10,
-            "axes.titlesize": 10,
-            "legend.fontsize": 7.5,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
+            "font.size": 12,
+            "axes.labelsize": 14,
+            "axes.titlesize": 14,
+            "legend.fontsize": 11,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.top": True,
             "ytick.right": False,  # we have twinx, handle manually
-            "axes.linewidth": 0.6,
-            "lines.linewidth": 1.2,
-            "lines.markersize": 3,
+            "axes.linewidth": 0.8,
+            "lines.linewidth": 1.4,
+            "lines.markersize": 4,
             "figure.dpi": 300,
             "savefig.dpi": 300,
         })
         _dpi = 300
-        # Match SP4 figure width (6.667 in) for alignment
-        fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(6.667, 4.2))
+        # Match SP4 figure width (6.667 in) for alignment; taller to accommodate larger fonts
+        fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(6.667, 5.0))
     else:
         _dpi = args.dpi
         fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(7.2, 7.6))
 
     # ---- Top: Remanence ----
     # MuMax3: markers only
-    ax_top.plot(d_m, mx_m, "o", color=_cx, markersize=3.5, markeredgewidth=0.0, zorder=1)
+    ax_top.plot(d_m, mx_m, "o", color=_cx, markersize=5, markeredgewidth=0.0, zorder=1)
     # Rust: solid line
-    ax_top.plot(d_r, mx_r, "-", color=_cx, linewidth=1.2, zorder=2)
+    ax_top.plot(d_r, mx_r, "-", color=_cx, linewidth=1.4, zorder=2)
 
     ax_top.set_xlabel(r"$d / \ell_\mathrm{ex}$")
     ax_top.set_ylabel(r"$\langle m_x \rangle$", color=_cx)
     ax_top.tick_params(axis="y", colors=_cx)
 
     ax_top_r = ax_top.twinx()
-    ax_top_r.plot(d_m, my_m, "o", color=_cy, markersize=3.5, markeredgewidth=0.0, zorder=1)
-    ax_top_r.plot(d_r, my_r, "-", color=_cy, linewidth=1.2, zorder=2)
+    ax_top_r.plot(d_m, my_m, "o", color=_cy, markersize=5, markeredgewidth=0.0, zorder=1)
+    ax_top_r.plot(d_r, my_r, "-", color=_cy, linewidth=1.4, zorder=2)
     ax_top_r.set_ylabel(r"$\langle m_y \rangle$", color=_cy)
     ax_top_r.tick_params(axis="y", colors=_cy, direction="in")
 
@@ -501,16 +501,16 @@ def main() -> None:
 
     # Legend for remanence: style encodes source, colour encodes component
     rem_handles = [
-        Line2D([], [], color="k", linestyle="-", linewidth=1.2, label="Rust"),
-        Line2D([], [], color="k", marker="o", linestyle="None", markersize=3, label="MuMax3"),
-        Line2D([], [], color=_cx, linestyle="-", linewidth=2, label=r"$m_x$"),
-        Line2D([], [], color=_cy, linestyle="-", linewidth=2, label=r"$m_y$"),
+        Line2D([], [], color="k", linestyle="-", linewidth=1.4, label="Rust"),
+        Line2D([], [], color="k", marker="o", linestyle="None", markersize=5, label="MuMax3"),
+        Line2D([], [], color=_cx, linestyle="-", linewidth=2.5, label=r"$m_x$"),
+        Line2D([], [], color=_cy, linestyle="-", linewidth=2.5, label=r"$m_y$"),
     ]
     ax_top.legend(
         handles=rem_handles, ncol=4,
         loc="lower center", bbox_to_anchor=(0.5, 1.0),
-        frameon=False, fontsize=7, handlelength=1.2,
-        handletextpad=0.3, columnspacing=0.8,
+        frameon=False, fontsize=11, handlelength=1.4,
+        handletextpad=0.4, columnspacing=1.0,
     )
 
     ax_top.grid(False)
@@ -520,20 +520,20 @@ def main() -> None:
     # MuMax3: red squares
     ax_bot.plot(
         d_m, hc_m, linestyle="None", marker="s", color=_cx,
-        markersize=3.5, markeredgewidth=0.0, label="MuMax3", zorder=1,
+        markersize=5, markeredgewidth=0.0, label="MuMax3", zorder=1,
     )
 
     # OOMMF: blue triangles
     if oommf_table is not None and oommf_table.exists():
         ax_bot.plot(
             d_o, hc_o, linestyle="None", marker="^", color=_cy,
-            markersize=3, markeredgewidth=0.0, label="OOMMF (Donahue)", zorder=1,
+            markersize=4.5, markeredgewidth=0.0, label="OOMMF (Donahue)", zorder=1,
         )
 
     # Rust: black x's
     ax_bot.plot(
         d_r, hc_r, linestyle="None", marker="x", color=_ck,
-        markersize=4, markeredgewidth=0.8, label="Rust", zorder=2,
+        markersize=5.5, markeredgewidth=1.0, label="Rust", zorder=2,
     )
 
     ax_bot.set_xlabel(r"$d / \ell_\mathrm{ex}$")
@@ -541,12 +541,14 @@ def main() -> None:
 
     if args.paper_style or args.pub:
         ax_bot.set_xlim(0, 30)
-        ax_bot.set_ylim(0.044, 0.058)
+        ax_bot.set_ylim(0.044, 0.060)
         ax_bot.set_xticks([0, 5, 10, 15, 20, 25, 30])
+        ax_bot.set_yticks([0.045, 0.050, 0.055, 0.060])
 
     ax_bot.grid(False)
     ax_bot.legend(loc="upper right", frameon=True, framealpha=0.95, edgecolor="0.8",
-                  fontsize=7, borderpad=0.3, handletextpad=0.4)
+                  fontsize=11, borderpad=0.3, handletextpad=0.3, labelspacing=0.25,
+                  markerscale=1.0)
 
     # Save
     args.out.parent.mkdir(parents=True, exist_ok=True)

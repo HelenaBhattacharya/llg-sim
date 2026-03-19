@@ -804,19 +804,19 @@ def main():
     if args.pub:
         plt.rcParams.update({
             "font.family": "serif",
-            "font.size": 9,
-            "axes.labelsize": 10,
-            "axes.titlesize": 10,
-            "legend.fontsize": 8,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
+            "font.size": 11,
+            "axes.labelsize": 13,
+            "axes.titlesize": 13,
+            "legend.fontsize": 11,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.top": True,
             "ytick.right": True,
             "axes.linewidth": 0.6,
             "lines.linewidth": 1.2,
-            "lines.markersize": 1.5,
+            "lines.markersize": 2.0,
             "figure.dpi": 300,
             "savefig.dpi": 300,
             "savefig.bbox": "tight",
@@ -825,10 +825,10 @@ def main():
         # Publication labels
         _our_label = "Rust"
         _ref_label = "MuMax3"
-        _mumax_ms = 1.5
+        _mumax_ms = 2.0
         _rust_lw = 1.2
         _mumax_marker = "o"
-        _legend_fs = 8
+        _legend_fs = 11
         _dpi = 300
     else:
         _our_label = "Rust"
@@ -855,7 +855,7 @@ def main():
     if args.sp4a_only:
         if args.pub:
             # Full-width to align with the freeze-frame triptych below (2000×561 px @ 300 dpi)
-            fig, ax = plt.subplots(1, 1, figsize=(6.667, 2.2))
+            fig, ax = plt.subplots(1, 1, figsize=(6.667, 2.6))
         else:
             fig, ax = plt.subplots(1, 1, figsize=(6.667, 2.8))
 
@@ -882,20 +882,20 @@ def main():
 
         # Compact custom legend: single row ABOVE the axes so it can't overlap data
         from matplotlib.lines import Line2D
-        _fs = 7 if args.pub else 6
+        _fs = 11 if args.pub else 8
         handles = [
             Line2D([], [], color="k", linestyle="-", linewidth=_rust_lw, label="Rust"),
-            Line2D([], [], color="k", marker="o", linestyle="None", markersize=2.5, label="MuMax3"),
-            Line2D([], [], color=_cx, linestyle="-", linewidth=2, label=r"$m_x$"),
-            Line2D([], [], color=_cy, linestyle="-", linewidth=2, label=r"$m_y$"),
-            Line2D([], [], color=_cz, linestyle="-", linewidth=2, label=r"$m_z$"),
+            Line2D([], [], color="k", marker="o", linestyle="None", markersize=4, label="MuMax3"),
+            Line2D([], [], color=_cx, linestyle="-", linewidth=2.5, label=r"$m_x$"),
+            Line2D([], [], color=_cy, linestyle="-", linewidth=2.5, label=r"$m_y$"),
+            Line2D([], [], color=_cz, linestyle="-", linewidth=2.5, label=r"$m_z$"),
         ]
         ax.legend(
             handles=handles, ncol=5,
             loc="lower center", bbox_to_anchor=(0.5, 1.0),
             frameon=False,
-            borderpad=0.1, labelspacing=0.15, handletextpad=0.3,
-            columnspacing=0.8, handlelength=1.2, fontsize=_fs,
+            borderpad=0.1, labelspacing=0.2, handletextpad=0.4,
+            columnspacing=1.0, handlelength=1.4, fontsize=_fs,
         )
 
         # Optional mx=0 crossing markers
@@ -909,7 +909,7 @@ def main():
                 if t0_ra is not None:
                     ax.axvline(float(t0_ra), linestyle="--", linewidth=VLINE_LW, color="0.5")
 
-        fig.subplots_adjust(left=0.08, right=0.98, bottom=0.18, top=0.88)
+        fig.subplots_adjust(left=0.10, right=0.97, bottom=0.16, top=0.86)
 
         if args.out:
             args.out.parent.mkdir(parents=True, exist_ok=True)

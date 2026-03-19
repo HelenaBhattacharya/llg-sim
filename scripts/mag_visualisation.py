@@ -116,6 +116,22 @@ def _auto_arrow_stride(nx: int, ny: int, target: int = 10) -> int:
     return max(1, int(round(min(nx, ny) / float(target))))
 
 
+def _nice_step(extent: float, target_ticks: int = 5) -> float:
+    """Choose a 'nice' round tick step for a given axis extent."""
+    raw = extent / max(1, target_ticks)
+    # Round to nearest nice value: 1, 2, 5, 10, 20, 50, 100, 200, 500...
+    mag = 10.0 ** np.floor(np.log10(raw))
+    residual = raw / mag
+    if residual < 1.5:
+        return mag
+    elif residual < 3.5:
+        return 2.0 * mag
+    elif residual < 7.5:
+        return 5.0 * mag
+    else:
+        return 10.0 * mag
+
+
 def _resample_vec_bilinear(src: np.ndarray, nx_t: int, ny_t: int) -> np.ndarray:
     """Resample a (nx, ny, 3) vector field to (nx_t, ny_t, 3) via bilinear interpolation.
 
@@ -467,6 +483,7 @@ def plot_abd_triptych(
     arrow_scale_cells: float = 10.0,
     arrow_width: float = 0.0018,
     delta_clim: Optional[Tuple[float, float]] = None,
+    pub: bool = False,
 ) -> None:
     """Triptych plot: A (rust), B (mumax), and Δ = A - B.
 
@@ -477,6 +494,9 @@ def plot_abd_triptych(
     Quiver arrows (if enabled) show in-plane vectors:
       - for A and B: (mx, my)
       - for Δ: (Δmx, Δmy)
+
+    If pub=True, produces a publication-quality figure matching the SP4 time-series
+    width (6.667 in) with larger fonts and shared y-axis.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -551,23 +571,64 @@ def plot_abd_triptych(
 
     aspect = (lx / ly) if (ly > 0) else 1.0
     aspect = max(0.25, min(4.0, float(aspect)))
-    panel_h = 4.0
-    panel_w = min(7.5, 4.0 * aspect)
-    fig_w = 3.0 * panel_w
-    fig_h = panel_h
 
-    # GridSpec: top row = 3 panels; bottom row = 2 colorbars (A/B share; Δ separate)
-    fig = plt.figure(figsize=(fig_w, fig_h + 1.35))
-    gs = fig.add_gridspec(
-        nrows=2,
-        ncols=3,
-        height_ratios=[20.0, 1.2],
-        hspace=0.35,
-        wspace=0.08,
-    )
-    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])]
-    cax_ab = fig.add_subplot(gs[1, 0:2])
-    cax_d = fig.add_subplot(gs[1, 2])
+    if pub:
+        # Publication mode: match original layout exactly — equal spacing,
+        # all panels with ticks, tight packing, serif fonts + LaTeX labels
+        plt.rcParams.update({
+            "font.family": "serif",
+            "font.size": 8,
+            "axes.labelsize": 9,
+            "axes.titlesize": 10,
+            "xtick.labelsize": 7,
+            "ytick.labelsize": 7,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+            "axes.linewidth": 0.5,
+        })
+        fig_w = 6.667
+        fig_h = 2.4
+        _dpi = 300
+        _title_a = "A (Rust)"
+        _title_b = "B (MuMax3)"
+        _title_d = r"$\Delta$ = A $-$ B"
+    else:
+        panel_h = 4.0
+        panel_w = min(7.5, 4.0 * aspect)
+        fig_w = 3.0 * panel_w
+        fig_h = panel_h + 1.35
+        _dpi = 250
+        _title_a = "A (rust)"
+        _title_b = "B (mumax)"
+        _title_d = "Δ = A − B"
+
+    # GridSpec layout
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    if pub:
+        # 3 equal columns, same spacing throughout — matches original layout
+        gs = fig.add_gridspec(
+            nrows=2,
+            ncols=3,
+            height_ratios=[1.0, 0.05],
+            hspace=0.10,
+            wspace=0.20,
+        )
+        axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])]
+        cax_ab = fig.add_subplot(gs[1, 0:2])
+        cax_d = fig.add_subplot(gs[1, 2])
+    else:
+        gs = fig.add_gridspec(
+            nrows=2,
+            ncols=3,
+            height_ratios=[20.0, 1.2],
+            hspace=0.35,
+            wspace=0.08,
+        )
+        axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])]
+        cax_ab = fig.add_subplot(gs[1, 0:2])
+        cax_d = fig.add_subplot(gs[1, 2])
 
     # If delta_clim is provided, use fixed [-1,1] for A/B and separate limits for Δ.
     ab_clim = (-1.0, 1.0) if delta_clim is not None else clim
@@ -583,7 +644,7 @@ def plot_abd_triptych(
         vmin=ab_clim[0] if ab_clim else None,
         vmax=ab_clim[1] if ab_clim else None,
     )
-    axes[0].set_title("A (rust)")
+    axes[0].set_title(_title_a)
     axes[0].set_xlim(0, lx)
     axes[0].set_ylim(0, ly)
 
@@ -597,7 +658,7 @@ def plot_abd_triptych(
         vmin=ab_clim[0] if ab_clim else None,
         vmax=ab_clim[1] if ab_clim else None,
     )
-    axes[1].set_title("B (mumax)")
+    axes[1].set_title(_title_b)
     axes[1].set_xlim(0, lx)
     axes[1].set_ylim(0, ly)
 
@@ -611,7 +672,7 @@ def plot_abd_triptych(
         vmin=d_clim[0] if d_clim else None,
         vmax=d_clim[1] if d_clim else None,
     )
-    axes[2].set_title("Δ = A − B")
+    axes[2].set_title(_title_d)
     axes[2].set_xlim(0, lx)
     axes[2].set_ylim(0, ly)
 
@@ -624,29 +685,85 @@ def plot_abd_triptych(
                 headwidth=3.0, headlength=3.0, headaxislength=3.0, minlength=0.0,
             )
 
-    for ax in axes:
-        ax.set_xlabel(xlabel)
-    axes[0].set_ylabel(ylabel)
+    if pub:
+        # All panels get axis labels and ticks — matching original layout
+        for ax in axes:
+            ax.set_xlabel(xlabel)
+        axes[0].set_ylabel(ylabel)
 
-    fig.suptitle(title)
+        # y ticks for the thin domain
+        for ax in axes:
+            ax.set_yticks([0, 50, 100])
 
-    # Colorbar for A/B (shared)
-    cbar_ab = fig.colorbar(im0, cax=cax_ab, orientation="horizontal")
-    cbar_ab.set_label(cbar_label_ab)
+        # B and Δ: hide y tick labels (redundant) but keep tick marks
+        for ax in axes[1:]:
+            ax.set_yticklabels([])
 
-    # Colorbar for Δ (separate scale) — explicit ticks for clean labels
-    cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
-    cbar_d.set_label(cbar_label_d)
-    if d_clim:
-        d_abs = max(abs(d_clim[0]), abs(d_clim[1]))
-        ticks = [-d_abs, -d_abs / 2, 0.0, d_abs / 2, d_abs]
-        cbar_d.set_ticks(ticks)
-        cbar_d.ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.3f}"))
+        # LaTeX-formatted colorbar labels
+        _pub_label_ab = {
+            "m_x": r"$m_x$", "m_y": r"$m_y$", "m_z": r"$m_z$",
+            "m_parallel": r"$m_\parallel$",
+        }.get(cbar_label_ab, cbar_label_ab)
+        _pub_label_d = {
+            "Δm_x": r"$\Delta m_x$", "Δm_y": r"$\Delta m_y$", "Δm_z": r"$\Delta m_z$",
+            "Δm_parallel": r"$\Delta m_\parallel$",
+        }.get(cbar_label_d, cbar_label_d)
 
-    # Manual spacing (avoid tight_layout warnings with colorbar axes)
-    fig.subplots_adjust(top=0.88, bottom=0.14)
+        # Colorbar for A/B (shared)
+        cbar_ab = fig.colorbar(im0, cax=cax_ab, orientation="horizontal")
+        cbar_ab.set_label(_pub_label_ab, fontsize=9)
+        cbar_ab.ax.tick_params(labelsize=7)
+        if ab_clim:
+            cbar_ab.set_ticks([-1.0, -0.5, 0.0, 0.5, 1.0])
 
-    fig.savefig(out_path, dpi=250, bbox_inches="tight")
+        # Colorbar for Δ
+        cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
+        cbar_d.set_label(_pub_label_d, fontsize=9)
+        cbar_d.ax.tick_params(labelsize=7)
+        if d_clim:
+            d_abs = max(abs(d_clim[0]), abs(d_clim[1]))
+            cbar_d.set_ticks([-d_abs, 0.0, d_abs])
+            cbar_d.ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.3f}"))
+
+        fig.subplots_adjust(top=0.95, bottom=0.14, left=0.06, right=0.98)
+
+        # Thin dashed divider between B and Δ colorbars
+        fig.canvas.draw()
+        b_bbox = axes[1].get_position()
+        d_bbox = axes[2].get_position()
+        x_div = 0.5 * (b_bbox.x1 + d_bbox.x0)
+        from matplotlib.lines import Line2D as _Line2D
+        fig.add_artist(_Line2D(
+            [x_div, x_div], [0.08, 0.92],
+            transform=fig.transFigure, clip_on=False,
+            color="0.45", linewidth=0.7, linestyle="--",
+        ))
+
+    else:
+        for ax in axes:
+            ax.set_xlabel(xlabel)
+        axes[0].set_ylabel(ylabel)
+
+        if title:
+            fig.suptitle(title)
+
+        # Colorbar for A/B (shared)
+        cbar_ab = fig.colorbar(im0, cax=cax_ab, orientation="horizontal")
+        cbar_ab.set_label(cbar_label_ab)
+
+        # Colorbar for Δ (separate scale) — explicit ticks for clean labels
+        cbar_d = fig.colorbar(imd, cax=cax_d, orientation="horizontal")
+        cbar_d.set_label(cbar_label_d)
+        if d_clim:
+            d_abs = max(abs(d_clim[0]), abs(d_clim[1]))
+            ticks = [-d_abs, -d_abs / 2, 0.0, d_abs / 2, d_abs]
+            cbar_d.set_ticks(ticks)
+            cbar_d.ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.3f}"))
+
+        # Manual spacing (avoid tight_layout warnings with colorbar axes)
+        fig.subplots_adjust(top=0.88, bottom=0.14)
+
+    fig.savefig(out_path, dpi=_dpi, bbox_inches="tight")
 # end plot_abd_triptych
     plt.close(fig)
 
@@ -1673,6 +1790,12 @@ def main() -> int:
         ),
     )
 
+    p.add_argument(
+        "--pub",
+        action="store_true",
+        help="Publication-quality styling: larger fonts, shared y-axis, matching SP4 figure width.",
+    )
+
     args = p.parse_args()
 
     input_a = Path(args.input)
@@ -1763,6 +1886,7 @@ def main() -> int:
                     delta_clim=delta_clim_arg,
                     show_arrows=bool(args.vectors),
                     units=args.units,
+                    pub=getattr(args, 'pub', False),
                 )
                 print(f"  wrote {out_png}")
 

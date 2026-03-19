@@ -32,9 +32,12 @@ use crate::vector_field::VectorField2D;
 use super::demag_poisson_mg::{
     DemagPoissonMGConfig, DemagPoissonMGHybrid, HybridConfig,
 };
+use super::demag_fft_uniform;
 use super::mg_kernels;
 
 use std::sync::{Mutex, OnceLock};
+
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Patch-level Poisson data (Phase 1 of composite V-cycle)
@@ -1243,6 +1246,160 @@ impl Default for CompositeVCycleConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Direct Newell near-field: exact demag at L0 material cells
+// ---------------------------------------------------------------------------
+//
+// Replaces PPPM entirely.  For each L0 material cell, B is computed by
+// direct summation of the Newell tensor over ALL material cells within a
+// configurable radius.  This is the same physics as the FFT convolution
+// but evaluated locally — no FFT, no MG approximation, no calibration.
+//
+// The MG solve is kept ONLY for providing φ to ghost-fill AMR patches
+// during the composite V-cycle.  The L0 B field is overwritten by the
+// exact Newell result after the MG solve completes.
+//
+// Cost: O(N_material × R²) per demag call.  For 96² grid with ~5000
+// material cells and radius=48 (covers entire disk), ~120M flops ≈ 50ms.
+// Competitive with MG+PPPM and far simpler.
+
+fn newell_direct_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LLG_NEWELL_DIRECT")
+            .map(|v| v != "0")
+            .unwrap_or(true)  // ON by default in composite mode
+    })
+}
+
+fn newell_direct_radius() -> usize {
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("LLG_NEWELL_DIRECT_RADIUS")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(0)  // 0 = use full grid (all material cells)
+    })
+}
+
+/// Precomputed Newell tensor components for direct demag evaluation.
+///
+/// Stores K_xx, K_xy, K_yy, K_zz (= μ₀ × N) for all offsets (di, dj)
+/// within a square of side 2*radius+1.  K includes μ₀ so B = K × M (in Tesla).
+struct NewellDirectDemag {
+    kxx: Vec<f64>,
+    kxy: Vec<f64>,
+    kyy: Vec<f64>,
+    kzz: Vec<f64>,
+    radius: usize,
+    stride: usize,
+    /// Indices of ALL material cells on L0 (where mask=true).
+    material_cells: Vec<usize>,
+}
+
+impl NewellDirectDemag {
+    fn new(dx: f64, dy: f64, dz: f64, radius: usize, mask: &[bool], _nx: usize) -> Self {
+        let stride = 2 * radius + 1;
+        let n = stride * stride;
+        let mut kxx = vec![0.0; n];
+        let mut kxy = vec![0.0; n];
+        let mut kyy = vec![0.0; n];
+        let mut kzz = vec![0.0; n];
+
+        let accuracy = 10.0;
+
+        for dj in -(radius as isize)..=(radius as isize) {
+            for di in -(radius as isize)..=(radius as isize) {
+                let (k_xx, k_xy, k_yy, k_zz) =
+                    demag_fft_uniform::kernel_2d_components_mumax_like(
+                        dx, dy, dz, di, dj, accuracy,
+                    );
+                let idx = (dj + radius as isize) as usize * stride
+                        + (di + radius as isize) as usize;
+                kxx[idx] = k_xx;
+                kxy[idx] = k_xy;
+                kyy[idx] = k_yy;
+                kzz[idx] = k_zz;
+            }
+        }
+
+        let material_cells: Vec<usize> = (0..mask.len())
+            .filter(|&i| mask[i]).collect();
+
+        Self { kxx, kxy, kyy, kzz, radius, stride, material_cells }
+    }
+
+    /// Compute exact B_demag at ALL material cells by direct Newell summation.
+    ///
+    /// Overwrites b_demag at every material cell.  Vacuum cells are zeroed.
+    ///
+    /// Two optimisations over the original offset-scanning loop:
+    ///   1. Inner loop iterates over `material_cells` directly instead of all
+    ///      (2R+1)² offsets. This reduces from O(N_mat × R²) with mostly-skipped
+    ///      vacuum iterations to O(N_mat²) with zero waste.
+    ///      For 3228 material cells, R=96: 10.4M vs 120M iterations.
+    ///   2. Outer loop is parallelised with rayon (each target cell is independent).
+    ///
+    /// Note: summation order differs from the offset-scanning version (source-index
+    /// order vs offset order), so results differ at floating-point rounding level
+    /// (~1e-16 relative). Physics-identical for all practical purposes.
+    fn compute_all(
+        &self,
+        b_demag: &mut VectorField2D,
+        m: &[[f64; 3]],
+        _mask: &[bool],
+        nx: usize, ny: usize,
+        ms: f64,
+    ) {
+        let r = self.radius as isize;
+
+        // Zero everything first (vacuum stays zero).
+        for v in b_demag.data.iter_mut() {
+            *v = [0.0; 3];
+        }
+
+        // Parallel over target cells; inner loop over material sources only.
+        let results: Vec<(usize, [f64; 3])> = self.material_cells
+            .par_iter()
+            .map(|&idx| {
+                let ci = (idx % nx) as isize;
+                let cj = (idx / nx) as isize;
+
+                let mut bx = 0.0f64;
+                let mut by = 0.0f64;
+                let mut bz = 0.0f64;
+
+                for &src in &self.material_cells {
+                    let si = (src % nx) as isize;
+                    let sj = (src / nx) as isize;
+                    let di = si - ci;
+                    let dj = sj - cj;
+
+                    // Skip sources outside the precomputed kernel table.
+                    // With radius >= max(nx,ny) this never triggers, but
+                    // kept for safety if radius is reduced in future.
+                    if di < -r || di > r || dj < -r || dj > r { continue; }
+
+                    let k = (dj + r) as usize * self.stride
+                          + (di + r) as usize;
+                    let mx = m[src][0] * ms;
+                    let my = m[src][1] * ms;
+                    let mz = m[src][2] * ms;
+
+                    bx += self.kxx[k] * mx + self.kxy[k] * my;
+                    by += self.kxy[k] * mx + self.kyy[k] * my;
+                    bz += self.kzz[k] * mz;
+                }
+                (idx, [bx, by, bz])
+            })
+            .collect();
+
+        // Scatter parallel results back into b_demag.
+        for (idx, b) in results {
+            b_demag.data[idx] = b;
+        }
+    }
+}
+
 pub(crate) struct CompositeGridPoisson {
     base_grid: Grid2D,
     l0_solver: DemagPoissonMGHybrid,
@@ -1255,15 +1412,26 @@ pub(crate) struct CompositeGridPoisson {
     coarse_div: Vec<f64>,
     /// V-cycle configuration.
     vcfg: CompositeVCycleConfig,
+    /// Direct Newell demag for exact L0 B (lazily initialised).
+    newell: Option<NewellDirectDemag>,
 }
 
 impl CompositeGridPoisson {
     pub(crate) fn new(base_grid: Grid2D) -> Self {
         let mg_cfg = DemagPoissonMGConfig::from_env();
 
-        // Auto-enable PPPM for L0 accuracy — patches provide fine-resolution
-        // near-field, but L0 needs PPPM to match Newell at uncovered cells.
-        if std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE").is_err() {
+        // PPPM is no longer auto-enabled — direct Newell replaces it for L0 B.
+        // MG is kept only for φ (V-cycle ghost-fills to patches).
+        // Explicitly disable PPPM unless the user forces it on.
+        if newell_direct_enabled() && std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE").is_err() {
+            unsafe {
+                std::env::set_var("LLG_DEMAG_MG_HYBRID_ENABLE", "0");
+            }
+            eprintln!(
+                "[composite] direct Newell enabled — PPPM disabled (MG kept for V-cycle φ only)"
+            );
+        } else if std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE").is_err() {
+            // Newell disabled, fall back to PPPM.
             unsafe {
                 std::env::set_var("LLG_DEMAG_MG_HYBRID_ENABLE", "1");
                 std::env::set_var("LLG_DEMAG_MG_HYBRID_RADIUS", "14");
@@ -1284,6 +1452,7 @@ impl CompositeGridPoisson {
             coarse_phi: vec![0.0; n],
             coarse_div: vec![0.0; n],
             vcfg: CompositeVCycleConfig::default(),
+            newell: None,
         }
     }
 
@@ -1395,21 +1564,20 @@ impl CompositeGridPoisson {
         // receives &[]), so all restriction work was wasted. The residuals
         // computed above are retained for convergence monitoring only.
 
-        // ═══════ L0 SOLVE (MG + PPPM, no enhanced-RHS) ═══════
+        // ═══════ L0 SOLVE (MG for φ; B will be overwritten by Newell) ═══════
 
         let phi_old_l0 = self.coarse_phi.clone();
 
         self.l0_solver.solve_with_corrections(
             &h.coarse, &[], b_scratch, mat);
 
-        // Extract updated L0 φ.
+        // Extract updated L0 φ (used for V-cycle ghost-fills to patches).
         let new_phi = self.l0_solver.mg.extract_magnet_layer_phi();
         self.coarse_phi.copy_from_slice(&new_phi);
 
-        // Apply PPPM-φ correction so patch ghost BCs match Newell.
-        if let Some(dk) = self.l0_solver.delta_kernel() {
-            dk.apply_phi_correction(&h.coarse, &mut self.coarse_phi, mat.ms);
-        }
+        // NOTE: PPPM-φ correction removed — direct Newell replaces PPPM.
+        // MG φ is used raw for ghost-fills; any φ error is corrected by
+        // the patch-level smoother during the upstroke.
 
         // ═══════ UPSTROKE: coarsest → finest ═══════
 
@@ -1545,6 +1713,28 @@ impl CompositeGridPoisson {
             self.coarse_div = vec![0.0; n_coarse];
         }
 
+        // ---- Lazy-init direct Newell tensor ----
+        if newell_direct_enabled() && self.newell.is_none() {
+            let cnx = h.base_grid.nx;
+            let cny = h.base_grid.ny;
+            // Radius 0 = use full grid extent (covers all material interactions)
+            let r_env = newell_direct_radius();
+            let r = if r_env == 0 { cnx.max(cny) } else { r_env };
+            eprintln!(
+                "[composite] building direct Newell tensor (radius={}) ...", r);
+            let t0 = std::time::Instant::now();
+            let default_mask = vec![true; cnx * cny];
+            let mask = h.geom_mask.as_deref()
+                .unwrap_or(&default_mask);
+            self.newell = Some(NewellDirectDemag::new(
+                h.base_grid.dx, h.base_grid.dy, h.base_grid.dz,
+                r, mask, cnx));
+            let n_mat = self.newell.as_ref().unwrap().material_cells.len();
+            eprintln!(
+                "[composite] Newell tensor ready: {} material cells, radius={}, {:.1}s",
+                n_mat, r, t0.elapsed().as_secs_f64());
+        }
+
         // ---- Compute fine ∇·M on all patches (patch RHS) ----
         if has_patches {
             compute_all_patch_rhs(h, &mut self.l1_data, &mut self.l2plus_data, mat.ms);
@@ -1645,6 +1835,21 @@ impl CompositeGridPoisson {
         // against this better base, and so on up to the finest level.
 
         b_demag_coarse.data.copy_from_slice(&b_scratch.data);
+
+        // ── Direct Newell: overwrite L0 B with exact Newell tensor result ──
+        // This replaces MG+PPPM B at all material cells with the exact
+        // demag field computed from the Newell tensor and actual M values.
+        // Patches then compute their defect corrections against this exact base.
+        if let Some(ref newell) = self.newell {
+            if let Some(gm) = h.geom_mask.as_deref() {
+                newell.compute_all(
+                    b_demag_coarse,
+                    &h.coarse.data, gm,
+                    h.base_grid.nx, h.base_grid.ny,
+                    mat.ms,
+                );
+            }
+        }
 
         let cnx = h.base_grid.nx;
         let cny = h.base_grid.ny;
@@ -1872,6 +2077,39 @@ impl CompositeGridPoisson {
         self.l0_solver.solve_with_corrections(
             &h.coarse, &corrections, b_demag_coarse, mat);
 
+        // ── Direct Newell: overwrite L0 B with exact result ──
+        if newell_direct_enabled() {
+            // Lazy-init Newell tensor (same logic as compute_vcycle)
+            if self.newell.is_none() {
+                let cnx = h.base_grid.nx;
+                let cny = h.base_grid.ny;
+                let r_env = newell_direct_radius();
+                let r = if r_env == 0 { cnx.max(cny) } else { r_env };
+                eprintln!("[composite] building direct Newell tensor (radius={}) ...", r);
+                let t0 = std::time::Instant::now();
+                let default_mask = vec![true; cnx * cny];
+                let mask = h.geom_mask.as_deref()
+                    .unwrap_or(&default_mask);
+                self.newell = Some(NewellDirectDemag::new(
+                    h.base_grid.dx, h.base_grid.dy, h.base_grid.dz,
+                    r, mask, cnx));
+                let n_mat = self.newell.as_ref().unwrap().material_cells.len();
+                eprintln!(
+                    "[composite] Newell tensor ready: {} material cells, radius={}, {:.1}s",
+                    n_mat, r, t0.elapsed().as_secs_f64());
+            }
+            if let Some(ref newell) = self.newell {
+                if let Some(gm) = h.geom_mask.as_deref() {
+                    newell.compute_all(
+                        b_demag_coarse,
+                        &h.coarse.data, gm,
+                        h.base_grid.nx, h.base_grid.ny,
+                        mat.ms,
+                    );
+                }
+            }
+        }
+
         if composite_diag() {
             let _l0_phi = self.l0_solver.mg.extract_magnet_layer_phi();
             let phi_max = _l0_phi.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -2030,22 +2268,26 @@ pub fn compute_composite_demag(
         let solver = CompositeGridPoisson::new(h.base_grid);
         static ONCE: OnceLock<()> = OnceLock::new();
         ONCE.get_or_init(|| {
+            let newell = newell_direct_enabled();
             let pppm = std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE")
                 .map(|v| v == "1").unwrap_or(false);
             let erhs = enhanced_rhs_enabled();
             let pdef = patch_defect_enabled();
             let patch_mode = if pdef { "defect-correction" } else { "bilinear-interp" };
+            let l0_mode = if newell { "Newell-direct" }
+                          else if pppm { "MG+PPPM" }
+                          else { "MG-only" };
             if vcycle_enabled() {
                 eprintln!(
-                    "[composite] V-CYCLE mode (PPPM={}, enhanced-RHS={}, patch-B={}) — \
+                    "[composite] V-CYCLE mode (L0-B={}, enhanced-RHS={}, patch-B={}) — \
                      iterative composite solve",
-                    pppm, erhs, patch_mode,
+                    l0_mode, erhs, patch_mode,
                 );
             } else {
                 eprintln!(
-                    "[composite] DEFECT mode (PPPM={}, enhanced-RHS={}, patch-B={}) — \
+                    "[composite] DEFECT mode (L0-B={}, enhanced-RHS={}, patch-B={}) — \
                      L0 MG solve + {} on patches",
-                    pppm, erhs, patch_mode, patch_mode,
+                    l0_mode, erhs, patch_mode, patch_mode,
                 );
             }
         });

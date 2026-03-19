@@ -13,29 +13,41 @@
 //   - Cell size: dx = dy = 3.125 nm (96² base on 300 nm box)
 //   - α = 0.01 for dynamics (physical Permalloy damping)
 //   - dt = 10 fs with 2 AMR levels; 3 fs with 3 AMR levels (auto-selected)
-//   - B_shift = 10 mT → s_eq ≈ 0.12 (safely in the linear regime)
-//     At β = 0.2 the restoring force is strong: old cfft run showed
-//     r_eq ≈ 11.5nm at 10mT (s = 0.115), well within linear regime.
+//   - B_shift = 20 mT → s_eq ≈ 55nm (s/R ≈ 0.55, mildly nonlinear)
+//     Larger field gives ~15nm orbit amplitude for clean frequency extraction.
+//     Old cfft run (80×80, 20mT) gave 822 MHz from 8 zero crossings — reliable.
+//     10mT gives only s_eq ≈ 9.5nm, orbit drowns in spin-wave ringdown noise.
 //
 // CFL note: With 3 AMR levels (ratio=2), the finest dx = 3.125/8 = 0.39 nm.
 //   Exchange CFL requires dt < ~3.5 fs at this spacing.  dt=3 fs gives
 //   good margin.  With 2 levels, dx_fine=0.78nm, dt=10fs.
 //   The code auto-selects dt based on AMR level count.
 //
+// MG stencil: default iso27 is used.  The solver warns about dz/dx = 6.4
+//   conditioning, but in Newell-direct mode MG only provides φ for patch
+//   ghost-fills (L0 B is exact from Newell).  The iso27 alpha-clamping
+//   weakens the z-face weight at high aspect ratios, which slows MG
+//   convergence but does not affect the converged solution.
+//   Override with LLG_DEMAG_MG_STENCIL=7 if MG convergence is poor.
+//
 // Protocol (Guslienko's method):
 //   Phase 1: Relax vortex to ground state (α = 0.5, B = 0, 1.5ns)
-//   Phase 2: Apply 10 mT in-plane field, relax to shifted equilibrium (α = 0.5, 3ns)
+//   Phase 2: Apply 20 mT in-plane field, relax to shifted equilibrium (α = 0.5, 3ns)
 //   Phase 3: Remove field, evolve with α = 0.01 — core oscillates ~6 periods in 8ns
 //
 // Expected result: nearly-circular orbits with slow decay,
 //   eigenfrequency ~740 MHz for β = 0.2 (Guslienko 2002 Fig 3 curve b;
 //   Novosad 2005 empirical scaling: f ≈ 3700×β MHz = 740 MHz).
-//   Old cfft run (80² base) gave 816 MHz — 10% overestimate from coarser grid.
-//   At 10 mT the equilibrium displacement is ~12nm (s ≈ 0.12), safely linear.
+//   Old cfft run (80² base, 20mT) gave 822 MHz — 11% above Novosad.
+//   At 20 mT the equilibrium displacement is ~55nm (s/R ≈ 0.55), mildly
+//   nonlinear but the old cfft frequency was stable across time windows
+//   (812–842 MHz).  The larger orbit (8–15nm amplitude) gives much better
+//   signal-to-noise for zero-crossing frequency extraction vs 10mT (~4nm).
 //
-// AMR: 3 levels (L1 boundary arcs, L2 intermediate, L3 vortex core tracking).
+// AMR: 3 levels by default (L1 boundary arcs, L2 intermediate, L3 vortex core).
 //   dx_fine = 0.39 nm — 14.6 cells per exchange length.
 //   dt = 3 fs (auto-selected for CFL safety at L3).
+//   Use LLG_AMR_MAX_LEVEL=2 for faster 2-level run (dt=10fs, ~2.5hrs).
 //
 // AMR features:
 //   - boundary_layer=4: ensures disk edge gets refinement patches
@@ -56,12 +68,16 @@
 //   3. AMR + coarse-FFT demag
 //   4. AMR + composite MG demag (optional, --skip-composite to disable)
 //
-// Run:
-//   cargo run --release --bin bench_vortex_gyration -- --amr-only --skip-composite --plots
-//     (AMR only, ~60-90 min: 2ns relax + 5ns gyration at dt=5fs)
+// Run (recommended — AMR cfft + composite, 3 levels, ~4-5 hrs):
+//   LLG_DEMAG_COMPOSITE_VCYCLE=1 LLG_COMPOSITE_MAX_CYCLES=1 \
+//     cargo run --release --bin bench_vortex_gyration -- --amr-only --plots
+//
+// Run (fast — 2 AMR levels, ~2.5 hrs):
+//   LLG_AMR_MAX_LEVEL=2 LLG_DEMAG_COMPOSITE_VCYCLE=1 LLG_COMPOSITE_MAX_CYCLES=1 \
+//     cargo run --release --bin bench_vortex_gyration -- --amr-only --plots
+//
+// Run (full 4-method comparison with fine FFT reference):
 //   cargo run --release --bin bench_vortex_gyration -- --plots
-//     (Full 4-method comparison, ~3-4 hours)
-//   cargo run --release --bin bench_vortex_gyration -- --skip-composite --plots
 
 use std::f64::consts::PI;
 use std::fs::{self, File, OpenOptions};
@@ -542,7 +558,7 @@ fn main() {
         || args.iter().any(|a| a=="--skip-fine-ref");
     let skip_coarse = (amr_only || fine_only) && !coarse_only;
     let skip_comp = uniform_only || args.iter().any(|a| a=="--skip-composite");
-    let skip_cfft = uniform_only; // skip AMR+coarse-FFT path
+    let skip_cfft = uniform_only || args.iter().any(|a| a=="--skip-cfft");
 
     let amr_lvl: usize = std::env::var("LLG_AMR_MAX_LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
 
@@ -568,7 +584,11 @@ fn main() {
     // Grid: 96² base → dx = 3.125 nm (< l_ex ≈ 5.7 nm ✓)
     // Disk spans 64 cells in diameter (21% more than old 80² setup's 53)
     // Vacuum gap = 50nm = 16 cells per side — safe for boundary_layer=4
-    let bnx = 96_usize; let bny = 96;
+    //
+    // Diagnostic: LLG_BASE_NX=80 reproduces the old 80×80 grid (dx=3.75nm)
+    // for direct comparison with the old 862 MHz cfft result.
+    let bnx: usize = std::env::var("LLG_BASE_NX").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
+    let bny = bnx;
     let dx = domain / bnx as f64;
     let dy = dx;
     let ratio = 2_usize; let ghost = 2;
@@ -597,13 +617,21 @@ fn main() {
     //   τ_relax = 1/(α×ω₀) ≈ 1/(0.5 × 2π × 740MHz) ≈ 0.43ns
     //   Phase 1: 1.5ns = 3.5τ → adequate relaxation
     //   Phase 2: 3.0ns = 7.0τ → well equilibrated under field
+    //            (old 80×80 run used 2.0ns, core still creeping; 3ns is safer)
     //   Phase 3: 8.0ns → ~5.9 periods at 740 MHz
-    let relax_steps = (1.5e-9 / dt).ceil() as usize;
+    //            Spin-wave ringdown decays by ~3ns (τ_FMR ≈ 0.56ns, 5τ ≈ 2.8ns)
+    //            Clean frequency window: t = 3–8ns → ~3.7 clean periods minimum
+    let relax_steps = (1.0e-9 / dt).ceil() as usize;
     let field_relax_steps = (3.0e-9 / dt).ceil() as usize;
-    let b_shift = 10.0e-3;   // 10 mT in-plane field → s_eq ≈ 0.12 (from old cfft data)
-                              // Safely in the linear regime (s < 0.15).
-                              // Old cfft run showed core at (0.2, 11.5)nm under 10mT.
-    let gyr_time = 8.0e-9;   // 8 ns — ~5.9 periods at 740 MHz
+    let b_shift = 20.0e-3;   // 20 mT in-plane field
+                              // Old cfft (80×80, 20mT): s_eq ≈ 56nm (0.56R), f = 822 MHz
+                              // Gives ~8-15nm orbit amplitude — large enough for clean
+                              // zero-crossing frequency extraction above spin-wave noise.
+                              // 10mT gives only ~4nm orbit → drowns in ringdown noise.
+                              // Slightly nonlinear (s/R ≈ 0.55) but old cfft showed stable
+                              // frequency (812–842 MHz) across all time windows.
+    let gyr_time: f64 = std::env::var("LLG_GYR_TIME_NS")
+    .ok().and_then(|s| s.parse().ok()).unwrap_or(8.0) * 1e-9;
     let gyr_steps = (gyr_time/dt).ceil() as usize;
 
     // Output cadences
@@ -653,7 +681,7 @@ fn main() {
     let cp = ClusterPolicy {
         indicator: ind, buffer_cells: 4, boundary_layer: bl,
         min_patch_area: 16, merge_distance: 1, max_patches: 0,
-        connectivity: Connectivity::Eight, min_efficiency: 0.65, max_flagged_fraction: 0.50,
+        connectivity: Connectivity::Eight, min_efficiency: 0.65, max_flagged_fraction: 1.0,
         confine_dilation: true,  // Safe with 300nm domain: 50nm vacuum gap = 16 cells >> buffer=4
     };
 
@@ -680,17 +708,36 @@ fn main() {
         h.set_geom_shape(disk.clone()); Some(h)
     } else { None };
 
-    // --- Checkpoint 1: verify geometry mask zeroed vacuum on L0 after init ---
+    // --- Verify EdgeSmooth consistency ---
+    //
+    // With the fill-fraction mask in set_geom_shape (hierarchy.rs fix),
+    // EdgeSmooth boundary cells (0 < fill < 1) are marked "material" and
+    // their partial M is preserved.  This check verifies the fix works:
+    // there should be zero "contaminated" cells because all nonzero-M cells
+    // are now correctly classified as material.
     {
         let nc = check_vacuum_contamination("cfft after set_geom_shape", &h_cf);
-        assert!(nc == 0, "FATAL: cfft L0 has {} non-zero vacuum cells after set_geom_shape", nc);
+        assert!(nc == 0, "FATAL: cfft L0 has {} non-zero vacuum cells — \
+            is the hierarchy.rs fill-fraction mask fix applied?", nc);
+        // Report EdgeSmooth cell counts for diagnostics.
+        let n_material = mc.iter().filter(|&&v| v).count();
+        let staircase_mask = disk.to_mask(&bg);
+        let n_staircase = staircase_mask.iter().filter(|&&v| v).count();
+        if n_material > n_staircase {
+            println!("  [EdgeSmooth] {} boundary cells preserved ({} fill-frac material vs {} staircase)",
+                n_material - n_staircase, n_material, n_staircase);
+        }
     }
     if let Some(ref hc) = h_co {
         let nc = check_vacuum_contamination("comp after set_geom_shape", hc);
-        assert!(nc == 0, "FATAL: comp L0 has {} non-zero vacuum cells after set_geom_shape", nc);
+        assert!(nc == 0, "FATAL: comp L0 has {} non-zero vacuum cells", nc);
     }
 
     // Steppers
+    // MG stencil: the default iso27 is adequate for ghost-fill φ quality.
+    // The solver warns about dz/dx = 6.4 conditioning, but in Newell-direct mode
+    // MG only provides φ for patch ghost-fills — L0 B is exact from Newell.
+    // If you see MG convergence issues, try: LLG_DEMAG_MG_STENCIL=7
     let mut st_cf = if !skip_cfft {
         unsafe { std::env::set_var("LLG_AMR_DEMAG_MODE", "coarse_fft"); }
         Some(AmrStepperRK4::new(&h_cf, true))
@@ -716,7 +763,11 @@ fn main() {
 
     let scr: usize = if let Some(ref s) = st_cf {
         if s.is_subcycling() { (s.coarse_dt(&llg,&h_cf)/llg.dt).round() as usize } else { 1 }
-    } else { 64 }; // default subcycle ratio when AMR is not running
+    } else if st_co.is_some() && h_co.is_some() {
+        let s = st_co.as_ref().unwrap();
+        let h = h_co.as_ref().unwrap();
+        if s.is_subcycling() { (s.coarse_dt(&llg,h)/llg.dt).round() as usize } else { 1 }
+    } else { 1 };
 
     let mut sf = RK4Scratch::new(fg);
     let mut sc = RK4Scratch::new(bg);
