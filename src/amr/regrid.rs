@@ -24,6 +24,17 @@ use crate::amr::indicator::{
 };
 use crate::amr::rect::Rect2i;
 
+// Dirty-level tracking: after nesting validation DROPs orphaned patches,
+// that level is marked "dirty".  On the NEXT regrid cycle, the acceptance
+// logic unconditionally accepts the proposal for that level, bypassing
+// fixes 4a/4b/4c.  This ensures core-covering patches are rebuilt within
+// one regrid cycle (~15ps) instead of being blocked by the area-based
+// hysteresis (fix 4b) when surviving boundary patches dominate total area.
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+static DIRTY_LEVELS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  RegridPolicy
 // ═══════════════════════════════════════════════════════════════════════════
@@ -715,6 +726,15 @@ pub fn maybe_regrid_nested_levels(
     }
 
     // ── Build nested levels 2..=max_level ────────────────────────────────
+    //
+    // Standard parent-composite indicator evaluation: each level's indicator
+    // is evaluated on the parent-level composite field (L0 coarse + parent
+    // patches).  This is the standard AMReX approach.
+    //
+    // The smoothed indicator max (Change E, Run 10d) stabilises the relative
+    // threshold to prevent the 8↔21 clustering bifurcation without decoupling
+    // the indicator from the parent composite.  This preserves the correct
+    // frequency (~700 MHz) while eliminating patch count oscillation.
 
     for level in 2..=max_level {
         let parent_level = level - 1;
@@ -732,7 +752,9 @@ pub fn maybe_regrid_nested_levels(
             break;
         }
 
-        // Composite field at parent resolution: r_parent = ratio^(parent_level).
+        // Composite field at parent resolution: the standard AMReX approach.
+        // Build the parent-level composite by resampling L0 to parent resolution
+        // and scattering parent-level patches into it.
         let r_parent = ratio_pow_local(h.ratio, parent_level);
         let grid_parent = crate::grid::Grid2D::new(
             h.base_grid.nx * r_parent,
@@ -741,10 +763,7 @@ pub fn maybe_regrid_nested_levels(
             h.base_grid.dy / (r_parent as f64),
             h.base_grid.dz,
         );
-
         let mut m_parent = h.coarse.resample_to_grid(grid_parent);
-
-        // Scatter parent-level patches into this uniform field.
         if parent_level == 1 {
             for p in &h.patches {
                 p.scatter_into_uniform_fine(&mut m_parent);
@@ -758,11 +777,10 @@ pub fn maybe_regrid_nested_levels(
             }
         }
 
-        // Region mask: within union of parent rects AND within material.
-        let n_parent = m_parent.grid.n_cells();
+        // Region mask at parent resolution: within union of parent rects AND material.
+        let n_parent = grid_parent.n_cells();
         let mut region_mask = vec![false; n_parent];
         mark_union_region(&h.base_grid, r_parent, &parent_rects, &mut region_mask);
-
         if let Some(up) = upsample_base_mask_to_ratio(&h.base_grid, h.geom_mask(), r_parent) {
             for i in 0..n_parent {
                 region_mask[i] = region_mask[i] && up[i];
@@ -792,7 +810,82 @@ pub fn maybe_regrid_nested_levels(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let level_indicator = indicator_at_level(cluster_policy_level1.indicator, h.ratio, level);
+        let mut level_indicator = indicator_at_level(cluster_policy_level1.indicator, h.ratio, level);
+        // ── Smoothed indicator max (Run 10d) ─────────────────────────────
+        //
+        // The relative threshold `frac × max(indicator)` jitters as the
+        // vortex core orbits.  The composite indicator max fluctuates
+        // because div/curl/grad signals depend on the core's position
+        // relative to the grid.  When max spikes up, the threshold rises,
+        // fewer cells are flagged, and the clustering produces the 8-state
+        // (small patches).  When max drops, more cells are flagged → 21-
+        // state (large patches).  This 8↔21 bifurcation was confirmed in
+        // Runs 6 and 10c.
+        //
+        // Fix: smooth the indicator max with an exponential moving average.
+        // The effective threshold becomes `frac × avg_max` instead of
+        // `frac × current_max`.  Since the clustering function computes
+        // `threshold = adjusted_frac × current_max` internally, we set:
+        //
+        //   adjusted_frac = frac × avg_max / current_max
+        //
+        // When max spikes UP:  adjusted_frac < frac → lower threshold →
+        //   MORE cells flagged → 21-state (prevents collapse)
+        // When max drops:      adjusted_frac > frac → higher threshold →
+        //   fewer cells flagged (prevents over-refinement)
+        //
+        // The smoothing factor α (default 0.15) gives a time constant of
+        // ~7 regrid cycles ≈ 100ps.  Fast enough to track genuine changes
+        // (core entering/leaving a region), slow enough to filter jitter.
+        {
+            use std::sync::Mutex;
+            use std::collections::HashMap;
+            static SMOOTH_MAX: Mutex<Option<HashMap<usize, f64>>> = Mutex::new(None);
+
+            let alpha: f64 = std::env::var("LLG_AMR_SMOOTH_ALPHA")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.15);
+
+            // Pre-compute indicator max within the region mask (same mask
+            // that the clustering call uses — not the geom_mask).
+            let (_ind_map, current_max, _thresh) = compute_indicator_map_for_kind(
+                level_indicator,
+                &m_parent,
+                Some(&region_mask),
+            );
+
+            // Update the smoothed average.
+            let mut guard = SMOOTH_MAX.lock().unwrap();
+            let avgs = guard.get_or_insert_with(HashMap::new);
+            let avg = avgs.entry(level).or_insert(current_max);
+            *avg = (1.0 - alpha) * (*avg) + alpha * current_max;
+            let avg_max = *avg;
+            drop(guard);
+
+            // Adjust the indicator frac so the effective threshold is
+            // frac × avg_max instead of frac × current_max.
+            if current_max > 1e-30 {
+                let scale = avg_max / current_max;
+                // Clamp scale to [0.5, 2.0] to prevent extreme adjustments
+                // during transients (e.g. phase transitions).
+                let scale = scale.clamp(0.5, 2.0);
+                if (scale - 1.0).abs() > 0.01 {
+                    level_indicator = match level_indicator {
+                        IndicatorKind::Grad2 { frac } =>
+                            IndicatorKind::Grad2 { frac: (frac * scale).min(0.95) },
+                        IndicatorKind::DivInplane { frac } =>
+                            IndicatorKind::DivInplane { frac: (frac * scale).min(0.95) },
+                        IndicatorKind::CurlMag { frac } =>
+                            IndicatorKind::CurlMag { frac: (frac * scale).min(0.95) },
+                        IndicatorKind::Composite { frac } =>
+                            IndicatorKind::Composite { frac: (frac * scale).min(0.95) },
+                        other => other, // Angle uses absolute threshold
+                    };
+                }
+            }
+        }
+
         let cp = ClusterPolicy {
             indicator: level_indicator,
             boundary_layer: l2plus_bl,  // L2+: default 0 (indicator-only), override via env
@@ -868,32 +961,26 @@ pub fn maybe_regrid_nested_levels(
         let mut cur = rects_at_level_base(h, level);
         cur.sort_by_key(|r| (r.i0, r.j0, r.nx, r.ny));
 
+        // ── L2+ acceptance: fixes 4a+4b+4c (Run 8 logic) + nesting clamp ──
+        //
+        // Asymmetric acceptance thresholds to prevent refine-derefine oscillation
+        // while allowing patches to track moving features:
+        //
+        //   4a: parent_changed AND growth → accept (stale layout after parent shift)
+        //   4b: shrink < 0.40 → accept (genuine derefinement only)
+        //   4c: centroid shift > 2 cells AND growth → accept (core tracking)
+        //
+        // This combination produced τ_eff ≈ 5ns in Run 8 with core@L3 ~83%.
+        // Combined with the nesting CLAMP (below) instead of Run 8's nesting DROP,
+        // the remaining 17% at L1 from orphan destruction should be reduced.
+        //
+        // NOT used: fix 4d (parent_changed blocks all) — froze everything in Run 10a.
+        // NOT used: smoothed max / shrink guard env vars — replaced by this logic.
+        //   Set LLG_AMR_SMOOTH_ALPHA=1.0 to disable threshold smoothing.
+
         // Did the parent level change in this regrid cycle?
         let parent_changed = level_changed.get(parent_level).copied().unwrap_or(false);
 
-        // L2+ hysteresis to prevent refine-derefine oscillation.
-        //
-        // The oscillation cycle:
-        //   1. Indicator on parent composite (with existing patches) → smooth
-        //      → fewer patches flagged → patches REMOVED
-        //   2. Without patches → parent field is coarser → indicator spikes
-        //      → patches RECREATED → goto 1
-        //
-        // Fix: asymmetric acceptance thresholds.
-        // - Growing (adding patches) is always accepted — features need refinement.
-        // - Shrinking (removing patches) requires that the new set has <50% of old
-        //   total area.  Small fluctuations in the clustering (e.g. 53→49 or 10→8)
-        //   are suppressed.  Only genuine de-refinement (e.g. feature leaves the
-        //   region entirely) triggers patch removal.
-        //
-        // Additional bypass conditions:
-        // - If the parent level changed, unconditionally accept.  The parent's
-        //   patches have shifted, so the old child layout is stale.
-        // - If the weighted centroid of proposed patches moved by >2 base cells,
-        //   accept regardless of area change.  This catches a moving feature
-        //   (e.g. vortex core) that the area-only check would reject because
-        //   the new patch at the new position has similar area to the old patch
-        //   at the old position.
         if cur != rects_base {
             let old_area: usize = cur.iter().map(|r| r.nx * r.ny).sum();
             let new_area: usize = rects_base.iter().map(|r| r.nx * r.ny).sum();
@@ -902,23 +989,26 @@ pub fn maybe_regrid_nested_levels(
                 true // always accept if creating from nothing
             } else if rects_base.is_empty() {
                 true // always accept full removal (no parent patches → no children)
-            } else if parent_changed {
-                true // parent shifted → child layout is stale
+            } else if parent_changed && new_area >= old_area {
+                true // fix 4a: parent shifted + growing → accept
             } else if new_area >= old_area {
                 true // growing or same → always accept
             } else {
-                // Shrinking: only accept if new area is less than 50% of old.
-                // This prevents the 53→4→52→4 oscillation where the clustering
-                // alternates between "boundary+core" and "core only" because the
-                // indicator sees the refined-vs-unrefined field.
+                // fix 4b: shrinking — only accept if new area < 40% of old.
+                // Blocks the 8↔21 oscillation (ratios 0.46-0.90) while allowing
+                // genuine derefinement (feature leaves region entirely).
                 let shrink_frac = new_area as f64 / old_area.max(1) as f64;
-                shrink_frac < 0.50
+                shrink_frac < 0.40
             };
 
-            // Centroid-shift detection: if the proposed patches' area-weighted
-            // centroid moved by more than 2 base cells from the current patches,
-            // accept regardless of area change.  This lets L2/L3 track a moving
-            // vortex core even when the total patch area didn't change much.
+            // fix 4c: centroid-shift detection (growth-only).
+            // If proposed patches' centroid moved > 2 base cells AND the proposal
+            // is growing, accept regardless of shrink threshold.  This lets L2/L3
+            // track a moving vortex core.
+            //
+            // IMPORTANT: growth-only guard (new_area >= old_area).  Without this,
+            // the core's orbital motion (~2-3 base cells per 15ps) triggers the
+            // centroid bypass on every shrinkage event, negating the 0.40 threshold.
             if !accept && !cur.is_empty() && !rects_base.is_empty() && old_area > 0 && new_area > 0 {
                 let centroid = |rects: &[Rect2i], total_area: usize| -> (f64, f64) {
                     let mut cx = 0.0_f64;
@@ -934,12 +1024,37 @@ pub fn maybe_regrid_nested_levels(
                 let (old_cx, old_cy) = centroid(&cur, old_area);
                 let (new_cx, new_cy) = centroid(&rects_base, new_area);
                 let shift = ((new_cx - old_cx).powi(2) + (new_cy - old_cy).powi(2)).sqrt();
-                if shift > 2.0 {
+                if shift > 2.0 && new_area >= old_area {
+                    accept = true;
+                }
+            }
+
+            // ── Dirty-level bypass ───────────────────────────────────────
+            //
+            // If the nesting validation DROPped patches at this level in
+            // a previous regrid cycle, unconditionally accept the current
+            // proposal.  This ensures core-covering patches are rebuilt
+            // within one regrid cycle (~15ps) instead of being blocked by
+            // fix 4b's area hysteresis (which fires when surviving boundary
+            // patches dominate the total area after a partial DROP).
+            if !accept {
+                let is_dirty = {
+                    let guard = DIRTY_LEVELS.lock().unwrap();
+                    guard.as_ref().map_or(false, |s| s.contains(&level))
+                };
+                if is_dirty {
                     accept = true;
                 }
             }
 
             if accept {
+                // Clear dirty flag for this level on acceptance.
+                {
+                    let mut guard = DIRTY_LEVELS.lock().unwrap();
+                    if let Some(set) = guard.as_mut() {
+                        set.remove(&level);
+                    }
+                }
                 h.replace_level_patches_preserve_overlap(level, rects_base);
                 changed_deep = true;
                 if level < level_changed.len() {
@@ -955,6 +1070,70 @@ pub fn maybe_regrid_nested_levels(
                 h.replace_level_patches_preserve_overlap(lv, Vec::new());
             }
             break;
+        }
+    }
+
+    // ── Post-regrid nesting validation ────────────────────────────────────
+    //
+    // After the level loop, some deeper-level patches may have become
+    // orphaned: their parent level changed (grew, shrank, or shifted),
+    // but the hysteresis check blocked the child's re-clustering, leaving
+    // stale child patches that are no longer nested within any parent rect.
+    //
+    // This causes panics in mg_composite.rs when the V-cycle tries to
+    // find a parent for each patch.  Rather than silently skipping
+    // orphans (which would corrupt the physics), we drop them here —
+    // they'll be correctly re-created at the next regrid cycle.
+    for level in 2..=max_level {
+        let parent_level = level - 1;
+        let parent_rects = rects_at_level_base(h, parent_level);
+        if parent_rects.is_empty() {
+            // Parent gone → clear this and all deeper.
+            for lv in level..=max_level {
+                h.replace_level_patches_preserve_overlap(lv, Vec::new());
+            }
+            changed_deep = true;
+            break;
+        }
+
+        let cur = rects_at_level_base(h, level);
+        if cur.is_empty() {
+            continue;
+        }
+
+        // DROP orphaned patches: keep only those fully contained in a parent.
+        // The dirty-level flag (below) ensures the acceptance logic won't
+        // block their re-creation at the next regrid cycle.
+        let mut valid: Vec<Rect2i> = Vec::new();
+        let mut dropped = 0usize;
+        for child in &cur {
+            if parent_rects.iter().any(|p| rect_contains(*p, *child)) {
+                valid.push(*child);
+            } else {
+                dropped += 1;
+            }
+        }
+
+        if dropped > 0 {
+            eprintln!(
+                "[regrid] nesting cleanup: dropped {} orphaned L{} patch(es) \
+                 ({} → {} patches)",
+                dropped, level, cur.len(), valid.len()
+            );
+            h.replace_level_patches_preserve_overlap(level, valid);
+            changed_deep = true;
+
+            // Mark this level as dirty for the next regrid cycle.
+            // After the DROP removed core-covering patches, surviving boundary
+            // patches would cause fix 4b to block the new core-covering proposal
+            // (area barely changed because boundary patches dominate).  The dirty
+            // flag forces unconditional acceptance for one cycle, letting the
+            // core patch be rebuilt within ~15ps instead of 65ps+.
+            {
+                let mut guard = DIRTY_LEVELS.lock().unwrap();
+                let set = guard.get_or_insert_with(HashSet::new);
+                set.insert(level);
+            }
         }
     }
 

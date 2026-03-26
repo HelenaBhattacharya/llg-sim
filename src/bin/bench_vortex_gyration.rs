@@ -19,8 +19,8 @@
 //     10mT gives only s_eq ≈ 9.5nm, orbit drowns in spin-wave ringdown noise.
 //
 // CFL note: With 3 AMR levels (ratio=2), the finest dx = 3.125/8 = 0.39 nm.
-//   Exchange CFL requires dt < ~3.5 fs at this spacing.  dt=3 fs gives
-//   good margin.  With 2 levels, dx_fine=0.78nm, dt=10fs.
+//   Exchange CFL (2D): dt_max = 2.83/[γ(2A/Ms)×2(π/dx)²] ≈ 3.8 fs.
+//   dt=3 fs gives 1.27× margin.  With 2 levels, dx_fine=0.78nm, dt=10fs.
 //   The code auto-selects dt based on AMR level count.
 //
 // MG stencil: default iso27 is used.  The solver warns about dz/dx = 6.4
@@ -608,7 +608,10 @@ fn main() {
     // Timing
     // With 2 AMR levels (default), dx_fine = dx_coarse/4 = 0.78 nm.
     // CFL limit at L2: dt_max ≈ 14 fs.  Using dt=10 fs for margin.
-    // With 3 AMR levels (LLG_AMR_MAX_LEVEL=3), dx_fine = 0.39 nm → use dt=3fs.
+    // With 3 AMR levels (LLG_AMR_MAX_LEVEL=3), dx_fine = 0.39 nm.
+    //   Exchange CFL (2D): dt_max = 2.83 / [γ(2A/Ms) × 2(π/dx)²] ≈ 3.8 fs.
+    //   dt=3fs gives 1.27× safety margin.  The 1D estimate (7.6fs) is WRONG
+    //   for this 2D code — the Nyquist k² doubles in 2D.
     let dt: f64 = if amr_lvl >= 3 { 3.0e-15 } else { 10.0e-15 };
     let alpha_relax = 0.5;
     let alpha_dyn = 0.01;    // Physical Permalloy damping — gives ~6 clean oscillation
@@ -638,12 +641,12 @@ fn main() {
     // relax_out: print every 200ps during relaxation
     // dyn_out: record core position every 5ps
     // snap_every: snapshot every 200ps
-    // dyn_regrid: regrid every 40ps
+    // dyn_regrid: regrid every 15ps
     let _steps_per_ns = (1.0e-9 / dt).round() as usize;
     let relax_out  = (200e-12 / dt).round() as usize;  // every 200ps
     let dyn_out    = (5e-12 / dt).round() as usize;     // every 5ps
     let snap_every = (200e-12 / dt).round() as usize;   // every 200ps
-    let dyn_regrid = (40e-12 / dt).round() as usize;    // every 40ps
+    let dyn_regrid = (15e-12 / dt).round() as usize;    // every 15ps
 
     // =====================================================================
     // Grids and masks
@@ -906,6 +909,17 @@ fn main() {
           writeln!(f, "amr_levels,{}", amr_lvl).unwrap();
           writeln!(f, "ratio,{}", ratio).unwrap();
         }
+        // Save coarse equilibrium if running coarse-only (no cfft/comp)
+        if !skip_coarse && skip_cfft && skip_comp {
+            let mut f = File::create(format!("{out}/m_fine_eq.csv")).unwrap();
+            writeln!(f, "i,j,mx,my,mz").unwrap();
+            for j in 0..bg.ny { for i in 0..bg.nx {
+                let v = m_coarse.data[j*bg.nx+i];
+                writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
+            }}
+            println!("  Saved coarse equilibrium as m_fine_eq.csv ({}×{}, dx={:.2}nm)",
+                bg.nx, bg.ny, bg.dx*1e9);
+        }
         if !skip_cfft {
             if let Some((r,_)) = maybe_regrid_nested_levels(&mut h_cf,&pr_cf,rp,cp) { pr_cf=r; }
             let l1 = pr_cf.clone(); let l2 = l2_rects(&h_cf); let l3 = l3_rects(&h_cf);
@@ -941,6 +955,12 @@ fn main() {
                 &format!("{out}/comp_snap_equilibrium.png"), "COMP Vortex ground state (B=0)");
             let _ = save_mz_snap(&cms, &disk,
                 &format!("{out}/comp_mz_equilibrium.png"), "COMP mz — Equilibrium (B=0)", -0.2, 1.0);
+            { let mut f = File::create(format!("{out}/comp_patches_eq.csv")).unwrap();
+              writeln!(f, "level,i0,j0,nx,ny").unwrap();
+              for r in &cl1 { writeln!(f, "1,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+              for r in &cl2 { writeln!(f, "2,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+              for r in &cl3 { writeln!(f, "3,{},{},{},{}", r.i0, r.j0, r.nx, r.ny).unwrap(); }
+            }
             { let mut f = File::create(format!("{out}/comp_m_fine_eq.csv")).unwrap();
               writeln!(f, "i,j,mx,my,mz").unwrap();
               for j in 0..fg.ny { for i in 0..fg.nx {
@@ -1292,8 +1312,8 @@ fn main() {
                       writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
                   }}
                 }
-                // 3. Fine (flattened) magnetisation — every 5th snapshot + final
-                if sn % 5 == 0 || step == gyr_steps {
+                // 3. Fine (flattened) magnetisation — every 2nd snapshot + final
+                if sn % 2 == 0 || step == gyr_steps {
                     let mut f = File::create(format!("{out}/m_fine_{sn:03}.csv")).unwrap();
                     writeln!(f, "i,j,mx,my,mz").unwrap();
                     for j in 0..fg.ny { for i in 0..fg.nx {
@@ -1327,7 +1347,7 @@ fn main() {
                       writeln!(f, "{i},{j},{:.6},{:.6},{:.6}", v[0], v[1], v[2]).unwrap();
                   }}
                 }
-                if sn % 5 == 0 || step == gyr_steps {
+                if sn % 2 == 0 || step == gyr_steps {
                     let mut f = File::create(format!("{out}/comp_m_fine_{sn:03}.csv")).unwrap();
                     writeln!(f, "i,j,mx,my,mz").unwrap();
                     for j in 0..fg.ny { for i in 0..fg.nx {

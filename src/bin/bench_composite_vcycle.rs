@@ -60,10 +60,86 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 // ---------------------------------------------------------------------------
+// Result struct for run_benchmark
+// ---------------------------------------------------------------------------
+#[allow(dead_code)]
+struct BenchmarkResult {
+    t_fine_ms: f64,
+    t_cfft_ms: f64,
+    t_comp_ms: f64,
+    edge_rmse_cfft: f64,
+    edge_rmse_comp: f64,
+    bulk_rmse_cfft: f64,
+    bulk_rmse_comp: f64,
+    /// Absolute RMSE vs externally-loaded reference (NaN if not available)
+    edge_rmse_cfft_abs: f64,
+    edge_rmse_comp_abs: f64,
+    edge_rmse_fine_abs: f64,
+    /// Component-resolved edge RMSE for the composite method (% of b_max)
+    bx_rmse_comp: f64,
+    by_rmse_comp: f64,
+    bz_rmse_comp: f64,
+    n_l1: usize,
+    n_l2: usize,
+    n_edge: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Binary B-field reference save/load (for fixed-reference sweep)
+// ---------------------------------------------------------------------------
+
+/// Save a VectorField2D to a binary file for cross-process reference sharing.
+/// Format: u64 nx, u64 ny, f64 dx, f64 dy, f64 dz, then nx*ny × [f64; 3].
+fn save_b_field_binary(path: &str, field: &VectorField2D) {
+    let f = std::fs::File::create(path).expect("cannot create ref file");
+    let mut w = std::io::BufWriter::new(f);
+    let g = &field.grid;
+    w.write_all(&(g.nx as u64).to_le_bytes()).unwrap();
+    w.write_all(&(g.ny as u64).to_le_bytes()).unwrap();
+    w.write_all(&g.dx.to_le_bytes()).unwrap();
+    w.write_all(&g.dy.to_le_bytes()).unwrap();
+    w.write_all(&g.dz.to_le_bytes()).unwrap();
+    for v in &field.data {
+        w.write_all(&v[0].to_le_bytes()).unwrap();
+        w.write_all(&v[1].to_le_bytes()).unwrap();
+        w.write_all(&v[2].to_le_bytes()).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+/// Load a VectorField2D from a binary file saved by `save_b_field_binary`.
+fn load_b_field_binary(path: &str) -> VectorField2D {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).expect("cannot open ref file");
+    let mut buf8 = [0u8; 8];
+    f.read_exact(&mut buf8).unwrap();
+    let nx = u64::from_le_bytes(buf8) as usize;
+    f.read_exact(&mut buf8).unwrap();
+    let ny = u64::from_le_bytes(buf8) as usize;
+    f.read_exact(&mut buf8).unwrap();
+    let dx = f64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8).unwrap();
+    let dy = f64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8).unwrap();
+    let dz = f64::from_le_bytes(buf8);
+    let grid = Grid2D::new(nx, ny, dx, dy, dz);
+    let mut field = VectorField2D::new(grid);
+    for v in &mut field.data {
+        f.read_exact(&mut buf8).unwrap();
+        v[0] = f64::from_le_bytes(buf8);
+        f.read_exact(&mut buf8).unwrap();
+        v[1] = f64::from_le_bytes(buf8);
+        f.read_exact(&mut buf8).unwrap();
+        v[2] = f64::from_le_bytes(buf8);
+    }
+    field
+}
+
+// ---------------------------------------------------------------------------
 // Core benchmark: run all three solvers at a given L0 grid size.
-// Returns (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp,
-//          bulk_rmse_cfft, bulk_rmse_comp, n_l1, n_l2plus, n_edge)
 // If skip_fine, t_fine_ms = 0 and edge/bulk errors are NaN.
+// Absolute RMSE computed if LLG_CV_LOAD_REF points to a valid binary file.
+// Fine FFT saved if LLG_CV_SAVE_REF is set.
 // ---------------------------------------------------------------------------
 fn run_benchmark(
     base_nx: usize, base_ny: usize, amr_levels: usize,
@@ -71,7 +147,8 @@ fn run_benchmark(
     domain_nm: f64, hole_radius_nm: f64, dz: f64,
     mat: &Material, shape: &MaskShape,
     skip_fine: bool, verbose: bool,
-) -> (f64, f64, f64, f64, f64, f64, f64, usize, usize, usize) {
+    m_unit: [f64; 3],
+) -> BenchmarkResult {
     let dx = domain_nm * 1e-9 / base_nx as f64;
     let dy = domain_nm * 1e-9 / base_ny as f64;
     let base_grid = Grid2D::new(base_nx, base_ny, dx, dy, dz);
@@ -90,7 +167,7 @@ fn run_benchmark(
     for j in 0..base_ny {
         for i in 0..base_nx {
             let k = j * base_nx + i;
-            m_coarse.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+            m_coarse.data[k] = if geom_mask[k] { m_unit } else { [0.0, 0.0, 0.0] };
         }
     }
     apply_fill_fractions(&mut m_coarse.data, &fill_frac);
@@ -136,7 +213,7 @@ fn run_benchmark(
             for i in 0..pnx {
                 let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
                 let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
-                p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+                p.m.data[j * pnx + i] = [ff * m_unit[0], ff * m_unit[1], ff * m_unit[2]];
             }
         }
     }
@@ -151,7 +228,7 @@ fn run_benchmark(
                 for i in 0..pnx {
                     let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
                     let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
-                    p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+                    p.m.data[j * pnx + i] = [ff * m_unit[0], ff * m_unit[1], ff * m_unit[2]];
                 }
             }
         }
@@ -185,7 +262,7 @@ fn run_benchmark(
                 let x = (i as f64 + 0.5) * fine_dx - fine_half_lx;
                 let y = (j as f64 + 0.5) * fine_dy - fine_half_ly;
                 let ff = shape.fill_fraction(x, y, fine_dx, fine_dy, n_smooth);
-                m_fine.data[j * fine_nx + i] = [ff, 0.0, 0.0];
+                m_fine.data[j * fine_nx + i] = [ff * m_unit[0], ff * m_unit[1], ff * m_unit[2]];
             }
         }
         let t1 = Instant::now();
@@ -225,6 +302,9 @@ fn run_benchmark(
     let mut edge_rmse_comp = f64::NAN;
     let mut bulk_rmse_cfft = f64::NAN;
     let mut bulk_rmse_comp = f64::NAN;
+    let mut bx_rmse_comp = f64::NAN;
+    let mut by_rmse_comp = f64::NAN;
+    let mut bz_rmse_comp = f64::NAN;
     let mut n_edge = 0usize;
     let mut n_bulk = 0usize;
     if let Some(ref b_fine) = b_fine_opt {
@@ -236,6 +316,10 @@ fn run_benchmark(
         let mut se_comp = 0.0f64;
         let mut se_cfft_bulk = 0.0f64;
         let mut se_comp_bulk = 0.0f64;
+        // Per-component squared errors (composite, edge cells only)
+        let mut se_comp_bx = 0.0f64;
+        let mut se_comp_by = 0.0f64;
+        let mut se_comp_bz = 0.0f64;
 
         // Helper: measure edge+bulk error on a single patch
         let mut measure_patch = |patch: &llg_sim::amr::patch::Patch2D, bc: &[[f64; 3]], bv: &[[f64; 3]]| {
@@ -257,6 +341,10 @@ fn run_benchmark(
                     if dist.abs() < edge_dist {
                         se_cfft += ec;
                         se_comp += ev;
+                        // Per-component (composite only, edge cells)
+                        se_comp_bx += (bv[idx][0]-br[0]).powi(2);
+                        se_comp_by += (bv[idx][1]-br[1]).powi(2);
+                        se_comp_bz += (bv[idx][2]-br[2]).powi(2);
                         n_edge += 1;
                     } else {
                         se_cfft_bulk += ec;
@@ -288,6 +376,10 @@ fn run_benchmark(
         if n_edge > 0 {
             edge_rmse_cfft = (se_cfft / n_edge as f64).sqrt() / b_max * 100.0;
             edge_rmse_comp = (se_comp / n_edge as f64).sqrt() / b_max * 100.0;
+            let n = n_edge as f64;
+            bx_rmse_comp = (se_comp_bx / n).sqrt() / b_max * 100.0;
+            by_rmse_comp = (se_comp_by / n).sqrt() / b_max * 100.0;
+            bz_rmse_comp = (se_comp_bz / n).sqrt() / b_max * 100.0;
         }
         if n_bulk > 0 {
             bulk_rmse_cfft = (se_cfft_bulk / n_bulk as f64).sqrt() / b_max * 100.0;
@@ -295,8 +387,112 @@ fn run_benchmark(
         }
     }
 
-    (t_fine_ms, t_cfft_ms, t_comp_ms, edge_rmse_cfft, edge_rmse_comp,
-     bulk_rmse_cfft, bulk_rmse_comp, n_l1, n_l2, n_edge)
+    // ---- Absolute RMSE against external reference (if provided) ----
+    let mut edge_rmse_cfft_abs = f64::NAN;
+    let mut edge_rmse_comp_abs = f64::NAN;
+    let mut edge_rmse_fine_abs = f64::NAN;
+
+    if let Ok(ref_path) = std::env::var("LLG_CV_LOAD_REF") {
+        if std::path::Path::new(&ref_path).exists() {
+            let b_ref_abs = load_b_field_binary(&ref_path);
+            let b_max_abs = b_ref_abs.data.iter()
+                .map(|v| (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt())
+                .fold(0.0f64, f64::max);
+
+            let mut se_cfft_a = 0.0f64;
+            let mut se_comp_a = 0.0f64;
+            let mut se_fine_a = 0.0f64;
+            // Per-component squared errors (composite, edge cells, vs fixed ref)
+            let mut se_comp_bx_a = 0.0f64;
+            let mut se_comp_by_a = 0.0f64;
+            let mut se_comp_bz_a = 0.0f64;
+            let mut n_edge_a = 0usize;
+
+            let mut measure_abs = |patch: &llg_sim::amr::patch::Patch2D,
+                                    bc: &[[f64; 3]], bv: &[[f64; 3]]| {
+                let pnx = patch.grid.nx;
+                let gi0 = patch.interior_i0();
+                let gj0 = patch.interior_j0();
+                let gi1 = patch.interior_i1();
+                let gj1 = patch.interior_j1();
+                for j in gj0..gj1 {
+                    for i in gi0..gi1 {
+                        let (x, y) = patch.cell_center_xy_centered(i, j, &base_grid);
+                        if !shape.contains(x, y) { continue; }
+                        let dist = (x - hole_centre.0).hypot(y - hole_centre.1) - hole_radius;
+                        if dist.abs() >= edge_dist { continue; }
+                        let (xc, yc) = patch.cell_center_xy(i, j);
+                        let br = sample_bilinear(&b_ref_abs, xc, yc);
+                        let idx = j * pnx + i;
+                        se_cfft_a += (bc[idx][0]-br[0]).powi(2) + (bc[idx][1]-br[1]).powi(2) + (bc[idx][2]-br[2]).powi(2);
+                        se_comp_a += (bv[idx][0]-br[0]).powi(2) + (bv[idx][1]-br[1]).powi(2) + (bv[idx][2]-br[2]).powi(2);
+                        // Per-component (composite vs fixed ref)
+                        se_comp_bx_a += (bv[idx][0]-br[0]).powi(2);
+                        se_comp_by_a += (bv[idx][1]-br[1]).powi(2);
+                        se_comp_bz_a += (bv[idx][2]-br[2]).powi(2);
+                        if let Some(ref bf) = b_fine_opt {
+                            let bf_local = sample_bilinear(bf, xc, yc);
+                            se_fine_a += (bf_local[0]-br[0]).powi(2) + (bf_local[1]-br[1]).powi(2) + (bf_local[2]-br[2]).powi(2);
+                        }
+                        n_edge_a += 1;
+                    }
+                }
+            };
+
+            for (pi, patch) in h.patches.iter().enumerate() {
+                if pi < b_l1_cfft.len() && pi < b_l1_comp.len() {
+                    measure_abs(patch, &b_l1_cfft[pi], &b_l1_comp[pi]);
+                }
+            }
+            for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+                let bc_lvl = if lvl_idx < b_l2_cfft.len() { &b_l2_cfft[lvl_idx] } else { continue };
+                let bv_lvl = if lvl_idx < b_l2_comp.len() { &b_l2_comp[lvl_idx] } else { continue };
+                for (pi, patch) in lvl_patches.iter().enumerate() {
+                    if pi < bc_lvl.len() && pi < bv_lvl.len() {
+                        measure_abs(patch, &bc_lvl[pi], &bv_lvl[pi]);
+                    }
+                }
+            }
+            drop(measure_abs); // release mutable borrows on accumulators
+
+            if n_edge_a > 0 {
+                edge_rmse_cfft_abs = (se_cfft_a / n_edge_a as f64).sqrt() / b_max_abs * 100.0;
+                edge_rmse_comp_abs = (se_comp_a / n_edge_a as f64).sqrt() / b_max_abs * 100.0;
+                if b_fine_opt.is_some() {
+                    edge_rmse_fine_abs = (se_fine_a / n_edge_a as f64).sqrt() / b_max_abs * 100.0;
+                }
+                // Override local Bx/By/Bz with fixed-reference values
+                let n = n_edge_a as f64;
+                bx_rmse_comp = (se_comp_bx_a / n).sqrt() / b_max_abs * 100.0;
+                by_rmse_comp = (se_comp_by_a / n).sqrt() / b_max_abs * 100.0;
+                bz_rmse_comp = (se_comp_bz_a / n).sqrt() / b_max_abs * 100.0;
+            }
+            if verbose {
+                eprintln!("  Abs-ref: comp={:.2}% cfft={:.2}% fine={:.2}% (Bx={:.2}% By={:.2}% Bz={:.2}%) ({} edge cells)",
+                    edge_rmse_comp_abs, edge_rmse_cfft_abs, edge_rmse_fine_abs,
+                    bx_rmse_comp, by_rmse_comp, bz_rmse_comp, n_edge_a);
+            }
+        }
+    }
+
+    // ---- Save fine FFT reference if requested ----
+    if let Ok(save_path) = std::env::var("LLG_CV_SAVE_REF") {
+        if let Some(ref b_fine) = b_fine_opt {
+            save_b_field_binary(&save_path, b_fine);
+            if verbose {
+                eprintln!("  Saved fine FFT reference to {}", save_path);
+            }
+        }
+    }
+
+    BenchmarkResult {
+        t_fine_ms, t_cfft_ms, t_comp_ms,
+        edge_rmse_cfft, edge_rmse_comp,
+        bulk_rmse_cfft, bulk_rmse_comp,
+        edge_rmse_cfft_abs, edge_rmse_comp_abs, edge_rmse_fine_abs,
+        bx_rmse_comp, by_rmse_comp, bz_rmse_comp,
+        n_l1, n_l2, n_edge,
+    }
 }
 
 fn main() {
@@ -304,6 +500,16 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let do_plots = args.iter().any(|a| a == "--plots");
     let do_sweep = args.iter().any(|a| a == "--sweep");
+
+    // Sweep method selection:
+    //   --mg-only     Run one composite per grid: MG-only (no Newell, no PPPM)
+    //   --pppm-only   Run one composite per grid: MG+PPPM
+    //   --newell-only Run one composite per grid: MG+Newell direct
+    //   (default)     Run TWO composites per grid: Newell + PPPM
+    let sweep_mg_only = args.iter().any(|a| a == "--mg-only");
+    let sweep_pppm_only = args.iter().any(|a| a == "--pppm-only");
+    let sweep_newell_only = args.iter().any(|a| a == "--newell-only");
+    let sweep_single_method = sweep_mg_only || sweep_pppm_only || sweep_newell_only;
 
     // ---- Configuration ----
     let base_nx: usize = env_or("LLG_CV_BASE_NX", 128);
@@ -313,9 +519,21 @@ fn main() {
     let ghost: usize = 2;
     let skip_fine: bool = env_or("LLG_CV_SKIP_FINE", 0usize) != 0;
 
-    let domain_nm = 500.0;
-    let hole_radius_nm = 100.0;
+    let domain_nm: f64 = env_or("LLG_CV_DOMAIN_NM", 500.0);
+    let hole_radius_nm: f64 = env_or("LLG_CV_HOLE_R_NM", 100.0);
     let dz: f64 = env_or("LLG_CV_DZ", 3e-9);
+
+    // Magnetisation direction: "x" (default), "z", "y", or "xz" (45° tilt).
+    let m_dir_str = std::env::var("LLG_CV_M_DIR").unwrap_or_else(|_| "x".to_string());
+    let m_unit: [f64; 3] = match m_dir_str.trim() {
+        "z"  => [0.0, 0.0, 1.0],
+        "y"  => [0.0, 1.0, 0.0],
+        "xz" => {
+            let c = std::f64::consts::FRAC_1_SQRT_2;
+            [c, 0.0, c]
+        }
+        _    => [1.0, 0.0, 0.0],  // default: +x
+    };
 
     let ms = 8.0e5;
     let a_ex = 1.3e-11;
@@ -344,19 +562,28 @@ fn main() {
     // ════════════════════════════════════════════════════════════════
     let do_sweep_point = args.iter().any(|a| a == "--sweep-point");
     if do_sweep_point {
-        let (tf, tc, tv, ec, ev, bc, bv, nl1, nl2, ne) = run_benchmark(
+        let r = run_benchmark(
             base_nx, base_ny, amr_levels, ratio, ghost,
             domain_nm, hole_radius_nm, dz,
             &mat, &shape, skip_fine, false,
+            m_unit,
         );
         let tr = ratio.pow(amr_levels as u32);
         let fnx = base_nx * tr;
         let fine_cells = fnx * fnx;
-        let comp_cells_est = base_nx * base_ny + (nl1 + nl2) * 400;
+        let comp_cells_est = base_nx * base_ny + (r.n_l1 + r.n_l2) * 400;
         // Output one CSV row to stdout — the sweep parent parses this
-        println!("{},{},{},{:.1},{:.1},{:.1},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{}",
-            base_nx, fnx, amr_levels, tf, tc, tv, ec, ev, bc, bv,
-            nl1, nl2, fine_cells, comp_cells_est, ne);
+        // Columns: base_nx,fnx,levels,t_fine,t_cfft,t_comp,e_cfft,e_comp,
+        //          b_cfft,b_comp,n_l1,n_l2,fine_cells,comp_est,n_edge,
+        //          e_comp_abs,e_cfft_abs,e_fine_abs,bx_comp,by_comp,bz_comp
+        println!("{},{},{},{:.1},{:.1},{:.1},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            base_nx, fnx, amr_levels,
+            r.t_fine_ms, r.t_cfft_ms, r.t_comp_ms,
+            r.edge_rmse_cfft, r.edge_rmse_comp,
+            r.bulk_rmse_cfft, r.bulk_rmse_comp,
+            r.n_l1, r.n_l2, fine_cells, comp_cells_est, r.n_edge,
+            r.edge_rmse_comp_abs, r.edge_rmse_cfft_abs, r.edge_rmse_fine_abs,
+            r.bx_rmse_comp, r.by_rmse_comp, r.bz_rmse_comp);
         return;
     }
 
@@ -367,20 +594,28 @@ fn main() {
         let sweep_sizes: Vec<usize> = if let Ok(s) = std::env::var("LLG_CV_SWEEP_SIZES") {
             s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
         } else {
-            vec![32, 48, 64, 96, 128, 256, 512]
+            vec![96, 128, 160, 192, 256, 384, 512]
         };
         let sweep_levels: usize = amr_levels;
         let sweep_skip_fine = env_or("LLG_CV_SWEEP_SKIP_FINE", 0usize) != 0;
         let edge_dist_nm: f64 = env_or("LLG_CV_EDGE_DIST_NM", 2.0);
 
-        let diag_dir = "out/bench_vcycle_diag";
+        let diag_dir = std::env::var("LLG_CV_OUT_DIR")
+            .unwrap_or_else(|_| "out/bench_vcycle_diag".to_string());
+        let diag_dir = diag_dir.as_str();
         fs::create_dir_all(diag_dir).ok();
         let csv_path = format!("{}/crossover_sweep.csv", diag_dir);
+
+        let mode_name = if sweep_mg_only { "MG-only" }
+            else if sweep_pppm_only { "PPPM" }
+            else if sweep_newell_only { "Newell" }
+            else { "Newell + PPPM (dual)" };
 
         println!("╔════════════════════════════════════════════════════════════════╗");
         println!("║  Composite V-Cycle — Crossover Sweep                          ║");
         println!("╚════════════════════════════════════════════════════════════════╝");
         println!();
+        println!("  Method:      {}", mode_name);
         println!("  AMR levels:  {} (ratio {}×, total {}×)", sweep_levels, ratio, ratio.pow(sweep_levels as u32));
         println!("  V-cycle:     {}", if vcycle_on { "ON" } else { "OFF" });
         println!("  Fine ref:    {}", if sweep_skip_fine { "SKIPPED" } else { "ON" });
@@ -388,80 +623,363 @@ fn main() {
         println!("  Grid sizes:  {:?}", sweep_sizes);
         println!();
 
+        let csv_header = "base_nx,fine_nx,t_fine_ms,t_cfft_ms,\
+            t_mg_ms,e_mg_pct,bx_mg_pct,by_mg_pct,bz_mg_pct,\
+            t_newell_ms,e_newell_pct,bx_newell_pct,by_newell_pct,bz_newell_pct,\
+            t_pppm_ms,e_pppm_pct,bx_pppm_pct,by_pppm_pct,bz_pppm_pct,\
+            e_cfft_pct,e_fine_abs_pct,n_edge";
+
+        // Load existing CSV rows (append mode: preserve data from previous runs)
+        let expected_cols = csv_header.split(',').count();
+        let mut existing_rows: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+        if let Ok(old_contents) = fs::read_to_string(&csv_path) {
+            for line in old_contents.lines().skip(1) {  // skip header
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                // Skip rows with wrong column count (old format)
+                if trimmed.split(',').count() != expected_cols { continue; }
+                if let Some(first) = trimmed.split(',').next() {
+                    if let Ok(nx) = first.trim().parse::<usize>() {
+                        // Only keep rows for sizes we are NOT re-running
+                        if !sweep_sizes.contains(&nx) {
+                            existing_rows.insert(nx, trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            if !existing_rows.is_empty() {
+                println!("  Append mode: keeping {} existing rows from previous runs", existing_rows.len());
+            }
+        }
+
+        // Now create/truncate and write header
         let mut csv_f = BufWriter::new(fs::File::create(&csv_path).unwrap());
-        writeln!(csv_f, "base_nx,fine_nx,amr_levels,t_fine_ms,t_cfft_ms,t_comp_ms,\
-            edge_rmse_cfft_pct,edge_rmse_comp_pct,bulk_rmse_cfft_pct,bulk_rmse_comp_pct,\
-            n_l1,n_l2plus,fine_cells,comp_cells_est,n_edge").unwrap();
+        writeln!(csv_f, "{}", csv_header).unwrap();
 
-        println!("  {:>6} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}",
-            "L0", "fine", "t_fine", "t_cfft", "t_comp", "e_cfft%", "e_comp%", "n_edge");
-        println!("  {:->6} {:->7} {:->10} {:->10} {:->10} {:->10} {:->10} {:->7}",
-            "", "", "", "", "", "", "", "");
+        // Write preserved rows from previous runs (sorted by base_nx)
+        for (_nx, line) in &existing_rows {
+            writeln!(csv_f, "{}", line).unwrap();
+        }
 
-        struct SweepRow { _base_nx: usize, fine_nx: usize, t_fine: f64, t_cfft: f64, t_comp: f64, e_cfft: f64, e_comp: f64, _n_edge: usize }
+        if sweep_single_method {
+            println!("  {:>6} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}",
+                "L0", "fine", "t_fine", "t_cfft", "t_comp",
+                "e_cfft%", "e_comp%", "n_edge");
+            println!("  {:->6} {:->7} {:->10} {:->10} {:->10} {:->10} {:->10} {:->7}",
+                "", "", "", "", "", "", "", "");
+        } else {
+            println!("  {:>6} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7}",
+                "L0", "fine", "t_fine", "t_cfft", "t_mg", "t_newl", "t_pppm",
+                "bz_mg%", "bz_nwl%", "bz_ppm%", "e_cfft%", "n_edge");
+            println!("  {:->6} {:->7} {:->10} {:->10} {:->10} {:->10} {:->10} {:->10} {:->10} {:->10} {:->10} {:->7}",
+                "", "", "", "", "", "", "", "", "", "", "", "");
+        }
+
+        #[allow(dead_code)]
+        struct SweepRow {
+            base_nx: usize,
+            fine_nx: usize,
+            t_fine: f64, t_cfft: f64,
+            t_mg: f64, t_newell: f64, t_pppm: f64,
+            e_cfft: f64, e_mg: f64, e_newell: f64, e_pppm: f64,
+            // Component-resolved RMSE for each method
+            bx_mg: f64, by_mg: f64, bz_mg: f64,
+            bx_newell: f64, by_newell: f64, bz_newell: f64,
+            bx_pppm: f64, by_pppm: f64, bz_pppm: f64,
+            // Absolute reference (vs 4096² stored fine FFT)
+            e_newell_abs: f64, e_pppm_abs: f64, e_fine_abs: f64,
+        }
         let mut rows: Vec<SweepRow> = Vec::new();
 
         // Each grid size MUST run in a separate process because the MG solver
         // uses OnceLock<> statics for the hybrid ΔK stencil and MG hierarchy.
-        // These get initialized on the first call and never refresh — running
-        // multiple sizes in one process would reuse the L0=32 stencil for L0=256.
         let exe = std::env::current_exe().expect("cannot find current executable");
 
-        for &nx in &sweep_sizes {
-            let tr = ratio.pow(sweep_levels as u32);
-            let fnx = nx * tr;
-
-            // Spawn ourselves with --sweep-point mode
-            let output = std::process::Command::new(&exe)
-                .arg("--sweep-point")
+        // Helper: spawn a sweep-point subprocess with specific method settings.
+        // Returns the raw CSV line on success.
+        // `extras` provides additional env vars (e.g. LLG_CV_SAVE_REF, LLG_CV_LOAD_REF).
+        let spawn_point = |nx: usize, skip_fine_sub: bool,
+                           newell_direct: &str, pppm_enable: &str,
+                           extras: &[(&str, &str)]| -> Option<String>
+        {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("--sweep-point")
                 .env("LLG_CV_BASE_NX", nx.to_string())
                 .env("LLG_CV_BASE_NY", nx.to_string())
                 .env("LLG_AMR_MAX_LEVEL", sweep_levels.to_string())
                 .env("LLG_CV_EDGE_DIST_NM", format!("{:.1}", edge_dist_nm))
-                .env("LLG_CV_SKIP_FINE", if sweep_skip_fine { "1" } else { "0" })
-                // Forward composite vcycle setting
+                .env("LLG_CV_SKIP_FINE", if skip_fine_sub { "1" } else { "0" })
                 .env("LLG_DEMAG_COMPOSITE_VCYCLE",
                     std::env::var("LLG_DEMAG_COMPOSITE_VCYCLE").unwrap_or_default())
                 .env("LLG_COMPOSITE_MAX_CYCLES",
                     std::env::var("LLG_COMPOSITE_MAX_CYCLES").unwrap_or_default())
-                .output()
-                .expect("failed to spawn sweep subprocess");
+                .env("LLG_NEWELL_DIRECT", newell_direct)
+                .env("LLG_DEMAG_MG_HYBRID_ENABLE", pppm_enable)
+                .env("LLG_DEMAG_MG_HYBRID_RADIUS",
+                    std::env::var("LLG_DEMAG_MG_HYBRID_RADIUS").unwrap_or("14".into()))
+                // Pass through problem configuration
+                .env("LLG_CV_DZ",
+                    std::env::var("LLG_CV_DZ").unwrap_or_default())
+                .env("LLG_CV_M_DIR",
+                    std::env::var("LLG_CV_M_DIR").unwrap_or_default())
+                .env("LLG_CV_DOMAIN_NM",
+                    std::env::var("LLG_CV_DOMAIN_NM").unwrap_or_default())
+                .env("LLG_CV_HOLE_R_NM",
+                    std::env::var("LLG_CV_HOLE_R_NM").unwrap_or_default());
 
-            // Parse the single CSV line from stdout
+            for &(k, v) in extras {
+                cmd.env(k, v);
+            }
+
+            let output = cmd.output().expect("failed to spawn sweep subprocess");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let line = stdout.lines()
                 .find(|l| l.starts_with(|c: char| c.is_ascii_digit()))
-                .unwrap_or("");
+                .map(|s| s.to_string());
 
-            if line.is_empty() {
-                eprintln!("  WARNING: sweep-point L0={} produced no output", nx);
+            if line.is_none() {
                 let stderr_str = String::from_utf8_lossy(&output.stderr);
                 for sl in stderr_str.lines().take(5) {
                     eprintln!("    {}", sl);
                 }
-                continue;
+            }
+            line
+        };
+
+        // Parse columns from sweep-point output line (extended format).
+        // Columns: base_nx,fnx,levels,t_fine,t_cfft,t_comp,e_cfft,e_comp,
+        //          b_cfft,b_comp,n_l1,n_l2,fine_cells,comp_est,n_edge,
+        //          e_comp_abs,e_cfft_abs,e_fine_abs,bx_comp,by_comp,bz_comp
+        #[allow(dead_code)]
+        struct ParsedLine {
+            t_fine: f64, t_cfft: f64, t_comp: f64,
+            e_cfft: f64, e_comp: f64,
+            n_edge: usize,
+            e_comp_abs: f64, e_fine_abs: f64,
+            bx_comp: f64, by_comp: f64, bz_comp: f64,
+        }
+
+        let parse_line = |line: &str| -> ParsedLine {
+            let c: Vec<&str> = line.split(',').collect();
+            ParsedLine {
+                t_fine:     c.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                t_cfft:     c.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                t_comp:     c.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                e_cfft:     c.get(6).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+                e_comp:     c.get(7).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+                n_edge:     c.get(14).and_then(|s| s.parse().ok()).unwrap_or(0),
+                e_comp_abs: c.get(15).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+                e_fine_abs: c.get(17).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+                bx_comp:    c.get(18).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+                by_comp:    c.get(19).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+                bz_comp:    c.get(20).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+            }
+        };
+
+        // Path for the fixed 4096² reference (saved by the first sweep point
+        // that runs a fine FFT, loaded by all subsequent points).
+        let ref_path = std::env::var("LLG_CV_REF_PATH")
+            .unwrap_or_else(|_| format!("{}/b_ref_fixed.bin", diag_dir));
+        let mut ref_saved = std::path::Path::new(&ref_path).exists();
+        if ref_saved {
+            println!("  Fixed ref:   {} (pre-existing)", ref_path);
+        }
+
+        for (sweep_idx, &nx) in sweep_sizes.iter().enumerate() {
+            let tr = ratio.pow(sweep_levels as u32);
+            let fnx = nx * tr;
+
+            // At L0≥1024: skip fine FFT (8192²+), skip Newell in dual mode
+            let skip_fine_this = sweep_skip_fine || nx >= 1024;
+
+            let mut tf = 0.0f64;
+            let mut tc = 0.0f64;
+            let mut t_mg = f64::NAN;
+            let mut t_newell = f64::NAN;
+            let mut t_pppm = f64::NAN;
+            let mut ec = f64::NAN;
+            let mut e_mg = f64::NAN;
+            let mut e_newell = f64::NAN;
+            let mut e_pppm = f64::NAN;
+            let mut e_newell_abs = f64::NAN;
+            let mut e_pppm_abs = f64::NAN;
+            let mut e_fine_abs = f64::NAN;
+            let mut bz_mg = f64::NAN;
+            let mut bz_newell = f64::NAN;
+            let mut bz_pppm = f64::NAN;
+            let mut bx_mg = f64::NAN;
+            let mut by_mg = f64::NAN;
+            let mut bx_newell = f64::NAN;
+            let mut by_newell = f64::NAN;
+            let mut bx_pppm = f64::NAN;
+            let mut by_pppm = f64::NAN;
+            let mut ne = 0usize;
+
+            if sweep_single_method {
+                // ── Single-method mode: one subprocess per grid size ──
+                // Uses LOCAL fine FFT as reference (no fixed ref) — for Fig 5 crossover
+                let (nd, pe) = if sweep_mg_only {
+                    ("0", "0")   // no Newell, no PPPM → pure MG
+                } else if sweep_pppm_only {
+                    ("0", "1")   // no Newell, PPPM on
+                } else {
+                    ("1", "0")   // Newell on, PPPM off (--newell-only)
+                };
+
+                // No fixed reference for single-method mode — local fine FFT is the reference
+                let extras: Vec<(&str, &str)> = Vec::new();
+
+                let line = spawn_point(nx, skip_fine_this, nd, pe, &extras);
+                if let Some(l) = line {
+                    let p = parse_line(&l);
+                    tf = p.t_fine;
+                    tc = p.t_cfft;
+                    ec = p.e_cfft;
+                    ne = p.n_edge;
+                    e_fine_abs = p.e_fine_abs;
+
+                    // Put result into ALL columns so CSV works regardless
+                    t_mg = p.t_comp; e_mg = p.e_comp; bz_mg = p.bz_comp; bx_mg = p.bx_comp; by_mg = p.by_comp;
+                    t_newell = p.t_comp; e_newell = p.e_comp; bz_newell = p.bz_comp; bx_newell = p.bx_comp; by_newell = p.by_comp;
+                    e_newell_abs = p.e_comp_abs;
+                    t_pppm = p.t_comp; e_pppm = p.e_comp; bz_pppm = p.bz_comp; bx_pppm = p.bx_comp; by_pppm = p.by_comp;
+                    e_pppm_abs = p.e_comp_abs;
+                } else {
+                    eprintln!("  WARNING: L0={} failed", nx);
+                }
+            } else {
+                // ── Triple-method mode (default): MG-only + Newell + PPPM ──
+                let skip_newell = nx >= 1024;
+
+                // Run 1: Newell direct (also saves/loads fine FFT reference)
+                if !skip_newell {
+                    let mut extras: Vec<(&str, &str)> = Vec::new();
+                    if !ref_saved && !skip_fine_this {
+                        extras.push(("LLG_CV_SAVE_REF", &ref_path));
+                    }
+                    if ref_saved {
+                        extras.push(("LLG_CV_LOAD_REF", &ref_path));
+                    }
+
+                    let newell_line = spawn_point(nx, skip_fine_this, "1", "0", &extras);
+                    if let Some(nl) = newell_line {
+                        let p = parse_line(&nl);
+                        tf = p.t_fine;
+                        tc = p.t_cfft;
+                        t_newell = p.t_comp;
+                        ec = p.e_cfft;
+                        e_newell = p.e_comp;
+                        ne = p.n_edge;
+                        e_newell_abs = p.e_comp_abs;
+                        e_fine_abs = p.e_fine_abs;
+                        bz_newell = p.bz_comp;
+                        bx_newell = p.bx_comp;
+                        by_newell = p.by_comp;
+
+                        if !ref_saved && std::path::Path::new(&ref_path).exists() {
+                            ref_saved = true;
+                            eprintln!("  [sweep] Saved reference to {}", ref_path);
+                        }
+                    } else {
+                        eprintln!("  WARNING: Newell L0={} failed", nx);
+                    }
+                }
+
+                // Run 2: PPPM
+                {
+                    let mut pppm_extras: Vec<(&str, &str)> = Vec::new();
+                    if ref_saved {
+                        pppm_extras.push(("LLG_CV_LOAD_REF", &ref_path));
+                    }
+
+                    let pppm_line = spawn_point(nx, skip_fine_this, "0", "1", &pppm_extras);
+                    if let Some(pl) = pppm_line {
+                        let p = parse_line(&pl);
+                        if skip_newell {
+                            tf = p.t_fine;
+                            tc = p.t_cfft;
+                            ne = p.n_edge;
+                            ec = p.e_cfft;
+                            e_fine_abs = p.e_fine_abs;
+                        }
+                        t_pppm = p.t_comp;
+                        e_pppm = p.e_comp;
+                        e_pppm_abs = p.e_comp_abs;
+                        bz_pppm = p.bz_comp;
+                        bx_pppm = p.bx_comp;
+                        by_pppm = p.by_comp;
+                    } else {
+                        eprintln!("  WARNING: PPPM L0={} failed", nx);
+                    }
+                }
+
+                // Run 3: MG-only (no Newell, no PPPM)
+                {
+                    let mut mg_extras: Vec<(&str, &str)> = Vec::new();
+                    if ref_saved {
+                        mg_extras.push(("LLG_CV_LOAD_REF", &ref_path));
+                    }
+
+                    let mg_line = spawn_point(nx, skip_fine_this, "0", "0", &mg_extras);
+                    if let Some(ml) = mg_line {
+                        let p = parse_line(&ml);
+                        t_mg = p.t_comp;
+                        e_mg = p.e_comp;
+                        bz_mg = p.bz_comp;
+                        bx_mg = p.bx_comp;
+                        by_mg = p.by_comp;
+                    } else {
+                        eprintln!("  WARNING: MG-only L0={} failed", nx);
+                    }
+                }
             }
 
-            // Write to CSV file
-            writeln!(csv_f, "{}", line).unwrap();
+            // Write combined CSV row
+            writeln!(csv_f, "{},{},{:.1},{:.1},{:.1},{:.2},{:.2},{:.2},{:.2},{:.1},{:.2},{:.2},{:.2},{:.2},{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+                nx, fnx, tf, tc,
+                t_mg, e_mg, bx_mg, by_mg, bz_mg,
+                t_newell, e_newell, bx_newell, by_newell, bz_newell,
+                t_pppm, e_pppm, bx_pppm, by_pppm, bz_pppm,
+                ec, e_fine_abs, ne).unwrap();
 
-            // Parse for display
-            let cols: Vec<&str> = line.split(',').collect();
-            let tf: f64 = cols.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let tc: f64 = cols.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let tv: f64 = cols.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let ec: f64 = cols.get(6).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
-            let ev: f64 = cols.get(7).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
-            let _nl1: usize = cols.get(10).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let _nl2: usize = cols.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let ne: usize = cols.get(14).and_then(|s| s.parse().ok()).unwrap_or(0);
+            // Display
+            let fmt = |v: f64| -> String {
+                if v.is_nan() { "N/A".into() } else { format!("{:.2}", v) }
+            };
+            if sweep_single_method {
+                println!("  {:>6} {:>7} {:>9}ms {:>9.1}ms {:>9}ms {:>9}% {:>9}% {:>7}",
+                    nx, fnx,
+                    if tf > 0.0 { format!("{:.0}", tf) } else { "skip".into() },
+                    tc,
+                    if t_mg.is_nan() { "skip".into() } else { format!("{:.1}", t_mg) },
+                    fmt(ec), fmt(e_mg), ne);
+            } else {
+                println!("  {:>6} {:>7} {:>9}ms {:>9.1}ms {:>9}ms {:>9}ms {:>9}ms {:>9}% {:>9}% {:>9}% {:>9}% {:>7}",
+                    nx, fnx,
+                    if tf > 0.0 { format!("{:.0}", tf) } else { "skip".into() },
+                    tc,
+                    if t_mg.is_nan() { "skip".into() } else { format!("{:.1}", t_mg) },
+                    if t_newell.is_nan() { "skip".into() } else { format!("{:.1}", t_newell) },
+                    if t_pppm.is_nan() { "skip".into() } else { format!("{:.1}", t_pppm) },
+                    fmt(bz_mg), fmt(bz_newell), fmt(bz_pppm),
+                    fmt(ec), ne);
+            }
 
-            let ec_str = if ec.is_nan() { "N/A".to_string() } else { format!("{:.2}", ec) };
-            let ev_str = if ev.is_nan() { "N/A".to_string() } else { format!("{:.2}", ev) };
-            println!("  {:>6} {:>7} {:>9.0}ms {:>9.1}ms {:>9.1}ms {:>9}% {:>9}% {:>7}",
-                nx, fnx, tf, tc, tv, ec_str, ev_str, ne);
+            rows.push(SweepRow {
+                base_nx: nx, fine_nx: fnx,
+                t_fine: tf, t_cfft: tc,
+                t_mg, t_newell, t_pppm,
+                e_cfft: ec, e_mg, e_newell, e_pppm,
+                bx_mg, by_mg, bz_mg,
+                bx_newell, by_newell, bz_newell,
+                bx_pppm, by_pppm, bz_pppm,
+                e_newell_abs, e_pppm_abs, e_fine_abs,
+            });
 
-            rows.push(SweepRow { _base_nx: nx, fine_nx: fnx, t_fine: tf, t_cfft: tc, t_comp: tv, e_cfft: ec, e_comp: ev, _n_edge: ne });
+            // Cooldown between subprocess runs (thermal management)
+            if sweep_idx + 1 < sweep_sizes.len() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
         }
 
         println!();
@@ -476,13 +994,20 @@ fn main() {
 
             let x_min = rows.iter().map(|r| r.fine_nx as f64).fold(f64::INFINITY, f64::min) * 0.8;
             let x_max = rows.iter().map(|r| r.fine_nx as f64).fold(0.0f64, f64::max) * 1.3;
-            // Convert ms → seconds for all timing
-            let t_max_s = rows.iter().map(|r| r.t_fine.max(r.t_cfft).max(r.t_comp))
-                .fold(0.0f64, f64::max) * 1.5 / 1000.0;
-            let t_min_s = rows.iter().map(|r| {
-                let mut m = r.t_comp;
-                if r.t_cfft > 0.0 { m = m.min(r.t_cfft); }
+            // Convert ms → seconds for all timing (NaN-safe for skipped methods)
+            let t_max_s = rows.iter().map(|r| {
+                let mut m = r.t_cfft;
+                if r.t_fine > m { m = r.t_fine; }
+                if r.t_newell.is_finite() && r.t_newell > m { m = r.t_newell; }
+                if r.t_pppm.is_finite() && r.t_pppm > m { m = r.t_pppm; }
                 m
+            }).fold(0.0f64, f64::max) * 1.5 / 1000.0;
+            let t_min_s = rows.iter().filter_map(|r| {
+                let mut m = f64::INFINITY;
+                if r.t_newell.is_finite() && r.t_newell > 0.0 { m = m.min(r.t_newell); }
+                if r.t_pppm.is_finite() && r.t_pppm > 0.0 { m = m.min(r.t_pppm); }
+                if r.t_cfft > 0.0 { m = m.min(r.t_cfft); }
+                if m.is_finite() { Some(m) } else { None }
             }).fold(f64::INFINITY, f64::min) * 0.5 / 1000.0;
             let t_min_s = t_min_s.max(1e-4);
             let t_max_s = t_max_s.max(1.0);
@@ -526,9 +1051,10 @@ fn main() {
             chart.draw_series(cfft_pts.iter().map(|&(x, y)| Circle::new((x, y), 5, GREEN.filled())))
                 .unwrap();
 
-            // Composite, ms → s
+            // Composite (Newell), ms → s — skip NaN (L0≥1024 where Newell is skipped)
             let comp_pts: Vec<(f64, f64)> = rows.iter()
-                .map(|r| (r.fine_nx as f64, r.t_comp / 1000.0))
+                .filter(|r| r.t_newell.is_finite() && r.t_newell > 0.0)
+                .map(|r| (r.fine_nx as f64, r.t_newell / 1000.0))
                 .collect();
             chart.draw_series(LineSeries::new(comp_pts.clone(), RED.stroke_width(2)))
                 .unwrap()
@@ -587,11 +1113,11 @@ fn main() {
             if fft_pts.len() >= 2 && comp_pts.len() >= 2 {
                 // Find the first data point where composite < fine FFT
                 for r in &rows {
-                    if r.t_fine > 0.0 && r.t_comp < r.t_fine {
-                        let speedup = r.t_fine / r.t_comp;
+                    if r.t_fine > 0.0 && r.t_newell < r.t_fine {
+                        let speedup = r.t_fine / r.t_newell;
                         chart.draw_series(std::iter::once(plotters::element::Text::new(
                             format!("{:.0}× faster", speedup),
-                            (r.fine_nx as f64 * 0.85, r.t_comp / 1000.0 * 0.6),
+                            (r.fine_nx as f64 * 0.85, r.t_newell / 1000.0 * 0.6),
                             ("sans-serif", 12).into_font().color(&RED),
                         ))).ok();
                         break;
@@ -616,8 +1142,14 @@ fn main() {
                 root.fill(&WHITE).unwrap();
 
                 let e_max = rows.iter()
-                    .filter(|r| !r.e_cfft.is_nan())
-                    .map(|r| r.e_cfft.max(r.e_comp))
+                    .filter(|r| !r.e_cfft.is_nan() || !r.e_newell.is_nan())
+                    .map(|r| {
+                        let mut m = 0.0f64;
+                        if r.e_cfft.is_finite() { m = m.max(r.e_cfft); }
+                        if r.e_newell.is_finite() { m = m.max(r.e_newell); }
+                        if r.e_pppm.is_finite() { m = m.max(r.e_pppm); }
+                        m
+                    })
                     .fold(0.0f64, f64::max) * 1.3;
 
                 let mut chart = ChartBuilder::on(&root)
@@ -640,8 +1172,8 @@ fn main() {
                     .map(|r| (r.fine_nx as f64, r.e_cfft))
                     .collect();
                 let comp_acc: Vec<(f64, f64)> = rows.iter()
-                    .filter(|r| !r.e_comp.is_nan())
-                    .map(|r| (r.fine_nx as f64, r.e_comp))
+                    .filter(|r| !r.e_newell.is_nan())
+                    .map(|r| (r.fine_nx as f64, r.e_newell))
                     .collect();
 
                 chart.draw_series(LineSeries::new(cfft_acc.clone(), GREEN.stroke_width(2)))
@@ -671,8 +1203,8 @@ fn main() {
             // Plot 3: Speedup ratio (fine FFT / composite) vs grid size
             {
                 let speedup_pts: Vec<(f64, f64)> = rows.iter()
-                    .filter(|r| r.t_fine > 0.0 && r.t_comp > 0.0)
-                    .map(|r| (r.fine_nx as f64, r.t_fine / r.t_comp))
+                    .filter(|r| r.t_fine > 0.0 && r.t_newell > 0.0)
+                    .map(|r| (r.fine_nx as f64, r.t_fine / r.t_newell))
                     .collect();
                 if speedup_pts.len() >= 2 {
                     let eff_path = format!("{}/crossover_speedup.png", diag_dir);
@@ -743,6 +1275,141 @@ fn main() {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // CELL-COUNT SWEEP: --cell-count-sweep
+    //
+    // Lightweight mode: builds AMR hierarchy at each grid size,
+    // counts actual cells per level, writes separate CSV.
+    // NO field computation — runs in seconds.
+    //
+    // Output: {diag_dir}/cell_count_sweep.csv
+    // Does NOT touch crossover_sweep.csv or any other outputs.
+    //
+    // Usage:
+    //   cargo run --release --bin bench_composite_vcycle -- --cell-count-sweep
+    //
+    // Custom sizes:
+    //   LLG_CV_CELLCOUNT_SIZES=64,96,128,192,256,384,512 \
+    //     cargo run --release --bin bench_composite_vcycle -- --cell-count-sweep
+    // ════════════════════════════════════════════════════════════════
+    let do_cell_count = args.iter().any(|a| a == "--cell-count-sweep");
+    if do_cell_count {
+        let sizes: Vec<usize> = if let Ok(s) = std::env::var("LLG_CV_CELLCOUNT_SIZES") {
+            s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+        } else {
+            vec![32, 64, 96, 128, 192, 256, 384, 512]
+        };
+
+        let diag_dir = std::env::var("LLG_CV_OUT_DIR")
+            .unwrap_or_else(|_| "out/bench_vcycle_diag".to_string());
+        fs::create_dir_all(&diag_dir).ok();
+        let csv_path = format!("{}/cell_count_sweep.csv", diag_dir);
+
+        println!("╔════════════════════════════════════════════════════════════════╗");
+        println!("║  Cell-Count Sweep (hierarchy only — no field computation)     ║");
+        println!("╚════════════════════════════════════════════════════════════════╝");
+        println!();
+        println!("  AMR levels:  {} (ratio {}×, total {}×)",
+            amr_levels, ratio, ratio.pow(amr_levels as u32));
+        println!("  Grid sizes:  {:?}", sizes);
+        println!("  Output:      {}", csv_path);
+        println!();
+
+        let mut csv_f = BufWriter::new(fs::File::create(&csv_path).unwrap());
+        writeln!(csv_f, "base_nx,fine_nx,N_fine,cells_L0,cells_L1,cells_L2,cells_L3,N_eff,neff_pct").unwrap();
+
+        println!("  {:>6} {:>7} {:>10} {:>8} {:>8} {:>8} {:>8} {:>10} {:>8}",
+            "L0", "fine", "N_fine", "L0", "L1", "L2", "L3", "N_eff", "%");
+        println!("  {:->6} {:->7} {:->10} {:->8} {:->8} {:->8} {:->8} {:->10} {:->8}",
+            "", "", "", "", "", "", "", "", "");
+
+        for &bnx in &sizes {
+            let bny = bnx;
+            let dx_local = domain_nm * 1e-9 / bnx as f64;
+            let dy_local = domain_nm * 1e-9 / bny as f64;
+            let bg = Grid2D::new(bnx, bny, dx_local, dy_local, dz);
+
+            let total_ratio_local = ratio.pow(amr_levels as u32);
+            let fnx = bnx * total_ratio_local;
+            let n_fine = fnx * fnx;
+            let n_l0 = bnx * bny;
+
+            // Build coarse M with fill-fraction weighting
+            let n_smooth = edge_smooth_n();
+            let (gm, ff) = shape.to_mask_and_fill(&bg, n_smooth);
+            let mut mc = VectorField2D::new(bg);
+            for j in 0..bny {
+                for i in 0..bnx {
+                    let k = j * bnx + i;
+                    mc.data[k] = if gm[k] { m_unit } else { [0.0; 3] };
+                }
+            }
+            apply_fill_fractions(&mut mc.data, &ff);
+
+            // Build AMR hierarchy
+            let mut h = AmrHierarchy2D::new(bg, mc, ratio, ghost);
+            h.set_geom_shape(shape.clone());
+
+            let indicator_kind = IndicatorKind::Composite { frac: 0.10 };
+            let boundary_layer_local: usize = env_or("LLG_AMR_BOUNDARY_LAYER", 4);
+            let cluster_policy = ClusterPolicy {
+                indicator: indicator_kind,
+                buffer_cells: 4,
+                boundary_layer: boundary_layer_local,
+                connectivity: Connectivity::Eight,
+                merge_distance: 1,
+                min_patch_area: 16,
+                max_patches: 0,
+                min_efficiency: 0.65,
+                max_flagged_fraction: 0.50,
+                confine_dilation: false,
+            };
+            let regrid_policy = RegridPolicy {
+                indicator: indicator_kind,
+                buffer_cells: 4,
+                boundary_layer: boundary_layer_local,
+                min_change_cells: 1,
+                min_area_change_frac: 0.01,
+            };
+
+            let current: Vec<Rect2i> = Vec::new();
+            let _ = maybe_regrid_nested_levels(&mut h, &current, regrid_policy, cluster_policy);
+
+            // Count actual cells per level
+            let cells_l1: usize = h.patches.iter()
+                .map(|p| p.grid.nx * p.grid.ny)
+                .sum();
+
+            let mut cells_l2 = 0usize;
+            let mut cells_l3 = 0usize;
+
+            if !h.patches_l2plus.is_empty() {
+                cells_l2 = h.patches_l2plus[0].iter()
+                    .map(|p| p.grid.nx * p.grid.ny)
+                    .sum();
+            }
+            if h.patches_l2plus.len() > 1 {
+                cells_l3 = h.patches_l2plus[1].iter()
+                    .map(|p| p.grid.nx * p.grid.ny)
+                    .sum();
+            }
+
+            let n_eff = n_l0 + cells_l1 + cells_l2 + cells_l3;
+            let pct = 100.0 * n_eff as f64 / n_fine as f64;
+
+            println!("  {:>6} {:>7} {:>10} {:>8} {:>8} {:>8} {:>8} {:>10} {:>7.2}%",
+                bnx, fnx, n_fine, n_l0, cells_l1, cells_l2, cells_l3, n_eff, pct);
+
+            writeln!(csv_f, "{},{},{},{},{},{},{},{},{:.4}",
+                bnx, fnx, n_fine, n_l0, cells_l1, cells_l2, cells_l3, n_eff, pct).unwrap();
+        }
+
+        println!();
+        println!("  Written to {}", csv_path);
+        println!("  Total time: {:.1} s", t0.elapsed().as_secs_f64());
+        return;
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // SINGLE-RUN MODE: detailed accuracy comparison at one grid size
     // ════════════════════════════════════════════════════════════════
     let dx = domain_nm * 1e-9 / base_nx as f64;
@@ -769,13 +1436,14 @@ fn main() {
         fine_nx, fine_ny, total_ratio, amr_levels);
     println!("  V-cycle:     {}", if vcycle_on { "ON (fine ∇φ on patches)" } else { "OFF (interpolated coarse B)" });
     println!("  EdgeSmooth:  n={} ({} boundary cells with partial fill)", n_smooth, n_boundary);
+    println!("  M direction: {} → [{:.3}, {:.3}, {:.3}]", m_dir_str, m_unit[0], m_unit[1], m_unit[2]);
     println!();
 
     let mut m_coarse = VectorField2D::new(base_grid);
     for j in 0..base_ny {
         for i in 0..base_nx {
             let k = j * base_nx + i;
-            m_coarse.data[k] = if geom_mask[k] { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+            m_coarse.data[k] = if geom_mask[k] { m_unit } else { [0.0, 0.0, 0.0] };
         }
     }
     apply_fill_fractions(&mut m_coarse.data, &fill_frac);
@@ -825,7 +1493,7 @@ fn main() {
             for i in 0..pnx {
                 let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
                 let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
-                p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+                p.m.data[j * pnx + i] = [ff * m_unit[0], ff * m_unit[1], ff * m_unit[2]];
             }
         }
     }
@@ -840,7 +1508,7 @@ fn main() {
                 for i in 0..pnx {
                     let (x, y) = p.cell_center_xy_centered(i, j, &base_grid);
                     let ff = shape.fill_fraction(x, y, pdx, pdy, n_smooth);
-                    p.m.data[j * pnx + i] = [ff, 0.0, 0.0];
+                    p.m.data[j * pnx + i] = [ff * m_unit[0], ff * m_unit[1], ff * m_unit[2]];
                 }
             }
         }
@@ -865,7 +1533,7 @@ fn main() {
                 let x = (i as f64 + 0.5) * fine_dx - fine_half_lx;
                 let y = (j as f64 + 0.5) * fine_dy - fine_half_ly;
                 let ff = shape.fill_fraction(x, y, fine_dx, fine_dy, n_smooth);
-                m_fine.data[j * fine_nx + i] = [ff, 0.0, 0.0];
+                m_fine.data[j * fine_nx + i] = [ff * m_unit[0], ff * m_unit[1], ff * m_unit[2]];
             }
         }
         Some(m_fine)
@@ -1177,7 +1845,9 @@ fn main() {
     // ════════════════════════════════════════════════════════════════════
     // DIAGNOSTIC CSV OUTPUT
     // ════════════════════════════════════════════════════════════════════
-    let diag_dir = "out/bench_vcycle_diag";
+    let diag_dir = std::env::var("LLG_CV_OUT_DIR")
+        .unwrap_or_else(|_| "out/bench_vcycle_diag".to_string());
+    let diag_dir = diag_dir.as_str();
     fs::create_dir_all(diag_dir).ok();
 
     // ---- 1. Patch map ----

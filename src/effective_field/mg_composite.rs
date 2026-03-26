@@ -582,6 +582,7 @@ fn fill_phi_ghosts_from_parent_patch(
 /// `step_ratio` is the refinement ratio between adjacent levels (h.ratio,
 /// typically 2). Each parent fine cell maps to step_ratio × step_ratio
 /// child fine cells.
+#[allow(dead_code)]
 fn restrict_residual_to_parent_patch(
     child_patch: &Patch2D,
     child_residual: &[f64],
@@ -1347,7 +1348,7 @@ impl NewellDirectDemag {
         b_demag: &mut VectorField2D,
         m: &[[f64; 3]],
         _mask: &[bool],
-        nx: usize, ny: usize,
+        nx: usize, _ny: usize,
         ms: f64,
     ) {
         let r = self.radius as isize;

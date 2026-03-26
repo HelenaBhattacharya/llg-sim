@@ -563,6 +563,7 @@ impl DeltaKernel2D {
     ///
     /// After this, the 2D central-difference gradient of φ_corrected will approximate
     /// the Newell B field, making patch ghost-fill consistent with the FFT reference.
+    #[allow(dead_code)]
     pub(crate) fn apply_phi_correction(&self, m: &VectorField2D, phi: &mut [f64], ms: f64) {
         let nx = m.grid.nx;
         let ny = m.grid.ny;
@@ -2403,6 +2404,7 @@ impl DemagPoissonMGHybrid {
     ///
     /// Used by mg_composite to apply the PPPM-φ correction to L0 φ
     /// before ghost-filling into AMR patches.
+    #[allow(dead_code)]
     pub(crate) fn delta_kernel(&self) -> Option<&DeltaKernel2D> {
         self.dk.as_ref()
     }
@@ -2603,6 +2605,7 @@ impl DemagPoissonMGHybrid {
     /// Used by the composite solver when patches provide near-field
     /// accuracy through defect correction. L0 MG gives the smooth
     /// far-field; PPPM is not needed because patches handle near-field.
+    #[allow(dead_code)]
     pub(crate) fn solve_plain(
         &mut self,
         coarse_m: &VectorField2D,
@@ -2621,6 +2624,7 @@ impl DemagPoissonMGHybrid {
     ///
     /// Used by the composite V-cycle: restricted patch residuals are
     /// injected into L0 RHS. No screening, no ΔK.
+    #[allow(dead_code)]
     pub(crate) fn solve_plain_with_corrections(
         &mut self,
         coarse_m: &VectorField2D,
