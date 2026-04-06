@@ -451,12 +451,12 @@ def main() -> None:
     if args.pub:
         plt.rcParams.update({
             "font.family": "serif",
-            "font.size": 12,
-            "axes.labelsize": 14,
+            "font.size": 13,
+            "axes.labelsize": 16,
             "axes.titlesize": 14,
-            "legend.fontsize": 11,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
+            "legend.fontsize": 12,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.top": True,
@@ -468,48 +468,54 @@ def main() -> None:
             "savefig.dpi": 300,
         })
         _dpi = 300
-        # Match SP4 figure width (6.667 in) for alignment; taller to accommodate larger fonts
-        fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(6.667, 5.0))
+        # Match SP4 figure width (6.667 in); compact vertical layout
+        fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(7.0, 5.0))
     else:
         _dpi = args.dpi
         fig, (ax_top, ax_bot) = plt.subplots(nrows=2, figsize=(7.2, 7.6))
 
     # ---- Top: Remanence ----
-    # MuMax3: markers only
-    ax_top.plot(d_m, mx_m, "o", color=_cx, markersize=5, markeredgewidth=0.0, zorder=1)
+    # MuMax3: hollow markers, slightly larger
+    ax_top.plot(d_m[::1], mx_m[::1], "o", color=_cx, markersize=6,
+                markerfacecolor="none", markeredgewidth=1.0, zorder=1)
     # Rust: solid line
     ax_top.plot(d_r, mx_r, "-", color=_cx, linewidth=1.4, zorder=2)
 
-    ax_top.set_xlabel(r"$d / \ell_\mathrm{ex}$")
+    # No x-axis label on top panel (shared with bottom); keep tick marks
+    ax_top.tick_params(axis="x", labelbottom=False)
     ax_top.set_ylabel(r"$\langle m_x \rangle$", color=_cx)
     ax_top.tick_params(axis="y", colors=_cx)
 
     ax_top_r = ax_top.twinx()
-    ax_top_r.plot(d_m, my_m, "o", color=_cy, markersize=5, markeredgewidth=0.0, zorder=1)
+    # MuMax3 my: hollow markers
+    ax_top_r.plot(d_m[::1], my_m[::1], "o", color=_cy, markersize=6,
+                  markerfacecolor="none", markeredgewidth=1.0, zorder=1)
+    # Rust my: solid line
     ax_top_r.plot(d_r, my_r, "-", color=_cy, linewidth=1.4, zorder=2)
     ax_top_r.set_ylabel(r"$\langle m_y \rangle$", color=_cy)
     ax_top_r.tick_params(axis="y", colors=_cy, direction="in")
 
     if args.paper_style or args.pub:
         ax_top.set_xlim(0, 30)
-        ax_top.set_ylim(0.9, 1.001)
+        ax_top.set_ylim(0.958, 1.003)
         ax_top.set_xticks([0, 5, 10, 15, 20, 25, 30])
-        ax_top.set_yticks([0.90, 0.95, 1.00])
+        ax_top.set_yticks([0.96, 0.98, 1.00])
 
-        ax_top_r.set_ylim(0.0, 0.1)
-        ax_top_r.set_yticks([0.0, 0.05, 0.1])
+        ax_top_r.set_ylim(-0.005, 0.10)
+        ax_top_r.set_yticks([0.00, 0.05, 0.10])
 
     # Legend for remanence: style encodes source, colour encodes component
     rem_handles = [
         Line2D([], [], color="k", linestyle="-", linewidth=1.4, label="Rust"),
-        Line2D([], [], color="k", marker="o", linestyle="None", markersize=5, label="MuMax3"),
+        Line2D([], [], color="k", marker="o", linestyle="None", markersize=6,
+               markerfacecolor="none", markeredgewidth=1.0, label="MuMax3"),
         Line2D([], [], color=_cx, linestyle="-", linewidth=2.5, label=r"$m_x$"),
         Line2D([], [], color=_cy, linestyle="-", linewidth=2.5, label=r"$m_y$"),
     ]
     ax_top.legend(
         handles=rem_handles, ncol=4,
         loc="lower center", bbox_to_anchor=(0.5, 1.0),
-        frameon=False, fontsize=11, handlelength=1.4,
+        frameon=False, fontsize=12, handlelength=1.4,
         handletextpad=0.4, columnspacing=1.0,
     )
 
@@ -547,12 +553,12 @@ def main() -> None:
 
     ax_bot.grid(False)
     ax_bot.legend(loc="upper right", frameon=True, framealpha=0.95, edgecolor="0.8",
-                  fontsize=11, borderpad=0.3, handletextpad=0.3, labelspacing=0.25,
+                  fontsize=12, borderpad=0.3, handletextpad=0.3, labelspacing=0.25,
                   markerscale=1.0)
 
     # Save
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    fig.tight_layout(h_pad=1.0)
     fig.savefig(args.out, dpi=_dpi)
     print(f"Wrote: {args.out}")
     print(f"Using MuMax table: {mumax_table}")

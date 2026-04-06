@@ -590,7 +590,7 @@ def plot_abd_triptych(
         })
         fig_w = 6.667
         fig_h = 2.4
-        _dpi = 300
+        _dpi = 1000
         _title_a = "A (Rust)"
         _title_b = "B (MuMax3)"
         _title_d = r"$\Delta$ = A $-$ B"

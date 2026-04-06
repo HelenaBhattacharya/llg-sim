@@ -4,6 +4,7 @@ scripts/plot_appendix_figures.py
 
   Figure A1 — Single-Spin Precession
   Figure A2 — Anisotropy Dynamics
+  Figure A3 — DMI Chirality Selection
 """
 
 import argparse, re, sys
@@ -15,10 +16,10 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, NullFormatter
 
 plt.rcParams.update({
-    "font.family": "serif", "font.size": 11,
-    "axes.labelsize": 12, "axes.titlesize": 12,
-    "legend.fontsize": 10,
-    "xtick.labelsize": 10, "ytick.labelsize": 10,
+    "font.family": "serif", "font.size": 14,
+    "axes.labelsize": 15, "axes.titlesize": 15,
+    "legend.fontsize": 13,
+    "xtick.labelsize": 13, "ytick.labelsize": 13,
     "lines.linewidth": 1.2,
     "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
 })
@@ -97,56 +98,65 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
     my_m_uniform = np.interp(t_r, t_m, my_m)
     fft_m = np.abs(np.fft.rfft((my_m_uniform - my_m_uniform.mean()) * win))
 
-    # ── Layout ──
-    fig = plt.figure(figsize=(7.2, 8.2))
-    gs = fig.add_gridspec(2, 2, hspace=0.52, wspace=0.32, height_ratios=[1, 1.25])
+    # ── Layout: 3 panels stacked vertically ──
+    fig, axes = plt.subplots(3, 1, figsize=(6.5, 10.0),
+                             constrained_layout=True,
+                             gridspec_kw={"height_ratios": [1, 1, 1.2]})
 
     # ═══ (a) Trajectory ═══
-    ax = fig.add_subplot(gs[0, 0])
+    ax = axes[0]
 
     # Analytical as thick transparent envelope
-    ax.plot(t_r * 1e9, my_an, "-", color="#2ca02c", linewidth=3.5,
+    ax.plot(t_r * 1e9, my_an, "-", color="#2ca02c", linewidth=4.0,
             alpha=0.3, zorder=1, label="Analytical")
     # Rust as thin solid line on top
-    ax.plot(t_r * 1e9, my_r, "-", color="#1f77b4", linewidth=0.4,
+    ax.plot(t_r * 1e9, my_r, "-", color="#1f77b4", linewidth=0.5,
             zorder=2, label="Rust (RK45)")
 
     ax.set_xlabel("Time (ns)")
     ax.set_ylabel(r"$m_y$")
+    ax.yaxis.set_label_coords(-0.1, 0.5)
     ax.set_xlim(0, t_max * 1e9)
 
-    # Legend tight in upper-right corner
-    ax.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=10,
-              borderaxespad=0.3, borderpad=0.3, handlelength=1.2)
+    ax.legend(loc="upper right", frameon=True, framealpha=0.95,
+              borderaxespad=0.3, borderpad=0.4, handlelength=1.5)
 
-    ax.set_title("(a)", loc="left", fontweight="bold")
+    # Stats inside panel (a) — bottom-right where signal has decayed
+    stat_text_a = (f"RMSE(Rust\u2013MuMax3) = {rmse_mumax:.1e}\n"
+                   f"max|$\\Delta m_y$| = {max_err_mumax:.1e}")
+    ax.text(0.97, 0.05, stat_text_a, transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=12,
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9))
 
     # ═══ (b) FFT — Rust + MuMax + predicted ═══
-    ax = fig.add_subplot(gs[0, 1])
+    ax = axes[1]
     f_ghz = freqs * 1e-9
 
-    ax.plot(f_ghz, fft_r / fft_r.max(), "-", color="#1f77b4", linewidth=1.0,
+    ax.plot(f_ghz, fft_r / fft_r.max(), "-", color="#1f77b4", linewidth=1.2,
             label="Rust")
-    ax.plot(f_ghz, fft_m / fft_m.max(), "--", color="#d62728", linewidth=0.9,
+    ax.plot(f_ghz, fft_m / fft_m.max(), "--", color="#d62728", linewidth=1.0,
             alpha=0.7, label="MuMax3")
-    ax.axvline(f_pred * 1e-9, color="#2ca02c", linestyle=":", linewidth=0.9,
+    ax.axvline(f_pred * 1e-9, color="#2ca02c", linestyle=":", linewidth=1.0,
                alpha=0.8, label="Analytical")
 
     ax.set_xlim(24, 32)
     ax.set_ylim(-0.02, 1.08)
     ax.set_xlabel("Frequency (GHz)")
     ax.set_ylabel("Normalised amplitude")
+    ax.yaxis.set_label_coords(-0.1, 0.5)
 
-    # Legend tight in upper-right corner (peak is narrow, corner is clear)
-    ax.legend(loc="upper right", frameon=True, framealpha=0.95, fontsize=10,
-              borderaxespad=0.3, borderpad=0.3, handlelength=1.2)
+    ax.legend(loc="upper right", frameon=True, framealpha=0.95,
+              borderaxespad=0.3, borderpad=0.4, handlelength=1.5)
 
-    ax.set_title("(b)", loc="left", fontweight="bold")
+    # Stats inside panel (b) — bottom-left flat baseline region
+    stat_text_b = (rf"$\gamma_0 B/2\pi$ = {f_pred*1e-9:.2f} GHz"
+                   f"\nFFT peak = {f_peak*1e-9:.2f} GHz")
+    ax.text(0.03, 0.95, stat_text_b, transform=ax.transAxes,
+            ha="left", va="top", fontsize=12,
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9))
 
-    # Stats will be placed after tight_layout — see below
-
-    # ═══ (c) Convergence (full bottom row) ═══
-    ax = fig.add_subplot(gs[1, :])
+    # ═══ (c) Convergence ═══
+    ax = axes[2]
     dt_c = conv["dt"]
 
     methods = [
@@ -167,7 +177,7 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
             continue
         dv, ev = dt_c[valid], err[valid]
 
-        ax.loglog(dv, ev, marker, color=color, markersize=4.5,
+        ax.loglog(dv, ev, marker, color=color, markersize=5.5,
                   markeredgewidth=0, zorder=3, label=name)
 
         # Theoretical slope: anchor at centre of points above precision floor
@@ -184,41 +194,23 @@ def make_fig_a1(rust_path, mumax_path, conv_path, out_path,
                       linewidth=1.0, alpha=0.3, zorder=1)
 
             # Label at right end of clean data, offset right
-            # Per-method vertical nudge to avoid overlap
-            y_nudge = {"Euler": -12, "RK23": -10, "RK4": 0, "RK45": 0}.get(name, 0)
+            y_nudge = {"Euler": -14, "RK23": -12, "RK4": 0, "RK45": 0}.get(name, 0)
             ri = min(len(dc) - 1, int(len(dc) * 0.85))
             ax.annotate(f"$\\Delta t^{{{order}}}$",
-                        xy=(dc[ri], ec[ri]), fontsize=10, color=color,
+                        xy=(dc[ri], ec[ri]), fontsize=13, color=color,
                         fontweight="bold",
-                        xytext=(10, y_nudge), textcoords="offset points", va="center")
+                        xytext=(12, y_nudge), textcoords="offset points", va="center")
 
     ax.set_xlabel(r"Time step $\Delta t$ (s)")
     ax.set_ylabel("Absolute error after 1 period")
-    ax.set_title("(c)", loc="left", fontweight="bold")
-    ax.legend(loc="upper left", frameon=True, framealpha=0.95,
-              fontsize=10, ncol=4, columnspacing=1.0)
+    ax.yaxis.set_label_coords(-0.1, 0.5)
+    ax.set_ylim(top=1.0)  # headroom for legend above Euler data
+    ax.legend(loc="upper center", frameon=True, framealpha=0.95,
+              ncol=4, columnspacing=0.3, handletextpad=0.15,
+              borderaxespad=0.3,
+              bbox_to_anchor=(0.35, 1.0))
     ax.yaxis.set_minor_locator(LogLocator(subs="auto", numticks=20))
     ax.yaxis.set_minor_formatter(NullFormatter())
-
-    # ═══ Place stat boxes after layout so they align properly ═══
-    fig.tight_layout()
-
-    # Read actual panel positions (data window, excludes labels)
-    bb_a = fig.axes[0].get_position()  # panel (a)
-    bb_b = fig.axes[1].get_position()  # panel (b)
-    stat_y = min(bb_a.y0, bb_b.y0) - 0.04  # use lower of the two so both align
-
-    stat_style = dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9)
-
-    fig.text(bb_a.x0 + bb_a.width / 2, stat_y,
-             f"RMSE(Rust–MuMax3) = {rmse_mumax:.1e}\n"
-             f"max|$\\Delta m_y$| = {max_err_mumax:.1e}",
-             fontsize=9, va="top", ha="center", bbox=stat_style)
-
-    fig.text(bb_b.x0 + bb_b.width / 2, stat_y,
-             rf"$\gamma_0 B/2\pi$ = {f_pred*1e-9:.2f} GHz"
-             f"\nFFT peak = {f_peak*1e-9:.2f} GHz",
-             fontsize=9, va="top", ha="center", bbox=stat_style)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -240,7 +232,7 @@ def make_fig_a2(rust_path, mumax_path, out_path):
 
     stride = max(1, len(t_m) // 200)
 
-    fig, ax_l = plt.subplots(figsize=(6.5, 3.8))
+    fig, ax_l = plt.subplots(figsize=(6.5, 4.5))
     ax_r = ax_l.twinx()
 
     # ── Left axis: mx, my (large oscillation) ──
@@ -248,15 +240,15 @@ def make_fig_a2(rust_path, mumax_path, out_path):
 
     # MuMax dots
     ax_l.plot(t_m[::stride]*1e9, _get(mumax,"mx")[mm][::stride], ".",
-              color=c_mx, markersize=6.0, alpha=0.4, markeredgewidth=0, zorder=2)
+              color=c_mx, markersize=7.0, alpha=0.4, markeredgewidth=0, zorder=2)
     ax_l.plot(t_m[::stride]*1e9, _get(mumax,"my")[mm][::stride], ".",
-              color=c_my, markersize=6.0, alpha=0.4, markeredgewidth=0, zorder=2,
+              color=c_my, markersize=7.0, alpha=0.4, markeredgewidth=0, zorder=2,
               label="MuMax3 (dots)")
 
     # Rust lines
-    ax_l.plot(t_r*1e9, rust["mx"][mr], "-", color=c_mx, linewidth=0.7,
+    ax_l.plot(t_r*1e9, rust["mx"][mr], "-", color=c_mx, linewidth=0.8,
               zorder=3, label=r"$m_x$")
-    ax_l.plot(t_r*1e9, rust["my"][mr], "-", color=c_my, linewidth=0.7,
+    ax_l.plot(t_r*1e9, rust["my"][mr], "-", color=c_my, linewidth=0.8,
               zorder=3, label=r"$m_y$")
 
     ax_l.set_xlabel("Time (ns)")
@@ -268,8 +260,8 @@ def make_fig_a2(rust_path, mumax_path, out_path):
     c_mz = "#2ca02c"
 
     ax_r.plot(t_m[::stride]*1e9, _get(mumax,"mz")[mm][::stride], ".",
-              color=c_mz, markersize=6.0, alpha=0.45, markeredgewidth=0, zorder=2)
-    ax_r.plot(t_r*1e9, rust["mz"][mr], "-", color=c_mz, linewidth=1.0,
+              color=c_mz, markersize=7.0, alpha=0.45, markeredgewidth=0, zorder=2)
+    ax_r.plot(t_r*1e9, rust["mz"][mr], "-", color=c_mz, linewidth=1.1,
               zorder=3, label=r"$m_z$")
 
     ax_r.set_ylabel(r"$m_z$", color=c_mz)
@@ -280,8 +272,8 @@ def make_fig_a2(rust_path, mumax_path, out_path):
     lines_r, labels_r = ax_r.get_legend_handles_labels()
     fig.legend(lines_l + lines_r, labels_l + labels_r,
                loc="upper center", ncol=4, frameon=True, framealpha=0.95,
-               fontsize=10, handletextpad=0.4, columnspacing=1.0,
-               bbox_to_anchor=(0.5, 0.98))
+               handletextpad=0.4, columnspacing=1.0,
+               bbox_to_anchor=(0.5, 1.06))
 
     # RMSE below the plot
     rmse_strs = []
@@ -291,8 +283,8 @@ def make_fig_a2(rust_path, mumax_path, out_path):
         rmse_strs.append(f"RMSE({lbl}) = {rmse_c:.1e}")
 
     fig.text(0.5, -0.02, "    ".join(rmse_strs),
-             ha="center", fontsize=9,
-             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
+             ha="center", fontsize=12,
+             bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9))
 
     fig.tight_layout()
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -391,44 +383,44 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
     # Colours: blue = +D, red = -D
     c_p, c_m = "#1f77b4", "#d62728"
 
-    fig, ax = plt.subplots(figsize=(6.8, 4.4))
+    fig, ax = plt.subplots(figsize=(6.5, 5.0))
 
     stride = max(1, len(xmp_c) // 120)
 
     # ── MuMax dots (behind, all components) ──
     # +D MuMax
     ax.plot(xmp_c[::stride], mzmp[::stride], "o", color=c_p,
-            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
+            markersize=5.5, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmp_c[::stride], mxmp[::stride], "o", color=c_p,
-            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
+            markersize=5.5, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmp_c[::stride], mymp[::stride], "o", color=c_p,
-            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
+            markersize=5.5, alpha=0.45, markeredgewidth=0, zorder=2)
 
     # -D MuMax
     ax.plot(xmm_c[::stride], mzmm[::stride], "s", color=c_m,
-            markersize=4.5, alpha=0.45, markeredgewidth=0, zorder=2)
+            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmm_c[::stride], mxmm[::stride], "s", color=c_m,
-            markersize=4.5, alpha=0.45, markeredgewidth=0, zorder=2)
+            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
     ax.plot(xmm_c[::stride], mymm[::stride], "s", color=c_m,
-            markersize=4.5, alpha=0.45, markeredgewidth=0, zorder=2)
+            markersize=5.0, alpha=0.45, markeredgewidth=0, zorder=2)
 
     # ── Rust lines (on top), ordered by component for clean legend pairing ──
     # mz pair
-    ax.plot(xrp_c, mzrp, "-",  color=c_p, linewidth=1.4, zorder=3,
+    ax.plot(xrp_c, mzrp, "-",  color=c_p, linewidth=1.6, zorder=3,
             label=r"$+D\;m_z$")
-    ax.plot(xrm_c, mzrm, "-",  color=c_m, linewidth=1.4, zorder=3,
+    ax.plot(xrm_c, mzrm, "-",  color=c_m, linewidth=1.6, zorder=3,
             label=r"$-D\;m_z$")
 
     # mx pair
-    ax.plot(xrp_c, mxrp, "--", color=c_p, linewidth=1.1, zorder=3,
+    ax.plot(xrp_c, mxrp, "--", color=c_p, linewidth=1.2, zorder=3,
             label=r"$+D\;m_x$")
-    ax.plot(xrm_c, mxrm, "--", color=c_m, linewidth=1.1, zorder=3,
+    ax.plot(xrm_c, mxrm, "--", color=c_m, linewidth=1.2, zorder=3,
             label=r"$-D\;m_x$")
 
     # my pair
-    ax.plot(xrp_c, myrp, ":",  color=c_p, linewidth=1.0, zorder=3,
+    ax.plot(xrp_c, myrp, ":",  color=c_p, linewidth=1.1, zorder=3,
             label=r"$+D\;m_y$")
-    ax.plot(xrm_c, myrm, ":",  color=c_m, linewidth=1.0, zorder=3,
+    ax.plot(xrm_c, myrm, ":",  color=c_m, linewidth=1.1, zorder=3,
             label=r"$-D\;m_y$")
 
     ax.axhline(0, color="0.5", linewidth=0.4, zorder=1)
@@ -437,8 +429,8 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
     ax.set_xlim(-500, 500)
     ax.set_ylim(-1.08, 1.08)
 
-    # ── Collect legend handles (placement deferred to after tight_layout) ──
-    mumax_handle = Line2D([], [], marker="o", color="0.55", markersize=6,
+    # ── Collect legend handles ──
+    mumax_handle = Line2D([], [], marker="o", color="0.55", markersize=7,
                           linestyle="None", alpha=0.5, markeredgewidth=0)
 
     handles, labels = ax.get_legend_handles_labels()
@@ -456,14 +448,13 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
         mu_m_i = np.interp(xrm_c, xmm_c, mu_m)
         rmse_p = np.sqrt(np.mean((rust_p - mu_p_i)**2))
         rmse_m = np.sqrt(np.mean((rust_m - mu_m_i)**2))
-        # ±D values match by symmetry — report average
         rmse_vals[comp_label] = 0.5 * (rmse_p + rmse_m)
 
     rmse_text = (f"RMSE(${list(rmse_vals.keys())[0]}$) = {list(rmse_vals.values())[0]:.1e}    "
                  f"RMSE(${list(rmse_vals.keys())[1]}$) = {list(rmse_vals.values())[1]:.1e}    "
                  f"RMSE(${list(rmse_vals.keys())[2]}$) = {list(rmse_vals.values())[2]:.1e}")
 
-    fig.tight_layout(rect=(0, 0.05, 1, 0.92))  # leave room top (legend) and bottom (RMSE)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.92))
 
     # Now place legend and RMSE centred on the plot data window
     bb = ax.get_position()
@@ -471,13 +462,13 @@ def make_fig_a3(rust_dplus, rust_dminus, mumax_dplus, mumax_dminus, out_path):
 
     fig.legend(all_handles, all_labels,
                loc="upper center", ncol=4, frameon=True, framealpha=0.92,
-               fontsize=9, handletextpad=0.4, columnspacing=0.8,
+               handletextpad=0.4, columnspacing=0.8,
                handlelength=2.0, borderpad=0.5,
-               bbox_to_anchor=(plot_centre_x, 1.0))
+               bbox_to_anchor=(plot_centre_x, 1.04))
 
     fig.text(plot_centre_x, 0.01, rmse_text,
-             ha="center", fontsize=9,
-             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
+             ha="center", fontsize=12,
+             bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="0.7", alpha=0.9))
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)

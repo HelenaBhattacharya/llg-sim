@@ -78,6 +78,9 @@
 //
 // Run (full 4-method comparison with fine FFT reference):
 //   cargo run --release --bin bench_vortex_gyration -- --plots
+//
+// Run (timing probe — measures fine FFT per-step cost, ~2-5 min):
+//   cargo run --release --bin bench_vortex_gyration -- --fine-only --timing-probe
 
 use std::f64::consts::PI;
 use std::fs::{self, File, OpenOptions};
@@ -819,6 +822,109 @@ fn main() {
         if skip_cfft{"SKIP"}else{"ON"},
         if skip_comp{"SKIP"}else{"ON"});
     println!();
+
+    // =====================================================================
+    // FINE FFT TIMING PROBE (--timing-probe flag)
+    // =====================================================================
+    if args.iter().any(|a| a=="--timing-probe") {
+        let comp_scr: usize = pow_usize(ratio * ratio, amr_lvl);  // r^{2L} = 64
+
+        println!("\n  ┌── TIMING PROBE: Fine FFT vs Composite AMR ─────────────┐");
+        println!("  │ Fine grid: {}×{} = {} cells", fnx, fny, fnx*fny);
+        println!("  │ Coarse grid: {}×{}, {} AMR levels, scr={}", bnx, bny, amr_lvl, comp_scr);
+
+        // ── FINE FFT PROBE ──
+        // Warmup: build and cache the Newell kernel (one-time cost)
+        println!("  │");
+        println!("  │ ── Fine FFT (768² uniform grid) ──");
+        println!("  │ Warming up (building FFT kernel)...");
+        let tw = Instant::now();
+        step_dyn(&mut m_fine, &mut bf, &llg, &mat, &mut sf, &fg, &mf);
+        let warmup_s = tw.elapsed().as_secs_f64();
+        println!("  │ Warmup (incl. kernel build): {:.2}s", warmup_s);
+
+        let fine_probe_n = 2000_usize;
+        println!("  │ Running {} step_dyn steps (cached FFT)...", fine_probe_n);
+        llg.alpha = alpha_dyn;
+        let t_fine_probe = Instant::now();
+        for i in 0..fine_probe_n {
+            step_dyn(&mut m_fine, &mut bf, &llg, &mat, &mut sf, &fg, &mf);
+            if (i+1) % 500 == 0 {
+                let el = t_fine_probe.elapsed().as_secs_f64();
+                println!("  │   {}/{} ({:.1}s, {:.4}s/step)", i+1, fine_probe_n, el, el/(i+1) as f64);
+            }
+        }
+        let fine_elapsed = t_fine_probe.elapsed().as_secs_f64();
+        let fine_per_step = fine_elapsed / fine_probe_n as f64;
+        println!("  │ Fine FFT: {:.4}s/step (avg over {} steps)", fine_per_step, fine_probe_n);
+
+        // ── COMPOSITE AMR PROBE ──
+        let comp_per_coarse;
+        if let (Some(s_co), Some(hc)) = (&mut st_co, &mut h_co) {
+            println!("  │");
+            println!("  │ ── Composite AMR ({}² base + patches, scr={}) ──", bnx, comp_scr);
+
+            // Warmup: first step triggers Newell tensor build, MG init, etc.
+            println!("  │ Warming up (building composite solver)...");
+            llg.alpha = alpha_dyn;
+            let tw2 = Instant::now();
+            s_co.step(hc, &llg, &mat, lm);
+            let warmup2 = tw2.elapsed().as_secs_f64();
+            println!("  │ Warmup: {:.2}s", warmup2);
+
+            let comp_probe_n = 100_usize;
+            println!("  │ Running {} composite coarse steps...", comp_probe_n);
+            let t_comp_probe = Instant::now();
+            for i in 0..comp_probe_n {
+                s_co.step(hc, &llg, &mat, lm);
+                if (i+1) % 25 == 0 {
+                    let el = t_comp_probe.elapsed().as_secs_f64();
+                    println!("  │   {}/{} ({:.1}s, {:.3}s/step)", i+1, comp_probe_n, el, el/(i+1) as f64);
+                }
+            }
+            let comp_elapsed = t_comp_probe.elapsed().as_secs_f64();
+            comp_per_coarse = comp_elapsed / comp_probe_n as f64;
+            println!("  │ Composite: {:.4}s/coarse step (avg over {} steps)", comp_per_coarse, comp_probe_n);
+        } else {
+            println!("  │");
+            println!("  │ ⚠ Composite not available (--fine-only or --skip-composite)");
+            println!("  │   Using historical value: 1.28 s/coarse step");
+            comp_per_coarse = 1.28;
+        }
+
+        // ── COMPARISON ──
+        // To advance 192 fs of physical time:
+        //   Fine FFT needs 64 steps (no subcycling)
+        //   Composite needs 1 coarse step (includes subcycled patches)
+        let fine_per_interval = fine_per_step * comp_scr as f64;
+        let interval_speedup = fine_per_interval / comp_per_coarse;
+
+        // Scale to 2.0 ns Phase 3
+        let report_gyr_ns = 2.0_f64;
+        let report_gyr_steps = (report_gyr_ns * 1e-9 / dt).ceil() as usize;
+        let comp_coarse_steps = report_gyr_steps as f64 / comp_scr as f64;
+        let fine_phase3_hr = (fine_per_step * report_gyr_steps as f64) / 3600.0;
+        let comp_phase3_hr = (comp_per_coarse * comp_coarse_steps) / 3600.0;
+
+        println!("  │");
+        println!("  │ ══════════════════════════════════════════════════════");
+        println!("  │ RESULTS");
+        println!("  │ ──────────────────────────────────────────────────────");
+        println!("  │ Fine FFT per step:       {:.4}s (avg {} steps)", fine_per_step, fine_probe_n);
+        println!("  │ Composite per coarse:    {:.4}s (avg, incl. all AMR overhead)", comp_per_coarse);
+        println!("  │");
+        println!("  │ To advance 192 fs (one coarse interval):");
+        println!("  │   Fine FFT:  {} steps × {:.4}s = {:.2}s", comp_scr, fine_per_step, fine_per_interval);
+        println!("  │   Composite: 1 step  × {:.4}s = {:.2}s", comp_per_coarse, comp_per_coarse);
+        println!("  │   ★ PER-INTERVAL SPEEDUP: {:.1}×", interval_speedup);
+        println!("  │");
+        println!("  │ Extrapolated to {:.1}ns Phase 3:", report_gyr_ns);
+        println!("  │   Fine FFT:  {:.1} hours", fine_phase3_hr);
+        println!("  │   Composite: {:.1} hours", comp_phase3_hr);
+        println!("  │   ★ DYNAMIC SPEEDUP: {:.1}×", fine_phase3_hr / comp_phase3_hr);
+        println!("  └───────────────────────────────────────────────────────┘\n");
+        std::process::exit(0);
+    }
 
     // =====================================================================
     // PHASE 1: Relax to vortex ground state (α=0.5, B=0)

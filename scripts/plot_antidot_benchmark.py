@@ -35,16 +35,16 @@ def setup_style():
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "DejaVu Serif", "Liberation Serif"],
-        "font.size": 11, "mathtext.fontset": "cm",
-        "axes.linewidth": 0.8, "axes.labelsize": 12, "axes.titlesize": 12,
+        "font.size": 12, "mathtext.fontset": "cm",
+        "axes.linewidth": 0.8, "axes.labelsize": 13, "axes.titlesize": 13,
         "axes.spines.top": True, "axes.spines.right": True,
         "xtick.direction": "in", "ytick.direction": "in",
         "xtick.major.size": 4, "ytick.major.size": 4,
         "xtick.minor.size": 2, "ytick.minor.size": 2,
         "xtick.major.width": 0.6, "ytick.major.width": 0.6,
         "xtick.top": True, "ytick.right": True,
-        "xtick.labelsize": 10, "ytick.labelsize": 10,
-        "legend.fontsize": 10, "legend.framealpha": 0.9,
+        "xtick.labelsize": 11, "ytick.labelsize": 11,
+        "legend.fontsize": 11, "legend.framealpha": 0.9,
         "legend.edgecolor": "0.7", "legend.fancybox": False,
         "legend.handlelength": 1.8, "lines.linewidth": 1.5,
         "figure.dpi": 200, "savefig.dpi": 300,
@@ -90,48 +90,62 @@ def plot_patch_map(diag_dir, out_dir,
     dx_l0 = domain_nm / base_nx
     dh = domain_nm / 2.0
 
-    level_style = {
-        1: {"fc": (0.95, 0.75, 0.20, 0.18), "ec": (0.70, 0.55, 0.10),
-            "lw": 0.8, "label": f"L1 (dx = {dx_l0/2:.2f} nm)"},
-        2: {"fc": (0.40, 0.75, 0.40, 0.22), "ec": (0.15, 0.50, 0.15),
-            "lw": 0.7, "label": f"L2 (dx = {dx_l0/4:.2f} nm)"},
-        3: {"fc": (0.35, 0.60, 0.85, 0.25), "ec": (0.15, 0.35, 0.65),
-            "lw": 0.6, "label": f"L3 (dx = {dx_l0/8:.3f} nm)"},
+    # Colour scheme matching vortex gyration Figure 8(a)
+    colours = {
+        1: '#FFD700',   # gold
+        2: '#00CC00',   # green
+        3: '#0077FF',   # blue
+    }
+    dx_labels = {
+        1: f"L1 (dx \u2248 {dx_l0/2:.2f} nm)",
+        2: f"L2 (dx \u2248 {dx_l0/4:.2f} nm)",
+        3: f"L3 (dx \u2248 {dx_l0/8:.3f} nm)",
     }
 
-    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Background domain
     ax.add_patch(mpatches.Rectangle((-dh, -dh), domain_nm, domain_nm,
                  fc="0.96", ec="0.7", lw=0.5, zorder=0))
-    lh = []
-    for lvl in sorted(level_style.keys()):
-        s = level_style[lvl]
+
+    drawn_levels = set()
+    for lvl in sorted(colours.keys()):
+        c = colours[lvl]
         mask = data["level"].astype(int) == lvl
-        drawn = False
         for row in data[mask]:
             x0 = float(row["coarse_i0"]) * dx_l0 - dh
             y0 = float(row["coarse_j0"]) * dx_l0 - dh
             w  = float(row["coarse_nx"]) * dx_l0
             ht = float(row["coarse_ny"]) * dx_l0
+            # Semi-transparent fill + solid edge (vortex style)
             ax.add_patch(mpatches.Rectangle((x0, y0), w, ht,
-                         fc=s["fc"], ec=s["ec"], lw=float(s["lw"]),
-                         zorder=lvl + 1))
-            drawn = True
-        if drawn:
-            lh.append(mpatches.Patch(fc=s["fc"], ec=s["ec"],
-                      lw=float(s["lw"]), label=str(s["label"])))
+                         linewidth=1.5, edgecolor=c,
+                         facecolor=c, alpha=0.15, zorder=lvl + 1))
+            ax.add_patch(mpatches.Rectangle((x0, y0), w, ht,
+                         linewidth=1.5, edgecolor=c,
+                         facecolor='none', zorder=lvl + 1))
+            drawn_levels.add(lvl)
 
+    # Hole boundary
     ax.add_patch(Circle((0, 0), hole_r_nm, fc="white", ec="black",
-                         lw=1.2, zorder=10))
-    lh.append(Line2D([], [], color="black", lw=1.2, label="Hole boundary"))
+                         lw=1.8, zorder=10))
+
+    # Legend — matching vortex style
+    legend_handles = [mpatches.Patch(facecolor=colours[l], edgecolor=colours[l],
+                                      alpha=0.4, label=dx_labels[l])
+                      for l in sorted(drawn_levels)]
+    legend_handles.append(Line2D([], [], color="black", lw=1.8, label="Hole boundary"))
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=14,
+              frameon=True, framealpha=0.95, edgecolor='0.7').set_zorder(50)
 
     ax.set_xlim(-dh * 1.02, dh * 1.02)
     ax.set_ylim(-dh * 1.02, dh * 1.02)
     ax.set_aspect("equal")
-    ax.set_xlabel("$x$ (nm)"); ax.set_ylabel("$y$ (nm)")
+    ax.set_xlabel(r"$x$ (nm)", fontsize=17)
+    ax.set_ylabel(r"$y$ (nm)", fontsize=17)
+    ax.tick_params(labelsize=15)
     ax.xaxis.set_minor_locator(mticker.AutoMinorLocator(2))
     ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
-    ax.legend(handles=lh, loc="lower left", fontsize=8, frameon=True,
-              framealpha=0.92, borderpad=0.5, handlelength=1.5, handleheight=1.2)
     fig.tight_layout()
     _save(fig, out_dir, "fig_patch_map")
 
@@ -388,19 +402,19 @@ def plot_error_radial(diag_dir, out_dir,
     # Boundary marker
     ax.axvline(0, color="black", lw=0.8, ls=":", alpha=0.5)
     ax.text(0.3, ax.get_ylim()[1] * 0.92, "boundary",
-            fontsize=8, color="0.3", fontstyle="italic",
+            fontsize=10, color="0.3", fontstyle="italic",
             va="top")
 
     ax.set_xlabel(
         "Distance from hole boundary into material (nm)",
-        fontsize=10)
+        fontsize=12)
     ax.set_ylabel(
-        r"$|\Delta B_x|/\max|B|$ (%)", fontsize=10)
+        r"$|\Delta B_x|/\max|B|$ (%)", fontsize=12)
     ax.set_xlim(0, max_dist)
     ax.set_ylim(bottom=0)
     ax.xaxis.set_minor_locator(mticker.AutoMinorLocator(2))
     ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
-    ax.legend(loc="upper right", fontsize=7.5, framealpha=0.9)
+    ax.legend(loc="upper right", fontsize=10, framealpha=0.9)
     ax.grid(axis="both", alpha=0.12)
 
     _save(fig, out_dir, "fig_error_radial")
@@ -413,7 +427,7 @@ def plot_error_radial(diag_dir, out_dir,
 #  (a) Runtime vs N — all 5 methods (fine FFT, cfft, MG, Newell, PPPM)
 #  (b) Edge RMSE vs N — cfft vs composite MG-only
 # ═══════════════════════════════════════════════════════════════════
-def plot_crossover(csv_path, out_dir):
+def plot_crossover(csv_path, out_dir, cell_count_csv=None, acc_csv=None):
     if not os.path.exists(csv_path):
         print(f"  SKIP crossover: {csv_path} not found"); return
 
@@ -442,6 +456,9 @@ def plot_crossover(csv_path, out_dir):
     t_newell = data["t_newell_ms"] / 1000.0 if "t_newell_ms" in names else None
     t_pppm   = data["t_pppm_ms"]   / 1000.0 if "t_pppm_ms"   in names else None
 
+    # Check if we have cell count data for neff bottom panel
+    have_neff = (cell_count_csv is not None and os.path.exists(cell_count_csv))
+
     # Colours
     cf = "#1F4E9A"    # fine FFT: dark blue
     cc = "#2E7D32"    # cfft: green
@@ -450,7 +467,7 @@ def plot_crossover(csv_path, out_dir):
     cp = "#EF6C00"    # PPPM: orange
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(5.2, 7.0))
-    fig.subplots_adjust(hspace=0.35, left=0.15, right=0.95, top=0.88, bottom=0.08)
+    fig.subplots_adjust(hspace=0.42, left=0.15, right=0.95, top=0.85, bottom=0.08)
 
     # ═══════════════════════════════════════════
     #  Top panel: Runtime vs N — all 5 methods
@@ -489,7 +506,7 @@ def plot_crossover(csv_path, out_dir):
             if sp > 1.5:
                 ax_top.annotate(f"{sp:.0f}" + r"$\times$",
                     (ni, tc), textcoords="offset points", xytext=(0, -13),
-                    ha="center", fontsize=8.5, color=cm, fontstyle="italic")
+                    ha="center", fontsize=11, color=cm, fontstyle="italic")
 
     # N log N reference slope
     if np.any(mf) and int(np.sum(mf)) >= 2:
@@ -501,34 +518,82 @@ def plot_crossover(csv_path, out_dir):
                     color="0.6", lw=0.8, label=r"$\propto N\log N$", zorder=1)
 
     ax_top.set_ylabel("Wall-clock time (s)")
-    ax_top.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), fontsize=8,
+    ax_top.set_ylim(1e-3, 1e3)
+    ax_top.legend(loc="lower center", bbox_to_anchor=(0.5, 1.05), fontsize=11,
                   ncol=3, frameon=True, columnspacing=1.0, handletextpad=0.4)
+
+    # Remove x-axis tick labels from top panel (shared axis, like SP2)
+    ax_top.tick_params(axis="x", labelbottom=False)
 
     nmin = int(np.sqrt(float(N_fine.min())))
     nmax = int(np.sqrt(float(N_fine.max())))
-    ax_top.set_xlabel(
-        rf"$N = n^2$ fine-equivalent cells ($n = {nmin}$ to ${nmax}$)")
 
     # ═══════════════════════════════════════════
-    #  Bottom panel: Edge RMSE vs N
-    #  (cfft vs composite MG-only only)
-    #  Threshold annotations to be added in Adobe
+    #  Bottom panel: Neff decomposed (if available) or Edge RMSE
     # ═══════════════════════════════════════════
-    me = np.isfinite(e_cfft)
-    if np.any(me):
-        ax_bot.semilogx(N_fine[me], e_cfft[me], "s-", color=cc, ms=4,
-                        label="Coarse-FFT + AMR", zorder=2)
-    mv2 = np.isfinite(e_comp)
-    if np.any(mv2):
-        ax_bot.semilogx(N_fine[mv2], e_comp[mv2], "^-", color=cm, ms=4,
-                        label="Composite MG + AMR", zorder=2)
+    if have_neff:
+        # Load cell count data
+        cc_raw = np.atleast_1d(np.genfromtxt(cell_count_csv, delimiter=",", names=True))
+        cc_names = cc_raw.dtype.names or ()
+
+        cc_fine_nx  = cc_raw["fine_nx"].astype(int)
+        cc_N_fine   = cc_raw["N_fine"].astype(float)
+        cc_cells_L0 = cc_raw["cells_L0"].astype(float)
+        cc_cells_L1 = cc_raw["cells_L1"].astype(float)
+        cc_cells_L2 = cc_raw["cells_L2"].astype(float) if "cells_L2" in cc_names else np.zeros_like(cc_cells_L0)
+        cc_cells_L3 = cc_raw["cells_L3"].astype(float) if "cells_L3" in cc_names else np.zeros_like(cc_cells_L0)
+        cc_N_eff    = cc_raw["N_eff"].astype(float)
+
+        f_L0    = cc_cells_L0 / cc_N_fine * 100.0
+        f_L1    = cc_cells_L1 / cc_N_fine * 100.0
+        f_L2    = cc_cells_L2 / cc_N_fine * 100.0
+        f_L3    = cc_cells_L3 / cc_N_fine * 100.0
+        f_total = cc_N_eff / cc_N_fine * 100.0
+
+        # Neff colours
+        c_total = "#C03030"
+        c_L0    = "0.50"
+        c_L1    = "#E8A040"
+        c_L2    = "#3AA03A"
+        c_L3    = "#4080C8"
+
+        ax_bot.semilogx(cc_N_fine, f_L0, ":", color=c_L0, lw=1.2, zorder=1,
+                        label=r"$L_0$ base grid ($1/64$)")
+        ax_bot.semilogx(cc_N_fine, f_L1, "-", color=c_L1, lw=1.2, marker="v", ms=4, zorder=2,
+                        label=r"$L_1$ patches")
+        if np.any(f_L2 > 0):
+            ax_bot.semilogx(cc_N_fine, f_L2, "-", color=c_L2, lw=1.0, marker="D", ms=3.5, zorder=2,
+                            label=r"$L_2$ patches")
+        if np.any(f_L3 > 0):
+            ax_bot.semilogx(cc_N_fine, f_L3, "-", color=c_L3, lw=0.9, marker="s", ms=3, zorder=2,
+                            label=r"$L_3$ patches")
+        ax_bot.semilogx(cc_N_fine, f_total, "^-", color=c_total, lw=1.8, ms=6, zorder=5,
+                        label=r"Total $N_{\mathrm{eff}}$")
+
+        ax_bot.set_ylabel(r"Fraction of fine grid (%)")
+        ax_bot.set_ylim(bottom=0, top=max(f_total) * 1.15)
+        ax_bot.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
+        ax_bot.grid(axis="both", alpha=0.12)
+        ax_bot.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), fontsize=11,
+                      ncol=3, frameon=True, columnspacing=1.0, handletextpad=0.4)
+    else:
+        # Fallback: Edge RMSE bottom panel
+        me = np.isfinite(e_cfft)
+        if np.any(me):
+            ax_bot.semilogx(N_fine[me], e_cfft[me], "s-", color=cc, ms=4,
+                            label="Coarse-FFT + AMR", zorder=2)
+        mv2 = np.isfinite(e_comp)
+        if np.any(mv2):
+            ax_bot.semilogx(N_fine[mv2], e_comp[mv2], "^-", color=cm, ms=4,
+                            label="Composite MG + AMR", zorder=2)
+        ax_bot.set_ylabel("Edge RMSE (%)")
+        ax_bot.set_ylim(bottom=0)
+        ax_bot.legend(loc="upper right", fontsize=11)
 
     ax_bot.set_xlabel(
         rf"$N = n^2$ fine-equivalent cells ($n = {nmin}$ to ${nmax}$)")
-    ax_bot.set_ylabel("Edge RMSE (%)")
-    ax_bot.set_ylim(bottom=0)
-    ax_bot.legend(loc="upper right", fontsize=7.5)
 
+    fig.align_ylabels([ax_top, ax_bot])
     _save(fig, out_dir, "fig5_crossover")
 
 
@@ -592,7 +657,7 @@ def plot_neff_ratio(csv_path, out_dir,
     ax.annotate(f"{eff_ratio[mid]*100:.1f}% of fine grid",
                 (N_fine[mid], eff_ratio[mid] * 100.0),
                 textcoords="offset points", xytext=(12, 8),
-                fontsize=8, color=cm,
+                fontsize=11, color=cm,
                 arrowprops=dict(arrowstyle="-", color="0.4", lw=0.6))
 
     nmin = int(np.sqrt(float(N_fine.min())))
@@ -601,7 +666,7 @@ def plot_neff_ratio(csv_path, out_dir,
         rf"$N = n^2$ fine-equivalent cells ($n = {nmin}$ to ${nmax}$)")
     ax.set_ylabel(r"$N_{\mathrm{eff}} \,/\, N_{\mathrm{fine}}$ (%)")
     ax.set_ylim(bottom=0)
-    ax.legend(loc="upper right", fontsize=8)
+    ax.legend(loc="upper right", fontsize=11)
     ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
     ax.grid(axis="both", alpha=0.15)
 
@@ -666,7 +731,7 @@ def plot_edge_vs_fixed_ref(csv_path, out_dir):
         ax.text(0.5, 0.92,
                 "Fine FFT discretisation curve requires\n"
                 "fixed-reference benchmark (LLG_CV_FIXED_REF)",
-                transform=ax.transAxes, fontsize=7.5, color="0.4",
+                transform=ax.transAxes, fontsize=9, color="0.4",
                 ha="center", va="top",
                 bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow",
                           ec="0.7", lw=0.5))
@@ -677,10 +742,10 @@ def plot_edge_vs_fixed_ref(csv_path, out_dir):
         rf"$N = n^2$ fine-equivalent cells ($n = {nmin}$ to ${nmax}$)")
     ax.set_ylabel("Edge RMSE vs fixed ref. (%)")
     ax.set_ylim(bottom=0)
-    ax.legend(loc="upper right", fontsize=8)
+    ax.legend(loc="upper right", fontsize=11)
     ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
 
-    ax.set_title("Convergence to absolute reference", fontsize=10, pad=6)
+    ax.set_title("Convergence to absolute reference", fontsize=12, pad=6)
 
     _save(fig, out_dir, "fig5b_fixed_ref")
     if not has_fine_abs:
@@ -774,7 +839,7 @@ def plot_neff_decomposed(cells_csv, out_dir, acc_csv=None):
     ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
     ax.grid(axis="both", alpha=0.12)
 
-    ax.legend(loc="upper center", fontsize=8.5, ncol=3,
+    ax.legend(loc="upper center", fontsize=11, ncol=3,
               columnspacing=1.0, handletextpad=0.4)
 
     _save(fig, out_dir, "fig5b_neff_decomposed")
@@ -924,14 +989,17 @@ def main():
                 sweep_3nm = candidate; break
         if sweep_3nm is None:
             sweep_3nm = os.path.join(diag_dir, "crossover_sweep_3nm.csv")
-    plot_crossover(sweep_3nm, out_dir)
-    plot_neff_ratio(sweep_3nm, out_dir, args.hole_r, args.domain)
-    plot_edge_vs_fixed_ref(sweep_3nm, out_dir)
 
-    # Fig 5b decomposed: real per-level cell counts
+    # Resolve cell count CSV before crossover (needed for combined figure)
     cells_csv = args.cell_count
     if cells_csv is None:
         cells_csv = os.path.join(diag_dir, "cell_count_sweep.csv")
+
+    plot_crossover(sweep_3nm, out_dir, cell_count_csv=cells_csv, acc_csv=sweep_3nm)
+    plot_neff_ratio(sweep_3nm, out_dir, args.hole_r, args.domain)
+    plot_edge_vs_fixed_ref(sweep_3nm, out_dir)
+
+    # Fig 5b decomposed: standalone version (also embedded in crossover if cell_count available)
     plot_neff_decomposed(cells_csv, out_dir, acc_csv=sweep_3nm)
 
     sweep_20nm = args.sweep_20nm or os.path.join(diag_dir, "crossover_sweep_20nm.csv")

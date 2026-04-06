@@ -584,36 +584,52 @@ impl AmrStepperRK4 {
         // subsequent calls within the same regrid epoch are a cheap no-op.
         h.trim_active_for_nesting();
 
-        // Phase-2 Bridge B: build the flattened *uniform fine composite* magnetisation.
-        //
-        // This composite is used both for FFT demag (gold operator) and as the source of
-        // parent-consistent ghost values for nested patches.
-        let mut m_fine = h.flatten_to_uniform_fine();
+        // CompositeGrid and CoarseFft operate natively on the AMR hierarchy —
+        // they never need the expensive N_fine-cell flattened composite.
+        // AllFft and AllMgUniformFine require the global fine grid for demag.
+        let needs_fine_grid = matches!(
+            self.demag_mode,
+            AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine
+        );
 
-        // If a geometry mask exists, ensure vacuum stays m=(0,0,0) on the fine grid before demag.
-        // Keep the mask around so we can also zero demag addends in vacuum.
-        let fine_mask = h.build_uniform_fine_mask();
-        if let Some(fm) = fine_mask.as_deref() {
-            for idx in 0..m_fine.grid.n_cells() {
-                if !fm[idx] {
-                    m_fine.data[idx] = [0.0, 0.0, 0.0];
+        if needs_fine_grid {
+            // Phase-2 Bridge B: build the flattened *uniform fine composite* magnetisation.
+            //
+            // This composite is used both for FFT demag (gold operator) and as the source of
+            // parent-consistent ghost values for nested patches.
+            let mut m_fine = h.flatten_to_uniform_fine();
+
+            // If a geometry mask exists, ensure vacuum stays m=(0,0,0) on the fine grid before demag.
+            // Keep the mask around so we can also zero demag addends in vacuum.
+            let fine_mask = h.build_uniform_fine_mask();
+            if let Some(fm) = fine_mask.as_deref() {
+                for idx in 0..m_fine.grid.n_cells() {
+                    if !fm[idx] {
+                        m_fine.data[idx] = [0.0, 0.0, 0.0];
+                    }
                 }
             }
-        }
 
-        // Parent-consistent ghost fill for all patch levels.
-        //
-        // Use the composite field so level-2+ ghost cells are consistent with level-(L-1)
-        // interiors, rather than falling back to coarse.
-        h.fill_patch_ghosts_from_uniform_fine(&m_fine);
+            // Parent-consistent ghost fill for all patch levels.
+            h.fill_patch_ghosts_from_uniform_fine(&m_fine);
+
+            // Compute demag on the fine grid.
+            self.compute_demag(h, &mut m_fine, fine_mask.as_deref(), mat);
+        } else {
+            // CompositeGrid / CoarseFft: skip the N_fine allocation entirely.
+            // Ghost-fill from the coarse grid (level-by-level, O(N_eff) cost).
+            h.fill_patch_ghosts();
+
+            // compute_demag for these modes ignores m_fine, so pass a minimal dummy.
+            let dummy_grid = Grid2D::new(1, 1, h.base_grid.dx, h.base_grid.dy, h.base_grid.dz);
+            let mut dummy = VectorField2D::new(dummy_grid);
+            self.compute_demag(h, &mut dummy, None, mat);
+        }
 
         let use_fine_demag_sampling = matches!(
             self.demag_mode,
             AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine
         );
-
-        // 1) Compute demag
-        self.compute_demag(h, &mut m_fine, fine_mask.as_deref(), mat);
 
         // 2) Step fine patches (active interior only) — PARALLEL
         {
@@ -1055,25 +1071,44 @@ impl AmrStepperRK4 {
         // ----------------------------------------------------------
         // 2) Compute demag ONCE on the flattened composite (Strategy A)
         // ----------------------------------------------------------
-        let mut m_fine = h.flatten_to_uniform_fine();
-        let fine_mask = h.build_uniform_fine_mask();
-        if let Some(fm) = fine_mask.as_deref() {
-            for idx in 0..m_fine.grid.n_cells() {
-                if !fm[idx] {
-                    m_fine.data[idx] = [0.0, 0.0, 0.0];
+        // CompositeGrid and CoarseFft operate natively on the AMR hierarchy —
+        // they never need the expensive N_fine-cell flattened composite.
+        // AllFft and AllMgUniformFine require the global fine grid for demag.
+        let needs_fine_grid = matches!(
+            self.demag_mode,
+            AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine
+        );
+
+        if needs_fine_grid {
+            let mut m_fine = h.flatten_to_uniform_fine();
+            let fine_mask = h.build_uniform_fine_mask();
+            if let Some(fm) = fine_mask.as_deref() {
+                for idx in 0..m_fine.grid.n_cells() {
+                    if !fm[idx] {
+                        m_fine.data[idx] = [0.0, 0.0, 0.0];
+                    }
                 }
             }
-        }
 
-        // Initial ghost fill at t=0 (using the composite — same as flat path).
-        h.fill_patch_ghosts_from_uniform_fine(&m_fine);
+            // Initial ghost fill at t=0 (using the composite — same as flat path).
+            h.fill_patch_ghosts_from_uniform_fine(&m_fine);
+
+            self.compute_demag(h, &mut m_fine, fine_mask.as_deref(), mat);
+        } else {
+            // CompositeGrid / CoarseFft: skip the N_fine allocation entirely.
+            // Ghost-fill from the coarse grid (level-by-level, O(N_eff) cost).
+            h.fill_patch_ghosts();
+
+            // compute_demag for these modes ignores m_fine, so pass a minimal dummy.
+            let dummy_grid = Grid2D::new(1, 1, h.base_grid.dx, h.base_grid.dy, h.base_grid.dz);
+            let mut dummy = VectorField2D::new(dummy_grid);
+            self.compute_demag(h, &mut dummy, None, mat);
+        }
 
         let use_fine_demag_sampling = matches!(
             self.demag_mode,
             AmrDemagMode::AllFft | AmrDemagMode::AllMgUniformFine
         );
-
-        self.compute_demag(h, &mut m_fine, fine_mask.as_deref(), mat);
 
         // ----------------------------------------------------------
         // 3) Set up frozen demag addends for ALL patches (once)

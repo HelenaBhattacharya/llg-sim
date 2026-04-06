@@ -804,12 +804,12 @@ def main():
     if args.pub:
         plt.rcParams.update({
             "font.family": "serif",
-            "font.size": 11,
-            "axes.labelsize": 13,
-            "axes.titlesize": 13,
-            "legend.fontsize": 11,
-            "xtick.labelsize": 11,
-            "ytick.labelsize": 11,
+            "font.size": 10,
+            "axes.labelsize": 11,
+            "axes.titlesize": 11,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.top": True,
@@ -825,7 +825,7 @@ def main():
         # Publication labels
         _our_label = "Rust"
         _ref_label = "MuMax3"
-        _mumax_ms = 2.0
+        _mumax_ms = 3.0
         _rust_lw = 1.2
         _mumax_marker = "o"
         _legend_fs = 11
@@ -859,13 +859,16 @@ def main():
         else:
             fig, ax = plt.subplots(1, 1, figsize=(6.667, 2.8))
 
-        # MuMax3: small markers, no connecting line (no individual labels)
+        # MuMax3: hollow markers, no connecting line (no individual labels)
         ax.plot(t_a_ns, mx_a, marker=_mumax_marker, linestyle="None",
-                color=_cx, markersize=_mumax_ms, zorder=1)
+                color=_cx, markersize=_mumax_ms,
+                markerfacecolor="none", markeredgewidth=0.8, zorder=1)
         ax.plot(t_a_ns, my_a, marker=_mumax_marker, linestyle="None",
-                color=_cy, markersize=_mumax_ms, zorder=1)
+                color=_cy, markersize=_mumax_ms,
+                markerfacecolor="none", markeredgewidth=0.8, zorder=1)
         ax.plot(t_a_ns, mz_a, marker=_mumax_marker, linestyle="None",
-                color=_cz, markersize=_mumax_ms, zorder=1)
+                color=_cz, markersize=_mumax_ms,
+                markerfacecolor="none", markeredgewidth=0.8, zorder=1)
 
         # Our solver: solid lines (no individual labels)
         if rust_a is not None:
@@ -882,10 +885,11 @@ def main():
 
         # Compact custom legend: single row ABOVE the axes so it can't overlap data
         from matplotlib.lines import Line2D
-        _fs = 11 if args.pub else 8
+        _fs = 10 if args.pub else 8
         handles = [
             Line2D([], [], color="k", linestyle="-", linewidth=_rust_lw, label="Rust"),
-            Line2D([], [], color="k", marker="o", linestyle="None", markersize=4, label="MuMax3"),
+            Line2D([], [], color="k", marker="o", linestyle="None", markersize=4,
+                   markerfacecolor="none", markeredgewidth=0.8, label="MuMax3"),
             Line2D([], [], color=_cx, linestyle="-", linewidth=2.5, label=r"$m_x$"),
             Line2D([], [], color=_cy, linestyle="-", linewidth=2.5, label=r"$m_y$"),
             Line2D([], [], color=_cz, linestyle="-", linewidth=2.5, label=r"$m_z$"),

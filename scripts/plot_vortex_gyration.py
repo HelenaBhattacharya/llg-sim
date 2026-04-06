@@ -66,7 +66,7 @@ def setup_style():
         "legend.fontsize": 9, "legend.framealpha": 0.92,
         "legend.edgecolor": "0.7", "legend.fancybox": False,
         "legend.handlelength": 1.8, "lines.linewidth": 1.5,
-        "figure.dpi": 200, "savefig.dpi": 300,
+        "figure.dpi": 1000, "savefig.dpi": 1000,
         "savefig.bbox": "tight", "savefig.pad_inches": 0.05,
     })
 
@@ -590,7 +590,7 @@ def plot_core_xt(root, info, methods, extra_core=None, t_cut_ns=None):
     ax.grid(True, alpha=0.2)
 
     out = os.path.join(root, 'fig_core_xt.pdf')
-    fig.savefig(out, dpi=300, bbox_inches='tight')
+    fig.savefig(out, dpi=600, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
@@ -808,7 +808,7 @@ def plot_patch_map(root, info, patches_file, title, outname, snap_idx=None, core
     # Manual legend — consistent with mesh zoom
     legend_patches = [mpatches.Patch(facecolor=colours[l], edgecolor=colours[l],
                                       alpha=0.4, label=f'L{l}') for l in sorted(colours)]
-    ax.legend(handles=legend_patches, fontsize=10, loc='upper right',
+    ax.legend(handles=legend_patches, fontsize=15, loc='upper right',
               framealpha=0.95, edgecolor='0.7').set_zorder(50)
 
     ax.set_xlim(0, base_nx)
@@ -827,12 +827,12 @@ def plot_patch_map(root, info, patches_file, title, outname, snap_idx=None, core
     ax.set_xticklabels([f'{int(v)}' for v in nm_ticks])
     ax.set_yticks(cell_ticks)
     ax.set_yticklabels([f'{int(v)}' for v in nm_ticks])
-    ax.set_xlabel(r'$x$ (nm)', fontsize=11)
-    ax.set_ylabel(r'$y$ (nm)', fontsize=11)
-    ax.tick_params(labelsize=10)
+    ax.set_xlabel(r'$x$ (nm)', fontsize=19)
+    ax.set_ylabel(r'$y$ (nm)', fontsize=19)
+    ax.tick_params(labelsize=17)
 
     out = os.path.join(root, outname)
-    fig.savefig(out, dpi=300, bbox_inches='tight')
+    fig.savefig(out, dpi=600, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
@@ -886,20 +886,21 @@ def plot_mz_colourmap(root, info, m_file, title, outname, snap_idx=None, core_me
     ax.axis('off')
 
     out = os.path.join(root, outname)
-    fig.savefig(out, dpi=300, bbox_inches='tight')
+    fig.savefig(out, dpi=600, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
-
-# ─────────────────────────────────────────────────────────────────
-# Figure 6: 3D mz Surface — Multi-view (perspective, side, bird's-eye)
-# ─────────────────────────────────────────────────────────────────
-
 def plot_mz_3d(root, info, m_file='m_fine_eq.csv', frame_label='Equilibrium'):
-    """3D wireframe plot of mz — García-Cervera Fig 8/9 style.
+    """3D coloured-wireframe plot of mz — García-Cervera Fig 9 style.
 
-    White background, dashed grid lines, z-axis fixed 0–1,
-    wireframe mesh visible on the surface."""
+    Line3DCollection wireframe coloured by mz at native resolution.
+    Z-buffer surface is always built on a fine grid (interpolated if
+    the wireframe is coarse) so occlusion closely follows the vortex
+    silhouette regardless of wireframe resolution."""
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+    from scipy.spatial import cKDTree
+    from scipy.interpolate import RegularGridInterpolator
+
     m = load_m_csv(os.path.join(root, m_file))
     if m is None:
         print(f"  Skipping 3D plot: {m_file} not found")
@@ -908,12 +909,10 @@ def plot_mz_3d(root, info, m_file='m_fine_eq.csv', frame_label='Equilibrium'):
     mz = m['mz']
     nx, ny = m['nx'], m['ny']
 
-    # Subsample for visible wireframe — keep dense for good boundary resolution
     step = max(1, nx // 180)
     mz_sub = mz[::step, ::step]
     ny_s, nx_s = mz_sub.shape
 
-    # Physical coordinates in nm
     dx_nm = info['dx_m'] * 1e9
     is_fine = 'fine' in m_file
     if is_fine:
@@ -922,99 +921,230 @@ def plot_mz_3d(root, info, m_file='m_fine_eq.csv', frame_label='Equilibrium'):
     else:
         dx_plot = dx_nm
 
-    x = np.arange(nx_s) * step * dx_plot
-    y = np.arange(ny_s) * step * dx_plot
-    X, Y = np.meshgrid(x, y)
+    x_arr = np.arange(nx_s) * step * dx_plot
+    y_arr = np.arange(ny_s) * step * dx_plot
+    X, Y = np.meshgrid(x_arr, y_arr)
     X -= X.mean()
     Y -= Y.mean()
 
-    # Tight disk mask
     R_nm = info['disk_r_m'] * 1e9
     dist = np.sqrt(X**2 + Y**2)
-    mz_plot = np.where(dist <= R_nm * 0.88, mz_sub, np.nan)
+    mz_plot = np.where(dist <= R_nm * 0.90, mz_sub, np.nan)
 
-    fig = plt.figure(figsize=(7, 5.5))
+    fig = plt.figure(figsize=(7.5, 6.0))
     ax = fig.add_subplot(111, projection='3d', facecolor='white')
     assert isinstance(ax, Axes3D)
-    # Orthographic projection: straight parallel axes like G-C's MATLAB plots
+
     try:
         ax.set_proj_type('ortho')
     except AttributeError:
         pass
-    # Wide/flat box like G-C: x:y:z ≈ 1:1:0.25
     try:
-        ax.set_box_aspect((1, 1, 0.25))
+        ax.set_box_aspect((1, 1, 0.95))
     except AttributeError:
-        pass  # older matplotlib
+        pass
 
-    # García-Cervera style: coloured surface with thin wireframe edges
-    norm = Normalize(vmin=0.0, vmax=1.0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    norm_c = Normalize(vmin=0.0, vmax=1.0)
     cmap = plt.colormaps['RdYlBu_r']
 
-    colours = cmap(norm(np.nan_to_num(mz_plot, nan=0)))
-    colours[np.isnan(mz_plot), 3] = 0.0
+    elev_r = np.radians(28)
+    azim_r = np.radians(-55)
+    ca, sa = np.cos(azim_r), np.sin(azim_r)
+    ce, se = np.cos(elev_r), np.sin(elev_r)
 
-    ax.plot_surface(X, Y, mz_plot, facecolors=colours,
-                    rstride=1, cstride=1,
-                    linewidth=0.08, edgecolor='0.45',
-                    alpha=0.95, antialiased=True, shade=False)
+    right = np.array([-sa, ca, 0.0])
+    up = np.array([-se * ca, -se * sa, ce])
+    view = np.array([ce * ca, ce * sa, se])
 
-    ax.set_xlabel('x (nm)', fontsize=11, labelpad=8)
-    ax.set_ylabel('y (nm)', fontsize=11, labelpad=8)
-    ax.set_zlabel(r'm$_z$', fontsize=11, labelpad=5)
-    ax.view_init(elev=25, azim=-50)
-
-    # Fixed z-axis: floor below 0 so the mz≈0 surface floats
-    # above the base plane (García-Cervera style)
-    ax.set_zlim(-0.12, 1.0)
-    ax.set_zticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-
-    # Tight axes so disk fills frame
     lim = R_nm * 0.92
+    z_lo, z_hi = -0.12, 1.05
+    z_range = z_hi - z_lo
+    z_aspect = 0.95
+
+    def to_norm(px, py, pz):
+        return px / lim, py / lim, (pz - z_lo) / z_range * z_aspect
+
+    def project_norm(px, py, pz):
+        nx_, ny_, nz_ = to_norm(px, py, pz)
+        sx = nx_ * right[0] + ny_ * right[1]
+        sy = nx_ * up[0] + ny_ * up[1] + nz_ * up[2]
+        sd = nx_ * view[0] + ny_ * view[1] + nz_ * view[2]
+        return sx, sy, sd
+
+    # ══════════════════════════════════════════════════════════════
+    # Z-buffer surface: always on a fine grid (≥150 points per side)
+    # If the wireframe is coarse, interpolate mz onto a finer grid.
+    # If it's already fine, use it directly.
+    # ══════════════════════════════════════════════════════════════
+    zbuf_min = 150
+    if min(ny_s, nx_s) >= zbuf_min:
+        # Already fine enough — use wireframe grid for z-buffer
+        Xz, Yz, mz_zbuf = X, Y, mz_plot
+    else:
+        # Interpolate onto finer grid for accurate z-buffer
+        x_c = x_arr - x_arr.mean()
+        y_c = y_arr - y_arr.mean()
+
+        # Replace NaN with 0 for interpolation (outside disk = flat)
+        mz_interp_src = np.nan_to_num(mz_sub, nan=0.0)
+        interp = RegularGridInterpolator(
+            (y_c, x_c), mz_interp_src,
+            method='linear', bounds_error=False, fill_value=0.0)
+
+        zbuf_n = zbuf_min
+        x_fine = np.linspace(x_c[0], x_c[-1], zbuf_n)
+        y_fine = np.linspace(y_c[0], y_c[-1], zbuf_n)
+        Xz, Yz = np.meshgrid(x_fine, y_fine)
+
+        pts = np.column_stack([Yz.ravel(), Xz.ravel()])
+        mz_zbuf = interp(pts).reshape(zbuf_n, zbuf_n)
+
+        # Re-apply disk mask at fine resolution
+        dist_z = np.sqrt(Xz**2 + Yz**2)
+        mz_zbuf = np.where(dist_z <= R_nm * 0.90, mz_zbuf, np.nan)
+
+        print(f"  Z-buffer upsampled: {ny_s}x{nx_s} wireframe → {zbuf_n}x{zbuf_n} z-buffer")
+
+    valid = ~np.isnan(mz_zbuf)
+    Xv, Yv, Zv = Xz[valid], Yz[valid], mz_zbuf[valid]
+    sx_s, sy_s, sd_s = project_norm(Xv, Yv, Zv)
+
+    tree = cKDTree(np.column_stack([sx_s, sy_s]))
+
+    # Parameters based on z-buffer grid cell size (always fine)
+    zbuf_cell_nm = (Xz[0, -1] - Xz[0, 0]) / (Xz.shape[1] - 1) if Xz.shape[1] > 1 else dx_plot
+    zbuf_cell_n = abs(zbuf_cell_nm) / lim
+    zbuf_cell_screen = np.sqrt((zbuf_cell_n * right[0])**2 + (zbuf_cell_n * right[1])**2)
+
+    search_r = max(zbuf_cell_screen * 1.5, 0.015)
+    depth_margin = max(search_r * 3.0, 0.10)
+    min_3d_norm = max(zbuf_cell_n * 5.0, 0.10)
+
+    # ── Build wireframe from native (possibly coarse) grid ──
+    segments = []
+    seg_colors = []
+    seg_mids = []
+
+    for j in range(ny_s):
+        for i in range(nx_s - 1):
+            z0, z1 = mz_plot[j, i], mz_plot[j, i + 1]
+            if np.isnan(z0) or np.isnan(z1):
+                continue
+            segments.append([[X[j,i], Y[j,i], z0],
+                             [X[j,i+1], Y[j,i+1], z1]])
+            zmid = (z0 + z1) / 2.0
+            seg_colors.append(list(cmap(norm_c(zmid))))
+            seg_mids.append(((X[j,i]+X[j,i+1])/2, (Y[j,i]+Y[j,i+1])/2, zmid))
+
+    for i in range(nx_s):
+        for j in range(ny_s - 1):
+            z0, z1 = mz_plot[j, i], mz_plot[j + 1, i]
+            if np.isnan(z0) or np.isnan(z1):
+                continue
+            segments.append([[X[j,i], Y[j,i], z0],
+                             [X[j+1,i], Y[j+1,i], z1]])
+            zmid = (z0 + z1) / 2.0
+            seg_colors.append(list(cmap(norm_c(zmid))))
+            seg_mids.append(((X[j,i]+X[j+1,i])/2, (Y[j,i]+Y[j+1,i])/2, zmid))
+
+    # ── Hidden-line removal ──
+    n_hidden = 0
+    for idx in range(len(segments)):
+        mx, my, mz_val = seg_mids[idx]
+        sx, sy, sd = project_norm(mx, my, mz_val)
+
+        neighbours = tree.query_ball_point([sx, sy], r=search_r)
+
+        for ni in neighbours:
+            nx1, ny1, nz1 = to_norm(mx, my, mz_val)
+            nx2, ny2, nz2 = to_norm(Xv[ni], Yv[ni], Zv[ni])
+            d3d_n = np.sqrt((nx2-nx1)**2 + (ny2-ny1)**2 + (nz2-nz1)**2)
+
+            if d3d_n < min_3d_norm:
+                continue
+
+            if sd_s[ni] > sd + depth_margin:
+                seg_colors[idx][3] = 0.0
+                n_hidden += 1
+                break
+
+    print(f"  Z-buffer: {n_hidden}/{len(segments)} hidden"
+          f"  (sr={search_r:.4f}, dm={depth_margin:.4f}, m3d={min_3d_norm:.4f})")
+
+    # Depth-sort
+    seg_depths = [project_norm(m[0], m[1], m[2])[2] for m in seg_mids]
+    order = np.argsort(seg_depths)
+    segments = [segments[i] for i in order]
+    seg_colors = [seg_colors[i] for i in order]
+
+    lc = Line3DCollection(segments, colors=seg_colors, linewidths=0.55)
+    ax.add_collection3d(lc)
+
+    ax.set_xlabel(r'$x$ (nm)', fontsize=18, labelpad=10)
+    ax.set_ylabel(r'$y$ (nm)', fontsize=18, labelpad=10)
+    ax.set_zlabel(r'$m_z$', fontsize=18, labelpad=7)
+    ax.view_init(elev=28, azim=-55)
+
+    ax.set_zlim(z_lo, z_hi)
+    ax.set_zticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
-    ax.tick_params(labelsize=9, pad=3)
 
-    # García-Cervera style: white panes with very thin light edges
+    tick_step = 40
+    x_ticks = np.arange(-80, 81, tick_step)
+    ax.set_xticks(x_ticks)
+    ax.set_yticks(x_ticks)
+    ax.tick_params(labelsize=15.5, pad=4)
+
+    grid_dot = (0, (0.8, 3.5))
+    grid_color = (0.35, 0.35, 0.35)
+
     try:
         for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
-            axis.pane.fill = False  # type: ignore
-            axis.pane.set_edgecolor((0.80, 0.80, 0.80, 0.15))  # type: ignore
-            axis._axinfo['grid']['linewidth'] = 0.2  # type: ignore
-            axis._axinfo['grid']['linestyle'] = ':'  # type: ignore
-            axis._axinfo['grid']['color'] = (0.7, 0.7, 0.7)  # type: ignore
-        # Make the 3D box frame lines thin and light
-        for line in ax.xaxis.get_ticklines():
-            line.set_linewidth(0.3)
-        for line in ax.yaxis.get_ticklines():
-            line.set_linewidth(0.3)
-        for line in ax.zaxis.get_ticklines():
-            line.set_linewidth(0.3)
+            axis.pane.fill = False
+            axis.pane.set_edgecolor((0, 0, 0, 0))
+            axis.pane.set_linewidth(0)
+            axis._axinfo['grid']['linewidth'] = 0.5
+            axis._axinfo['grid']['linestyle'] = grid_dot
+            axis._axinfo['grid']['color'] = grid_color
+        for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+            for line in axis.get_ticklines():
+                line.set_linewidth(0.4)
     except (AttributeError, KeyError):
         pass
-    ax.grid(True, color='0.80', alpha=0.20, linewidth=0.2, linestyle=':')
-    # Thin the 3D box/spine lines
+
+    ax.grid(True, color=grid_color, alpha=0.7, linewidth=0.5, linestyle=grid_dot)
+
     try:
-        for spine in ax.xaxis.line, ax.yaxis.line, ax.zaxis.line:
-            spine.set_linewidth(0.3)  # type: ignore
-            spine.set_color('0.6')  # type: ignore
+        for spine_line in [ax.xaxis.line, ax.yaxis.line, ax.zaxis.line]:
+            spine_line.set_linewidth(0.7)
+            spine_line.set_color('0.25')
+            spine_line.set_linestyle('-')
     except AttributeError:
         pass
 
-    # Colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm_c)
     sm.set_array([])
-    fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.08)
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.08)
+    cbar.set_label(r'$m_z$', fontsize=18, rotation=90, labelpad=8)
+    cbar.ax.tick_params(labelsize=15.5)
 
     fig.tight_layout()
     out_base = os.path.splitext(m_file)[0]
-    outname = f'fig_mz_3d_{out_base.replace("m_fine_", "").replace("m_coarse_", "c_")}.pdf'
-    out = os.path.join(root, outname)
-    fig.savefig(out, dpi=250, bbox_inches='tight')
+    tag = out_base.replace("m_fine_", "").replace("m_coarse_", "c_")
+
+    out_pdf = os.path.join(root, f'fig_mz_3d_{tag}.pdf')
+    out_png = os.path.join(root, f'fig_mz_3d_{tag}.png')
+
+    fig.savefig(out_pdf, dpi=750, bbox_inches='tight', pad_inches=0.02)
+    fig.savefig(out_png, dpi=900, bbox_inches='tight', pad_inches=0.02,
+                transparent=False, facecolor='white')
     plt.close(fig)
-    print(f"  Saved {out}")
-
-
+    print(f"  Saved {out_pdf}")
+    print(f"  Saved {out_png}")
 # ─────────────────────────────────────────────────────────────────
 # Figure 7: Mesh — Full domain with disk boundary
 # ─────────────────────────────────────────────────────────────────
@@ -1101,7 +1231,7 @@ def plot_mesh_full(root, info, patches_file='patches_eq.csv',
         legend_handles.append(mpatches.Patch(facecolor='none', edgecolor=colours_p[l],
                                               linewidth=2, label=f'L{l}'))
     legend_handles.append(Line2D([0], [0], color='k', lw=2, label='Disk boundary'))
-    ax.legend(handles=legend_handles, fontsize=10, loc='upper right',
+    ax.legend(handles=legend_handles, fontsize=15, loc='upper right',
               framealpha=0.95, edgecolor='0.7').set_zorder(50)
 
     ax.set_xlim(0, nx)
@@ -1110,7 +1240,7 @@ def plot_mesh_full(root, info, patches_file='patches_eq.csv',
     ax.axis('off')
 
     out = os.path.join(root, f'fig_mesh_full_{frame_label.split("(")[-1].replace(")","").replace(" ","_").lower() if "(" in frame_label else "eq"}.pdf')
-    fig.savefig(out, dpi=300, bbox_inches='tight')
+    fig.savefig(out, dpi=600, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
@@ -1247,7 +1377,7 @@ def plot_mesh_zoom(root, info, patches_file, m_file,
     # Legend — consistent with patch map
     legend_handles = [mpatches.Patch(facecolor='none', edgecolor=colours_p[l],
                                       linewidth=2, label=f'L{l}') for l in sorted(colours_p)]
-    leg = ax.legend(handles=legend_handles, fontsize=10, loc='upper right',
+    leg = ax.legend(handles=legend_handles, fontsize=15, loc='upper right',
                     framealpha=0.95, edgecolor='0.7')
     leg.set_zorder(50)
 
@@ -1289,13 +1419,13 @@ def plot_mesh_zoom(root, info, patches_file, m_file,
     ax.set_yticks(fine_yticks)
     ax.set_yticklabels([f'{int(v)}' for v in nm_yticks])
 
-    ax.set_xlabel(r'$x$ (nm)', fontsize=11)
-    ax.set_ylabel(r'$y$ (nm)', fontsize=11)
-    ax.tick_params(labelsize=10)
+    ax.set_xlabel(r'$x$ (nm)', fontsize=19)
+    ax.set_ylabel(r'$y$ (nm)', fontsize=19)
+    ax.tick_params(labelsize=17)
 
     tag = frame_label.split("(")[-1].replace(")", "").replace(" ", "_").lower() if "(" in frame_label else "eq"
     out = os.path.join(root, f'fig_mesh_zoom_{tag}.pdf')
-    fig.savefig(out, dpi=300, bbox_inches='tight')
+    fig.savefig(out, dpi=600, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
@@ -1481,7 +1611,7 @@ def plot_mz_3d_multiresolution(root, info, m_fine_file, patches_file,
     fig.tight_layout()
     tag = frame_label.split("(")[-1].replace(")", "").replace(" ", "_").lower() if "(" in frame_label else "eq"
     out = os.path.join(root, f'fig_mz_3d_multires_{tag}.pdf')
-    fig.savefig(out, dpi=250, bbox_inches='tight')
+    fig.savefig(out, dpi=750, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
@@ -1581,7 +1711,7 @@ def plot_mz_cross_sections(root, info, m_files, labels, outname='fig_mz_cross_se
     fig.tight_layout()
 
     out = os.path.join(root, outname)
-    fig.savefig(out, dpi=300, bbox_inches='tight')
+    fig.savefig(out, dpi=600, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out}")
 
@@ -1830,7 +1960,7 @@ def plot_vortex_inset_quiver(root, info, m_file, snap_idx=None,
     fig.tight_layout(pad=0.1)
     stem = os.path.splitext(m_file)[0].replace("m_fine_", "").replace("m_coarse_", "c_")
     out = os.path.join(root, f'fig_vortex_inset_{stem}.pdf')
-    fig.savefig(out, dpi=300, bbox_inches='tight', transparent=True)
+    fig.savefig(out, dpi=600, bbox_inches='tight', transparent=True)
     plt.close(fig)
     print(f"  Saved {out}")
 
