@@ -1,163 +1,134 @@
-# llg-sim - DRAFT
+# llg-sim
 
-A modular micromagnetic solver for the Landau–Lifshitz–Gilbert (LLG) equation, written in Rust.
+A two-dimensional micromagnetic solver implementing the Landau–Lifshitz–Gilbert
+equation with adaptive mesh refinement (AMR) and composite multigrid
+demagnetising-field computation. Written in Rust.
 
-This repository is developed as part of the CMP11 MPhys project **“Building the Next-Generation Micromagnetic Simulator”**.
-The focus is on clarity, modularity, and extensibility (e.g. additional energy terms / adaptive meshing), while benchmarking against **MuMax3**.
+Developed as part of MPhys project CMP11.
 
 ---
 
 ## Features
 
-### Physics / effective fields
-- Thin-film (2D) micromagnetics (Nx×Ny×1) with full 3D magnetisation vectors
-- Exchange, uniaxial anisotropy, Zeeman field
-- **Demagnetising field (demag)** (`src/effective_field/demag.rs`):
-  - treats each finite difference cell as a uniformly magnetised rectangular prism
-  - builds a demag kernel K_ij once per geometry and computes B_demag = K * M via FFT convolution
-  - kernel is cached on disk (out/demag_cache/) to avoid recomputation across runs
-- Interfacial DMI (Néel-type) for thin films
-
-### Time integration and relaxation
-- Integrators for LLG dynamics:
-  - Explicit Euler
-  - RK4 (frozen field)
-  - RK4 (recompute field at sub-steps)
-  - Adaptive RK45 (Dormand-Prince 5(4)) with recompute field
-  - **Relaxation controller** (`src/relax.rs`):
-    - precession suppressed (damping-only RHS)
-    - adaptive **RK23** (Bogacki–Shampine 3(2)) relax stepper
-    - energy-descent phase → torque-descent phase
-    - tolerance tightening
-    - Configurable torque-check stride
-
-### Validation and comparison workflow
-- Reproducible benchmark binaries under `src/bin/*`
-- Python plotting/overlay scripts under `scripts/`
-- MuMax3 reference scripts under `mumax/`
-- Generated outputs are written to `out/` and `runs/` and `mumax_outputs/` (all ignored by git)
+- Full LLG dynamics with Dormand–Prince (RK45) adaptive integration and
+  Bogacki–Shampine (RK23) damping-only relaxation
+- Effective fields: exchange, uniaxial anisotropy, interfacial DMI
+  (Néel-type), Zeeman, demagnetising field (FFT convolution)
+- Block-structured AMR with temporal subcycling and dynamic regridding
+- Composite multigrid demagnetising field with configurable near-field
+  correction (MG-only, direct Newell, PPPM)
+- Validated against MuMax3 and µMAG Standard Problems 2 and 4
 
 ---
 
-## Quickstart
+## Prerequisites
 
-### Prerequisites:
-- Rust toolchain (main code): `rustc + cargo`
-- Python3 (for plotting)
-- Python packages: `numpy, matplotlib`
-- Mumax3 on GPU machine/cluster (used for reference outputs)
+- Rust toolchain: `rustc` + `cargo`
+- Python 3 with `numpy`, `matplotlib` (for plotting)
+- MuMax3 (for generating reference data; not required to run the solver)
 
-### Clone and build
-```bash 
-git clone https://github.com/HelenaBhattacharya/llg-sim.git
-cd llg-sim
-cargo build --release
-```
 ---
 
-### Run tests
-```bash 
-cargo test
-# or just the integration-style tests found in `tests/validation.rs`:
-cargo test --test validation
-```
----
-
-### Python environment
+## Build and test
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install numpy matplotlib
+cargo build --release
+cargo test
 ```
----
-## Benchmarks and how to reproduce
 
-### Standard Problem 4
-Run Rust:
+---
+
+## Reproducing report results
+
+### Standard Problem 4 (Section 3.1)
 ```bash
 cargo run --release --bin st_problems -- sp4 a
-cargo run --release --bin st_problems -- sp4 b
 ```
 
-Run MuMax3 code on GPU and compare outputs:
+Compare against MuMax3:
 ```bash
 python3 scripts/compare_sp4.py \
   --mumax-root mumax_outputs/st_problems/sp4 \
-  --rust-root runs/st_problems/sp4 \
-  --metrics --metrics-interp mumax
+  --rust-root runs/st_problems/sp4
 ```
 
-### Uniform film field test (rk45 solver + demag ON)
-Run Rust:
+### Standard Problem 2 (Section 3.2)
 ```bash
-cargo run --release --bin uniform_film_field_rk45 -- demag=on
+cargo run --release --bin st_problems -- sp2
 ```
-Example overlays (m_y and m_z):
-```bash
-python3 scripts/overlay_macrospin.py \
-  out/uniform_film_rk45_demag_on/rust_table_uniform_film.csv \
-  mumax_outputs/uniform_film_field_demag_on/table.txt \
-  --col my --clip_overlap --metrics
-```
----
-```bash
-python3 scripts/overlay_macrospin.py \
-  out/uniform_film_rk45_demag_on/rust_table_uniform_film.csv \
-  mumax_outputs/uniform_film_field_demag_on/table.txt \
-  --col mz --clip_overlap --metrics
-```
-> ⚠ Current status: m_z(t) matches closely; m_y(t) shows remaining discrepancy under RK45+demag. This is an active debugging item.
 
-### DMI chirality check
-Run Rust (two runs with opposite DMI sign):
+Compare against MuMax3:
 ```bash
+python3 scripts/compare_sp2.py
+```
+
+### Anti-dot benchmark (Section 4.1)
+
+Single run at L0 = 256 with composite V-cycle:
+```bash
+LLG_DEMAG_COMPOSITE_VCYCLE=1 \
+  cargo run --release --bin bench_composite_vcycle -- --plots
+```
+
+Crossover sweep across grid sizes:
+```bash
+LLG_DEMAG_COMPOSITE_VCYCLE=1 \
+  cargo run --release --bin bench_composite_vcycle -- --sweep --plots
+```
+
+### Vortex gyration (Section 4.2)
+
+Full three-phase simulation with AMR and direct Newell correction:
+```bash
+LLG_AMR_MAX_LEVEL=3 LLG_NEWELL_DIRECT=1 \
+  cargo run --release --bin bench_vortex_gyration -- --plots
+```
+
+### Component-level validation (Appendix A)
+```bash
+cargo run --release --bin macrospin_fmr
+cargo run --release --bin macrospin_anisotropy
 cargo run --release --bin bloch_dmi -- dmi=1e-4
 cargo run --release --bin bloch_dmi -- dmi=-1e-4
 ```
----
-Analyse:
-```bash
-python3 scripts/bloch_dmi_analysis.py \
-  --dplus  out/bloch_relax_Dplus \
-  --dminus out/bloch_relax_Dminus
-```
----
-### Exploratory CLI (not a benchmark)
-Outputs go to `runs/”`.
-```bash
-cargo run --release -- tilt mumaxlike steps=20000 integrator=rk45 movie
-```
----
-> Additional reproducible benchmarks are available under `src/bin/`. Each benchmark file contains the canonical run command(s), expected output folder(s), and the recommended post-processing (Python) commands in the header comment.
 
-## Outputs and folder conventions
-- This repo uses three output roots (all gitignored):
-  - `out/`
-Canonical outputs from Rust benchmark binaries (plots, CSVs, configs).
-Also contains out/demag_cache/: cached Fourier-space demag kernels keyed by geometry.
-  - `runs/`
-Exploratory/ad-hoc runs (e.g. command-line driver runs, intermediate experiments).
-  - `mumax_outputs/`
-MuMax3 outputs copied back from SCARF (or another machine) for direct overlays with Rust results.
+---
 
 ## Repository structure
-
 ```text
 llg-sim/
-├── src/                  # solver core + utilities
-│   ├── effective_field/  # exchange / anisotropy / zeeman / dmi / demag
-│   ├── llg.rs            # LLG RHS + integrators (RK23 + RK45 included)
-│   ├── relax.rs          # MuMax-like Relax controller (energy→torque)
-│   └── bin/              # reproducible benchmark binaries
-├── scripts/              # python overlays / plots (numpy, matplotlib)
-├── mumax/                # MuMax3 reference scripts (.mx3)
-├── tests/                # cargo test integration-style checks
-├── out/                  # Rust benchmark outputs (gitignored)
-├── runs/                 # exploratory outputs (gitignored)
-├── mumax_outputs/        # MuMax3 outputs copied back for overlays (gitignored)
+├── src/
+│   ├── lib.rs
+│   ├── llg.rs, relax.rs, minimize.rs, equilibrate.rs
+│   ├── params.rs, grid.rs, vector_field.rs
+│   ├── geometry_mask.rs, initial_states.rs, energy.rs, ovf.rs
+│   ├── effective_field/
+│   │   ├── exchange.rs, anisotropy.rs, dmi.rs, zeeman.rs
+│   │   ├── demag_fft_uniform.rs, coarse_fft_demag.rs
+│   │   ├── demag_poisson_mg.rs, mg_composite.rs
+│   │   ├── mg_kernels.rs, mg_treecode.rs, mg_diagnostics.rs
+│   ├── amr/
+│   │   ├── hierarchy.rs, patch.rs, indicator.rs
+│   │   ├── clustering.rs, interp.rs, regrid.rs, stepper.rs
+│   └── bin/
+│       ├── st_problems/ (sp4.rs, sp2.rs)
+│       ├── macrospin_fmr.rs, macrospin_anisotropy.rs
+│       ├── bloch_dmi.rs
+│       ├── bench_composite_vcycle.rs
+│       └── bench_vortex_gyration.rs
+├── tests/
+│   ├── validation.rs, test_demag_methods.rs, subcycling_tests.rs
+├── scripts/
+│   ├── compare_sp4.py, compare_sp2.py
+│   ├── plot_antidot_benchmark.py, plot_vortex_gyration.py
+│   ├── plot_appendix_figures.py, ovf_utils.py
+├── mumax/                # MuMax3 reference scripts
 ├── Cargo.toml
+├── LICENSE
 └── README.md
 ```
 
+---
+
 ## License
-MIT License (see `License`)
+
+MIT
